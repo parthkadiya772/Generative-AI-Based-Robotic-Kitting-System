@@ -1,0 +1,137 @@
+# ============================================================
+# Generative Kitting System — Master Configuration
+# ============================================================
+
+simulation:
+  usd_scene_path: "C:/KP/AI_and_Automation/Sem_4/Thesis/robot_in_air/AIKIDO.usd"
+  robot_prim_path: "/World"
+  ur10_base_path: "/World/gantry_home/ur10_flattened/ur10_instanceable/base_link"
+  ee_path: "/World/gantry_home/ur10_flattened/ur10_instanceable/ee_link"
+  camera_prim_path: "/World/Camera"
+  depth_camera_prim_path: "/World/Realsense/RSD455/Camera_Pseudo_Depth"
+  imu_sensor_prim_path: "/World/Realsense/RSD455/Imu_Sensor"
+  physics_dt: 0.01667          # 1/60
+  rendering_dt: 0.01667        # 1/60
+
+  # Gantry configuration
+  gantry_x_joint: "gantry_vagn_joint"
+  gantry_x_offset: 1.27
+
+  # URDF/YAML paths for Lula IK solver
+  urdf_path: "c:/kp/ai_and_automation/sem_4/thesis/isaacsim/exts/isaacsim.asset.importer.urdf/data/urdf/robots/ur10/urdf/ur10.urdf"
+  yaml_path: "c:/kp/ai_and_automation/sem_4/thesis/isaacsim/exts/isaacsim.robot_motion.motion_generation/motion_policy_configs/universal_robots/ur10/rmpflow/ur10_robot_description.yaml"
+
+  # Gripper finger prim paths (Robotiq 2F-140)
+  gripper_finger_paths:
+    - "/World/gantry_home/ur10_flattened/ur10_instanceable/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/left_inner_finger"
+    - "/World/gantry_home/ur10_flattened/ur10_instanceable/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/right_inner_finger"
+    - "/World/gantry_home/ur10_flattened/ur10_instanceable/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/left_outer_finger"
+    - "/World/gantry_home/ur10_flattened/ur10_instanceable/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/right_outer_finger"
+    - "/World/gantry_home/ur10_flattened/ur10_instanceable/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/robotiq_base_link"
+  box_prim_path: "/World/robot_facade_full"
+
+# ─── Perception (VLM) ───────────────────────────────────────
+perception:
+  vlm_provider: "ollama_qwen"         # Active provider (overridden by UI model selection)
+  vlm_model: "qwen2.5vl:32b"         # Active model  (overridden by UI model selection)
+  vlm_base_url: "http://10.7.0.35:11434"   # Active endpoint (overridden by UI model selection)
+  max_retries: 2
+  temperature: 0.1                    # Low temperature for deterministic perception
+  confidence_threshold: 0.5           # Reject objects below this confidence
+
+  # ── Available VLM Models (shown as dropdown in Streamlit UI) ──
+  # Add your VPN model endpoints here.  "name" is the dropdown label.
+  vlm_models:
+
+    # ── VPN Remote Server ────────────────────────────────────
+    - name: "Qwen2.5-VL 32B (VPN Remote)"
+      provider: "ollama_qwen"
+      model: "qwen2.5vl:32b"
+      base_url: "http://10.7.0.35:11434"
+
+    - name: "Qwen3-VL 32B (VPN Remote)"
+      provider: "ollama_qwen"
+      model: "qwen3-vl:32b"
+      base_url: "http://10.7.0.35:11434"
+
+    - name: "Qwen3.5 9B (VPN Remote)"
+      provider: "ollama_qwen"
+      model: "qwen3.5:9b"
+      base_url: "http://10.7.0.35:11434"
+
+    - name: "Qwen3.5-VL 27B (VPN Remote)"
+      provider: "ollama_qwen"
+      model: "qwen3.5:27b"
+      base_url: "http://10.7.0.35:11434"
+
+    - name: "LLaVA 13B (VPN Remote)"
+      provider: "ollama_llava"
+      model: "llava:13b"
+      base_url: "http://10.7.0.35:11434"
+
+# ─── Orchestration (LLM) ────────────────────────────────────
+orchestration:
+  llm_provider: "ollama_llama"        # Active provider (overridden by UI model selection)
+  llm_model: "llama3.1:8b"           # Active model  (overridden by UI model selection)
+  llm_api_key_env: "OPENAI_API_KEY"
+  llm_base_url: "http://localhost:11434"   # Active endpoint (overridden by UI model selection)
+  max_retries: 3
+  temperature: 0.0                    # Zero temperature for deterministic planning
+  max_tokens: 4096
+  max_plan_steps: 50                  # Reject plans with more steps (hallucination guard)
+
+  # ── Available LLM Models (shown as dropdown in Streamlit UI) ──
+  # Add your VPN model endpoints here.  "name" is the dropdown label.
+  llm_models:
+
+    # ── VPN Remote Server ────────────────────────────────────
+    - name: "Llama 3.1 8B (VPN Remote)"
+      provider: "ollama_llama"
+      model: "llama3.1:8b"
+      base_url: "http://10.7.0.35:11434"
+
+# ─── Execution ───────────────────────────────────────────────
+execution:
+  # 7-DOF: [gantry_x, shoulder_pan, shoulder_lift, elbow, wrist1, wrist2, wrist3]
+  home_joint_positions: [0.0, 0, -1.5708, 1.5708, -1.5708, -1.5708, 0]
+
+  workspace_bounds:
+    x_min: -1.5
+    x_max: 2.0
+    y_min: -1.5
+    y_max: 1.5
+    z_min: -0.1
+    z_max: 1.5
+
+  # Robotiq 2F-140 parameters
+  gripper_tcp_offset: 0.150           # metres: ee_link → finger contact pad
+  gripper_body_width: 0.160           # metres: widest dimension (fingers open)
+  gripper_max_width: 0.085            # 85mm finger aperture
+  gripper_force: 40.0                 # Newtons
+  finger_open_rad: 0.0               # radians — fully open
+  finger_close_rad: 0.5              # radians — ~50mm part
+
+  # Motion parameters
+  pre_grasp_height_offset: 0.15      # 15cm above object for approach
+  hover_clearance: 0.015             # gap above part top before plunge
+  box_height: 0.05                   # metres — box wall height above part
+  box_entry_margin: 0.15             # metres — clearance above rim
+  place_drop_height: 0.0             # metres above destination surface
+  place_retract_height: 0.20         # metres above destination after release
+  transit_safe_height: 0.40          # metres above safe_z during transit
+  grasp_depth_fraction: 0.5          # 0.0=top, 0.5=mid, 1.0=bottom
+
+  # Kit tray
+  kit_tray_position: [0.5, 0.0, 0.02]
+
+  # Safety
+  action_timeout_seconds: 30         # max seconds per action primitive
+  downward_orientation: [1.0, 0.0, 1.0, 0.0]   # [w, x, y, z] quaternion
+
+# ─── Logging ─────────────────────────────────────────────────
+logging:
+  level: "INFO"
+  log_file: "kitting_session.log"
+  save_vlm_images: true
+  save_task_plans: true
+  log_dir: "logs"

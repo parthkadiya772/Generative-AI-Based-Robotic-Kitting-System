@@ -1,0 +1,91 @@
+api_version: 1.0
+
+# 7-DOF Kinematic Chain (1 Gantry Slider + 6 UR10 Arm Joints)
+cspace:
+  - gantry_vagn_joint
+  - shoulder_pan_joint
+  - shoulder_lift_joint
+  - elbow_joint
+  - wrist_1_joint
+  - wrist_2_joint
+  - wrist_3_joint
+
+root_link: world
+subtree_root_link: gantry
+
+# Default safe resting angles (7 items)
+default_q: [0.0, -1.57, -1.57, -1.57, -1.57, 1.57, 0.0]
+
+# Limits (7 items to match the 7 joints)
+acceleration_limits: [40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0]
+jerk_limits: [10000.0, 10000.0, 10000.0, 10000.0, 10000.0, 10000.0, 10000.0]
+
+cspace_to_urdf_rules: []
+composite_task_spaces: []
+
+# Robot safety bounds (prevents it from colliding with itself)
+collision_spheres:
+  - upper_arm_link:
+      - center: [0.0, -0.045, 0.01]
+        radius: 0.1
+      - center: [0.0, -0.045, 0.3]
+        radius: 0.06
+      - center: [0.0, -0.045, 0.6]
+        radius: 0.08
+  - forearm_link:
+      - center: [0.0, 0.0, 0.0]
+        radius: 0.08
+      - center: [0.0, 0.0, 0.30]
+        radius: 0.05
+      - center: [0.0, 0.0, 0.57]
+        radius: 0.065
+  - wrist_1_link:
+      - center: [0.0, 0.0, 0.0]
+        radius: 0.05
+      - center: [0.0, 0.11, 0.0]
+        radius: 0.065
+  - wrist_2_link:
+      - center: [0.0, 0.0, 0.0]
+        radius: 0.05
+      - center: [0.0, 0, 0.11]
+        radius: 0.065
+  - wrist_3_link:
+      - center: [0.0, 0.0, 0.0]
+        radius: 0.045
+      - center: [0.0, 0.05, 0.0]
+        radius: 0.05
+
+  # --- Robotiq 2F-140 gripper body ---
+  - robotiq_base_link:
+      - center: [0.0, 0.0, 0.02]
+        radius: 0.055
+      - center: [0.0, 0.0, 0.05]
+        radius: 0.05
+
+  # --- Left finger ---
+  - left_outer_knuckle:
+      - center: [0.0, 0.0, 0.015]
+        radius: 0.025
+  - left_outer_finger:
+      - center: [0.0, 0.0, 0.015]
+        radius: 0.022
+  - left_inner_knuckle:
+      - center: [0.0, 0.0, 0.02]
+        radius: 0.022
+  - left_inner_finger:
+      - center: [0.0, 0.0, 0.02]
+        radius: 0.020
+
+  # --- Right finger ---
+  - right_outer_knuckle:
+      - center: [0.0, 0.0, 0.015]
+        radius: 0.025
+  - right_outer_finger:
+      - center: [0.0, 0.0, 0.015]
+        radius: 0.022
+  - right_inner_knuckle:
+      - center: [0.0, 0.0, 0.02]
+        radius: 0.022
+  - right_inner_finger:
+      - center: [0.0, 0.0, 0.02]
+        radius: 0.020

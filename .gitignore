@@ -1,0 +1,15 @@
+meshes/
+New folder/
+transforms/
+transforms_simple/
+.antigravity/
+.vscode/
+.aikido/
+__pycache__/
+.DS_Store
+ur10_setup/
+aikido_files.txt
+aikido_paths.txt
+AIKIDO_test.usd
+AIKIDO_USDA.usda
+CLAUDE.md

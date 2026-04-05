@@ -1,0 +1,33 @@
+# ============================================================
+# Generative Kitting System — Dependencies
+# ============================================================
+
+# Core
+numpy>=1.24
+pyyaml>=6.0
+pydantic>=2.0
+
+# AI Models
+openai>=1.30                  # GPT-4o API
+ollama>=0.2                   # Local model serving (Qwen, Llama, LLaVA)
+transformers>=4.40            # HuggingFace VLM loading (optional)
+torch>=2.2                    # PyTorch for local models (optional)
+
+# Database
+# sqlite3 is built-in
+
+# UI
+streamlit>=1.35
+
+# Image Processing
+Pillow>=10.0
+
+# NVIDIA Isaac Sim
+# isaacsim — installed separately via Omniverse Launcher
+# omni.isaac.core, omni.isaac.manipulators — Isaac Sim extensions
+
+# Logging
+loguru>=0.7
+
+# Testing
+pytest>=8.0

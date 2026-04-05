@@ -1,0 +1,1027 @@
+"""
+Isaac Sim ↔ Streamlit Bridge Server  (v2 — Neuro-Symbolic Kitting).
+
+Run this script inside Isaac Sim's Script Editor.  It exposes an HTTP
+API on port 8600 that the Streamlit dashboard consumes for:
+
+  GET  /api/ping          → health check + capabilities list
+  GET  /api/status        → robot joint positions, DOF info, sim state
+  GET  /api/camera        → live camera frame (rgb|depth) as base64 JPEG
+  POST /api/execute       → execute a list of action primitives
+  POST /api/joints        → set joint positions directly
+  POST /api/home          → move robot to home position
+  POST /api/gripper       → open / close gripper
+  POST /api/approach      → move near a world XYZ (Lula IK)
+  POST /api/pick          → full pick sequence at XYZ
+  POST /api/place         → full place sequence at XYZ
+
+Usage in Isaac Sim Script Editor:
+  exec(open("c:/KP/AI_and_Automation/Sem_4/Thesis/robot_in_air/generative_kitting/isaac_sim_bridge.py").read())
+"""
+
+import sys, os, json, asyncio, threading, traceback, io, base64, time, tempfile
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import numpy as np
+
+# ═════════════════════════════════════════════════════════════
+# CONFIGURATION (mirrors the constants in robot_control.py)
+# ═════════════════════════════════════════════════════════════
+
+BRIDGE_PORT = 8600
+ROBOT_PRIM  = "/World"
+
+# Dual cameras
+CAMERA_RGB_PRIM   = "/World/Camera"
+CAMERA_DEPTH_PRIM = "/World/Realsense/RSD455/Camera_Pseudo_Depth"
+IMU_PRIM          = "/World/Realsense/RSD455/Imu_Sensor"
+
+# Robot geometry
+UR10_BASE_PATH = "/World/gantry_home/ur10_flattened/ur10_instanceable/base_link"
+EE_PATH        = "/World/gantry_home/ur10_flattened/ur10_instanceable/ee_link"
+PLACE_BOX_PATH = "/World/box_840"
+
+# URDF / YAML for Lula IK
+URDF_PATH = r"c:/kp/ai_and_automation/sem_4/thesis/isaacsim/exts/isaacsim.asset.importer.urdf/data/urdf/robots/ur10/urdf/ur10.urdf"
+YAML_PATH = r"c:/kp/ai_and_automation/sem_4/thesis/isaacsim/exts/isaacsim.robot_motion.motion_generation/motion_policy_configs/universal_robots/ur10/rmpflow/ur10_robot_description.yaml"
+
+HOME_JOINTS = [0.0, 0, -1.5708, 1.5708, -1.5708, -1.5708, 0]
+
+# Gantry
+GANTRY_X_JOINT  = "gantry_vagn_joint"
+GANTRY_X_OFFSET = 1.27
+
+# Gripper / finger joints
+FINGER_OPEN  = 0.0
+FINGER_CLOSE = 0.5
+
+# Gripper geometry
+GRIPPER_TCP_OFFSET   = 0.150
+GRIPPER_BODY_WIDTH   = 0.160
+GRIPPER_HALF_WIDTH   = GRIPPER_BODY_WIDTH / 2.0
+HOVER_CLEARANCE      = 0.015
+GRASP_DEPTH_FRACTION = 0.5
+BOX_HEIGHT           = 0.05
+BOX_ENTRY_MARGIN     = 0.15
+PLACE_DROP_HEIGHT    = 0.0
+PLACE_RETRACT_HEIGHT = 0.20
+TRANSIT_SAFE_HEIGHT  = 0.40
+DOWNWARD_ORIENTATION = np.array([1.0, 0.0, 1.0, 0.0])
+
+
+# ═════════════════════════════════════════════════════════════
+# HELPERS (ported from robot_control.py)
+# ═════════════════════════════════════════════════════════════
+
+def normalize_quat(q):
+    mag = np.linalg.norm(q)
+    if mag < 1e-9:
+        raise ValueError(f"Quaternion {q} is near-zero")
+    return q / mag
+
+
+def get_world_pos(prim_path):
+    import omni.usd
+    from isaacsim.core.utils.prims import get_prim_at_path
+    return np.array(omni.usd.get_world_transform_matrix(
+        get_prim_at_path(prim_path)).ExtractTranslation())
+
+
+def compute_bbox_geometry(stage, prim_path, label="PRIM"):
+    from pxr import Gf, UsdGeom, Usd
+    prim = stage.GetPrimAtPath(prim_path)
+    if not prim.IsValid():
+        raise RuntimeError(f"Prim not found: '{prim_path}'")
+    bbox_cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), ["default", "render"], useExtentsHint=True)
+    world_bound = bbox_cache.ComputeWorldBound(prim)
+    aligned_box = world_bound.ComputeAlignedRange()
+    min_pt = np.array(aligned_box.GetMin())
+    max_pt = np.array(aligned_box.GetMax())
+    height = float(max_pt[2] - min_pt[2])
+    center_xy = [float((min_pt[0]+max_pt[0])/2), float((min_pt[1]+max_pt[1])/2)]
+    return {
+        "center_xy": center_xy,
+        "pivot": get_world_pos(prim_path),
+        "top_z": float(max_pt[2]),
+        "bot_z": float(min_pt[2]),
+        "height": height,
+        "min_pt": min_pt, "max_pt": max_pt,
+    }
+
+
+def compute_grasp_geometry(stage, part_path, depth_frac=0.5):
+    bbox = compute_bbox_geometry(stage, part_path, "PART")
+    grasp_z = bbox["top_z"] - depth_frac * bbox["height"]
+    return {
+        "part_center_xy": bbox["center_xy"],
+        "part_top_z": bbox["top_z"],
+        "part_bot_z": bbox["bot_z"],
+        "part_height": bbox["height"],
+        "grasp_z": grasp_z,
+    }
+
+
+def apply_arm_joints(robot, dof_names, arm_names, ik_result):
+    targets = robot.get_joint_positions()
+    for i, lula_name in enumerate(arm_names):
+        for idx, dof_name in enumerate(dof_names):
+            if lula_name in dof_name:
+                targets[idx] = ik_result[i]
+                break
+    return targets
+
+
+def set_finger_joints(robot, dof_names, value, base_targets=None):
+    targets = base_targets if base_targets is not None else robot.get_joint_positions()
+    for idx, name in enumerate(dof_names):
+        if "inner_finger_joint" in name:
+            targets[idx] = -value
+        elif "finger_joint" in name or "knuckle_joint" in name:
+            targets[idx] = value
+    return targets
+
+
+def ik_solve(lula_solver, frame, pos, ori, warm):
+    action, ok = lula_solver.compute_inverse_kinematics(
+        frame_name=frame, target_position=pos,
+        target_orientation=ori, warm_start=warm)
+    return action, ok
+
+
+# ── URDF / YAML Patching ────────────────────────────────────
+
+GRIPPER_TCP_LINK = """
+  <link name="gripper_tcp">
+    <inertial>
+      <mass value="0.001"/>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <inertia ixx="0.0001" ixy="0" ixz="0" iyy="0.0001" iyz="0" izz="0.0001"/>
+    </inertial>
+    <collision>
+      <origin xyz="0 0 {half_tcp}" rpy="0 0 0"/>
+      <geometry><box size="{width} {width} {tcp_offset}"/></geometry>
+    </collision>
+  </link>
+  <joint name="gripper_tcp_joint" type="fixed">
+    <parent link="ee_link"/>
+    <child link="gripper_tcp"/>
+    <origin xyz="0 0 {tcp_offset}" rpy="0 0 0"/>
+  </joint>
+""".format(tcp_offset=GRIPPER_TCP_OFFSET, half_tcp=GRIPPER_TCP_OFFSET/2, width=GRIPPER_BODY_WIDTH)
+
+
+def patch_urdf_and_yaml():
+    temp_dir = tempfile.gettempdir()
+    fixed_urdf = os.path.join(temp_dir, "fixed_ur10_with_gripper.urdf")
+    fixed_yaml = os.path.join(temp_dir, "fixed_ur10_with_gripper.yaml")
+
+    with open(URDF_PATH, 'r') as f:
+        urdf = f.read()
+    urdf = urdf.replace("</inertial>",
+        '<inertia ixx="0.1" ixy="0.0" ixz="0.0" iyy="0.1" iyz="0.0" izz="0.1"/></inertial>')
+    urdf = urdf.replace("0.0027000046)", "0.0027000046")
+    if "gripper_tcp" not in urdf:
+        urdf = urdf.replace("</robot>", GRIPPER_TCP_LINK + "\n</robot>")
+    with open(fixed_urdf, 'w') as f:
+        f.write(urdf)
+
+    with open(YAML_PATH, 'r') as f:
+        yaml_txt = f.read()
+    yaml_txt = yaml_txt.replace("root_link: world", "root_link: base_link")
+    if "gripper_tcp_joint" not in yaml_txt:
+        yaml_txt = yaml_txt.rstrip() + "\nee_fixed_joints:\n  - gripper_tcp_joint\n"
+    with open(fixed_yaml, 'w') as f:
+        f.write(yaml_txt)
+
+    return fixed_urdf, fixed_yaml
+
+
+# ═════════════════════════════════════════════════════════════
+# SHARED STATE
+# ═════════════════════════════════════════════════════════════
+
+class BridgeState:
+    def __init__(self):
+        self.robot = None
+        self.world = None
+        self.camera_rgb = None
+        self.camera_depth = None
+        self.lula_solver = None
+        self.target_frame = "ee_link"
+        self.arm_names = []
+        self.dof_names = []
+        self.num_dof = 15
+        self.is_ready = False
+        self.ik_ready = False
+        self.is_executing = False
+        self.last_error = None
+        self.execution_log = []
+        self._command_queue = []
+        self._result_queue = []
+        self._lock = threading.Lock()
+
+    def push_command(self, cmd):
+        with self._lock:
+            self._command_queue.append(cmd)
+
+    def pop_command(self):
+        with self._lock:
+            return self._command_queue.pop(0) if self._command_queue else None
+
+    def push_result(self, result):
+        with self._lock:
+            self._result_queue.append(result)
+
+    def pop_result(self, timeout=60):
+        start = time.time()
+        while time.time() - start < timeout:
+            with self._lock:
+                if self._result_queue:
+                    return self._result_queue.pop(0)
+            time.sleep(0.05)
+        return {"error": "Timeout waiting for Isaac Sim response"}
+
+
+STATE = BridgeState()
+
+
+# ═════════════════════════════════════════════════════════════
+# HTTP REQUEST HANDLER
+# ═════════════════════════════════════════════════════════════
+
+class BridgeHandler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        pass  # suppress default logging
+
+    def _send_json(self, data, status=200):
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode())
+
+    def _read_body(self):
+        length = int(self.headers.get("Content-Length", 0))
+        return json.loads(self.rfile.read(length)) if length > 0 else {}
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+
+    def do_GET(self):
+        path = self.path.split("?")[0]
+        if path == "/api/status":
+            self._handle_status()
+        elif path == "/api/camera":
+            cam_type = "rgb"
+            if "?" in self.path:
+                params = dict(p.split("=") for p in self.path.split("?")[1].split("&") if "=" in p)
+                cam_type = params.get("type", "rgb")
+            self._handle_camera(cam_type)
+        elif path == "/api/ping":
+            self._send_json({
+                "status": "ok", "bridge": "isaac_sim", "port": BRIDGE_PORT,
+                "cameras": ["rgb", "depth"], "ik_ready": STATE.ik_ready,
+            })
+        elif path == "/api/scene_parts":
+            self._handle_scene_parts()
+        else:
+            self._send_json({"error": f"Unknown endpoint: {path}"}, 404)
+
+    def do_POST(self):
+        body = self._read_body()
+        path = self.path.split("?")[0]
+        if path == "/api/execute":
+            self._handle_execute(body)
+        elif path == "/api/joints":
+            self._handle_set_joints(body)
+        elif path == "/api/home":
+            self._handle_home()
+        elif path == "/api/gripper":
+            self._handle_gripper(body)
+        elif path == "/api/approach":
+            self._handle_approach(body)
+        elif path == "/api/pick":
+            self._handle_pick(body)
+        elif path == "/api/place":
+            self._handle_place(body)
+        else:
+            self._send_json({"error": f"Unknown endpoint: {path}"}, 404)
+
+    # ── GET handlers ─────────────────────────────────────────
+
+    def _handle_status(self):
+        if not STATE.is_ready:
+            self._send_json({"status": "not_ready"})
+            return
+        try:
+            joints = STATE.robot.get_joint_positions()
+            self._send_json({
+                "status": "ready" if not STATE.is_executing else "executing",
+                "num_dof": STATE.num_dof,
+                "joint_names": list(STATE.dof_names),
+                "joint_positions": joints.tolist() if joints is not None else [],
+                "is_executing": STATE.is_executing,
+                "ik_ready": STATE.ik_ready,
+                "last_error": STATE.last_error,
+            })
+        except Exception as e:
+            self._send_json({"status": "error", "error": str(e)})
+
+    def _handle_camera(self, cam_type="rgb"):
+        if not STATE.is_ready:
+            self._send_json({"error": "Not ready"}, 503)
+            return
+        STATE.push_command({"action": "camera_capture", "camera": cam_type})
+        result = STATE.pop_result(timeout=10)
+        self._send_json(result)
+
+    def _handle_scene_parts(self):
+        """Scan the USD stage for pickable parts with real-world coordinates."""
+        if not STATE.is_ready:
+            self._send_json({"error": "Not ready"}, 503)
+            return
+        STATE.push_command({"action": "scan_scene_parts"})
+        result = STATE.pop_result(timeout=15)
+        self._send_json(result)
+
+    # ── POST handlers ────────────────────────────────────────
+
+    def _handle_execute(self, body):
+        plan = body.get("plan", [])
+        if not plan:
+            self._send_json({"error": "No plan provided"}, 400)
+            return
+        if STATE.is_executing:
+            self._send_json({"error": "Already executing"}, 409)
+            return
+        STATE.push_command({"action": "execute_plan", "plan": plan})
+        result = STATE.pop_result(timeout=300)
+        self._send_json(result)
+
+    def _handle_set_joints(self, body):
+        positions = body.get("positions", [])
+        if not positions:
+            self._send_json({"error": "No positions"}, 400)
+            return
+        STATE.push_command({"action": "set_joints", "positions": positions})
+        self._send_json(STATE.pop_result(timeout=15))
+
+    def _handle_home(self):
+        STATE.push_command({"action": "move_home"})
+        self._send_json(STATE.pop_result(timeout=15))
+
+    def _handle_gripper(self, body):
+        action = body.get("action", "open")
+        STATE.push_command({"action": f"gripper_{action}"})
+        self._send_json(STATE.pop_result(timeout=10))
+
+    def _handle_approach(self, body):
+        """Move near a target XYZ using Lula IK."""
+        STATE.push_command({"action": "approach", "params": body})
+        self._send_json(STATE.pop_result(timeout=30))
+
+    def _handle_pick(self, body):
+        """Full pick sequence at XYZ."""
+        STATE.push_command({"action": "pick_object_ik", "params": body})
+        self._send_json(STATE.pop_result(timeout=60))
+
+    def _handle_place(self, body):
+        """Full place sequence at XYZ."""
+        STATE.push_command({"action": "place_object_ik", "params": body})
+        self._send_json(STATE.pop_result(timeout=60))
+
+
+# ═════════════════════════════════════════════════════════════
+# ASYNC COMMAND PROCESSOR
+# ═════════════════════════════════════════════════════════════
+
+async def process_commands():
+    import omni.kit.app
+    while True:
+        cmd = STATE.pop_command()
+        if cmd is None:
+            await omni.kit.app.get_app().next_update_async()
+            continue
+
+        action = cmd.get("action", "")
+        try:
+            if action == "camera_capture":
+                result = await _capture_camera(cmd.get("camera", "rgb"))
+            elif action == "move_home":
+                result = await _move_home()
+            elif action == "set_joints":
+                result = await _set_joints(cmd["positions"])
+            elif action == "gripper_open":
+                result = await _set_gripper(FINGER_OPEN)
+            elif action == "gripper_close":
+                result = await _set_gripper(FINGER_CLOSE)
+            elif action == "execute_plan":
+                result = await _execute_plan(cmd["plan"])
+            elif action == "scan_scene_parts":
+                result = await _scan_scene_parts()
+            elif action == "approach":
+                result = await _approach_target(cmd.get("params", {}))
+            elif action == "pick_object_ik":
+                result = await _pick_object_ik(cmd.get("params", {}))
+            elif action == "place_object_ik":
+                result = await _place_object_ik(cmd.get("params", {}))
+            else:
+                result = {"error": f"Unknown action: {action}"}
+        except Exception as e:
+            result = {"error": str(e), "traceback": traceback.format_exc()}
+            STATE.last_error = str(e)
+
+        STATE.push_result(result)
+
+
+# ═════════════════════════════════════════════════════════════
+# CAMERA CAPTURE (with black-frame fix)
+# ═════════════════════════════════════════════════════════════
+
+async def _capture_camera(cam_type="rgb"):
+    try:
+        from omni.isaac.sensor import Camera
+        import omni.kit.app
+
+        if cam_type == "depth":
+            if STATE.camera_depth is None:
+                STATE.camera_depth = Camera(prim_path=CAMERA_DEPTH_PRIM, resolution=(640, 480))
+                STATE.camera_depth.initialize()
+                for _ in range(10):
+                    await omni.kit.app.get_app().next_update_async()
+            cam = STATE.camera_depth
+        else:
+            if STATE.camera_rgb is None:
+                STATE.camera_rgb = Camera(prim_path=CAMERA_RGB_PRIM, resolution=(640, 480))
+                STATE.camera_rgb.initialize()
+                for _ in range(10):
+                    await omni.kit.app.get_app().next_update_async()
+            cam = STATE.camera_rgb
+
+        # ── Black-frame fix ──────────────────────────────────
+        # Request two consecutive frames to avoid stale/black data
+        for attempt in range(3):
+            cam.get_current_frame()
+            for _ in range(3):
+                await omni.kit.app.get_app().next_update_async()
+
+            rgba = cam.get_rgba()
+            if rgba is not None and rgba.size > 0:
+                # Check if frame is mostly black (mean < 5 across RGB)
+                if np.mean(rgba[:, :, :3]) > 3:
+                    break  # valid frame
+            # else retry
+
+        if rgba is None or rgba.size == 0:
+            return {"error": f"{cam_type} camera returned empty frame"}
+
+        from PIL import Image
+        img = Image.fromarray(rgba[:, :, :3])
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        b64 = base64.b64encode(buf.getvalue()).decode()
+        return {
+            "image_base64": b64, "width": img.width, "height": img.height,
+            "format": "jpeg", "camera": cam_type,
+        }
+
+    except Exception as e:
+        return {"error": f"{cam_type} camera failed: {e}"}
+
+
+# ═════════════════════════════════════════════════════════════
+# SCENE PARTS SCANNER
+# ═════════════════════════════════════════════════════════════
+
+# Parts container prim — all pickable parts live under this
+PARTS_CONTAINER = "/World/robot_facade_full"
+
+async def _scan_scene_parts():
+    """Scan the USD stage for pickable parts with real-world bounding box coordinates."""
+    import omni.usd
+    from pxr import UsdGeom, Usd
+
+    try:
+        stage = omni.usd.get_context().get_stage()
+        container = stage.GetPrimAtPath(PARTS_CONTAINER)
+
+        if not container.IsValid():
+            return {"error": f"Parts container not found: {PARTS_CONTAINER}",
+                    "parts": [], "place_target": None}
+
+        parts = []
+        for child in container.GetChildren():
+            child_path = str(child.GetPath())
+            child_name = child.GetName()
+
+            # Skip non-mesh prims (like lights, cameras, etc)
+            # A pickable part should have geometry descendants
+            bbox_cache = UsdGeom.BBoxCache(
+                Usd.TimeCode.Default(), ["default", "render"], useExtentsHint=True)
+            world_bound = bbox_cache.ComputeWorldBound(child)
+            aligned = world_bound.ComputeAlignedRange()
+            min_pt = np.array(aligned.GetMin())
+            max_pt = np.array(aligned.GetMax())
+
+            # Skip zero-volume prims
+            dims = max_pt - min_pt
+            if np.all(dims < 1e-6):
+                continue
+
+            center = (min_pt + max_pt) / 2.0
+            height = float(dims[2])
+            top_z = float(max_pt[2])
+
+            parts.append({
+                "prim_path": child_path,
+                "name": child_name,
+                "center_xyz": [float(center[0]), float(center[1]), float(center[2])],
+                "top_z": top_z,
+                "height": height,
+                "bbox_min": min_pt.tolist(),
+                "bbox_max": max_pt.tolist(),
+            })
+
+        # Also get place destination geometry
+        place_info = None
+        try:
+            dest_geom = compute_bbox_geometry(stage, PLACE_BOX_PATH, "DESTINATION")
+            place_info = {
+                "prim_path": PLACE_BOX_PATH,
+                "center_xy": dest_geom["center_xy"],
+                "top_z": dest_geom["top_z"],
+            }
+        except Exception:
+            pass
+
+        return {
+            "status": "ok",
+            "parts_container": PARTS_CONTAINER,
+            "num_parts": len(parts),
+            "parts": parts,
+            "place_target": place_info,
+        }
+
+    except Exception as e:
+        return {"error": f"Scene scan failed: {e}", "parts": []}
+
+
+# ═════════════════════════════════════════════════════════════
+# BASIC MOTION PRIMITIVES
+# ═════════════════════════════════════════════════════════════
+
+async def _move_home():
+    import omni.kit.app
+    home_all = np.zeros(STATE.num_dof, dtype=np.float32)
+    for i, val in enumerate(HOME_JOINTS):
+        if i < STATE.num_dof:
+            home_all[i] = val
+    STATE.robot.set_joint_positions(home_all)
+    for _ in range(120):
+        await omni.kit.app.get_app().next_update_async()
+    return {"status": "ok", "action": "move_home",
+            "joint_positions": STATE.robot.get_joint_positions().tolist()}
+
+
+async def _set_joints(positions):
+    import omni.kit.app
+    pos = np.array(positions, dtype=np.float32)
+    if len(pos) == 7:
+        current = STATE.robot.get_joint_positions()
+        full = current.copy(); full[:7] = pos; pos = full
+    elif len(pos) != STATE.num_dof:
+        return {"error": f"Expected {STATE.num_dof} or 7 values, got {len(pos)}"}
+    STATE.robot.set_joint_positions(pos)
+    for _ in range(60):
+        await omni.kit.app.get_app().next_update_async()
+    return {"status": "ok", "joint_positions": STATE.robot.get_joint_positions().tolist()}
+
+
+async def _set_gripper(finger_value):
+    import omni.kit.app
+    from isaacsim.core.utils.types import ArticulationAction
+    targets = set_finger_joints(STATE.robot, STATE.dof_names, finger_value)
+    STATE.robot.apply_action(ArticulationAction(joint_positions=targets))
+    for _ in range(90):
+        await omni.kit.app.get_app().next_update_async()
+    return {"status": "ok",
+            "action": f"gripper_{'open' if finger_value < 0.1 else 'close'}",
+            "finger_value": finger_value}
+
+
+async def _verify_grasp():
+    finger_pos = STATE.robot.get_joint_positions()[7]
+    is_grasping = abs(finger_pos) > 0.05
+    return {"status": "ok", "is_grasping": bool(is_grasping), "finger_pos": float(finger_pos)}
+
+
+# ═════════════════════════════════════════════════════════════
+# LULA IK MOTION PRIMITIVES
+# ═════════════════════════════════════════════════════════════
+
+def _get_warm_start():
+    """Build a Lula-compatible warm-start from current joint positions."""
+    current = STATE.robot.get_joint_positions()
+    warm = np.zeros(len(STATE.arm_names))
+    for i, lula_name in enumerate(STATE.arm_names):
+        for idx, dof_name in enumerate(STATE.dof_names):
+            if lula_name in dof_name:
+                warm[i] = current[idx]
+                break
+    return warm
+
+
+def _update_base_pose():
+    """Update Lula solver with current arm base transform."""
+    import omni.usd
+    from isaacsim.core.utils.prims import get_prim_at_path
+    base_prim = get_prim_at_path(UR10_BASE_PATH)
+    base_matrix = omni.usd.get_world_transform_matrix(base_prim)
+    base_pos = np.array(base_matrix.ExtractTranslation())
+    rot = base_matrix.ExtractRotation().GetQuat()
+    base_rot = np.array([rot.real, rot.imaginary[0], rot.imaginary[1], rot.imaginary[2]])
+    STATE.lula_solver.set_robot_base_pose(base_pos, base_rot)
+    return base_pos
+
+
+async def _ik_move_to(target_xyz, orientation=None, settle_frames=150):
+    """Move end-effector to XYZ using Lula IK. Returns True on success."""
+    import omni.kit.app
+    from isaacsim.core.utils.types import ArticulationAction
+
+    if not STATE.ik_ready:
+        return {"error": "IK solver not initialised"}
+
+    ori = orientation if orientation is not None else normalize_quat(DOWNWARD_ORIENTATION)
+    warm = _get_warm_start()
+
+    action, ok = ik_solve(STATE.lula_solver, STATE.target_frame,
+                          np.array(target_xyz, dtype=np.float64), ori, warm)
+    if not ok:
+        return {"error": f"IK failed for target {target_xyz}"}
+
+    targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, action)
+    STATE.robot.apply_action(ArticulationAction(joint_positions=targets))
+    for _ in range(settle_frames):
+        await omni.kit.app.get_app().next_update_async()
+
+    ee_pos = get_world_pos(EE_PATH)
+    return {"status": "ok", "target": list(target_xyz), "ee_position": ee_pos.tolist()}
+
+
+async def _move_gantry_x(target_x):
+    """Move the X-gantry to align with a target X coordinate."""
+    import omni.kit.app
+    from isaacsim.core.utils.types import ArticulationAction
+
+    targets = STATE.robot.get_joint_positions()
+    gantry_idx = None
+    for idx, name in enumerate(STATE.dof_names):
+        if GANTRY_X_JOINT in name:
+            gantry_idx = idx
+            targets[idx] = target_x - GANTRY_X_OFFSET
+            break
+
+    if gantry_idx is None:
+        return {"error": "Gantry joint not found"}
+
+    STATE.robot.apply_action(ArticulationAction(joint_positions=targets))
+    for _ in range(120):
+        await omni.kit.app.get_app().next_update_async()
+
+    _update_base_pose()
+    return {"status": "ok", "gantry_x": float(targets[gantry_idx])}
+
+
+async def _approach_target(params):
+    """Move arm near target XYZ at safe height (for depth camera inspection)."""
+    x = params.get("x", 0.3)
+    y = params.get("y", 0.0)
+    z = params.get("z", 0.5)
+    safe_z = z + BOX_ENTRY_MARGIN + BOX_HEIGHT + GRIPPER_TCP_OFFSET
+
+    # Move gantry first
+    await _move_gantry_x(x)
+
+    # Move arm to safe height above target XY
+    result = await _ik_move_to([x, y, safe_z])
+    if "error" in result:
+        return result
+
+    return {"status": "ok", "action": "approach",
+            "target": [x, y, z], "ee_position": result["ee_position"]}
+
+
+async def _pick_object_ik(params):
+    """Full IK-based pick sequence: approach → hover → descend → grasp → retract."""
+    import omni.kit.app, omni.usd
+    from isaacsim.core.utils.types import ArticulationAction
+
+    if not STATE.ik_ready:
+        return {"error": "IK solver not initialised"}
+
+    x = params.get("x", 0.3)
+    y = params.get("y", 0.0)
+    z = params.get("z", 0.02)
+    part_path = params.get("part_prim", None)
+
+    STATE.is_executing = True
+    steps = []
+    try:
+        locked_ori = normalize_quat(DOWNWARD_ORIENTATION)
+        tcp_z_offset = 0.0 if STATE.target_frame == "gripper_tcp" else GRIPPER_TCP_OFFSET
+
+        # Use bbox geometry if part_prim is provided
+        if part_path:
+            stage = omni.usd.get_context().get_stage()
+            try:
+                geom = compute_grasp_geometry(stage, part_path, GRASP_DEPTH_FRACTION)
+                x = geom["part_center_xy"][0]
+                y = geom["part_center_xy"][1]
+                part_top_z = geom["part_top_z"]
+                grasp_z = geom["grasp_z"]
+            except Exception:
+                part_top_z = z
+                grasp_z = z
+        else:
+            part_top_z = z
+            grasp_z = z
+
+        safe_z = part_top_z + BOX_HEIGHT + BOX_ENTRY_MARGIN + tcp_z_offset
+        hover_z = part_top_z + HOVER_CLEARANCE + tcp_z_offset
+        grasp_target_z = grasp_z + tcp_z_offset
+
+        # 1. Move gantry
+        await _move_gantry_x(x)
+        _update_base_pose()
+        steps.append({"phase": "gantry", "status": "ok"})
+
+        # 2. Open gripper
+        await _set_gripper(FINGER_OPEN)
+        steps.append({"phase": "open_gripper", "status": "ok"})
+
+        # 3. Move to safe height above target
+        r = await _ik_move_to([x, y, safe_z])
+        if "error" in r: return {**r, "steps": steps}
+        steps.append({"phase": "safe_height", "status": "ok", "detail": r})
+
+        # 4. Descend to hover (inside box if applicable)
+        r = await _ik_move_to([x, y, hover_z])
+        if "error" in r: return {**r, "steps": steps}
+        steps.append({"phase": "hover", "status": "ok"})
+
+        # 5. Plunge to grasp height
+        r = await _ik_move_to([x, y, grasp_target_z], settle_frames=100)
+        if "error" in r: return {**r, "steps": steps}
+        steps.append({"phase": "grasp_descend", "status": "ok"})
+
+        # 6. Close gripper
+        await _set_gripper(FINGER_CLOSE)
+        steps.append({"phase": "close_gripper", "status": "ok"})
+
+        # 7. Verify grasp
+        grasp_check = await _verify_grasp()
+        steps.append({"phase": "verify_grasp", "status": "ok", "detail": grasp_check})
+
+        # 8. Retract to safe height (keep fingers closed)
+        targets = STATE.robot.get_joint_positions()
+        warm = _get_warm_start()
+        action, ok = ik_solve(STATE.lula_solver, STATE.target_frame,
+                              np.array([x, y, safe_z]), locked_ori, warm)
+        if ok:
+            targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, action)
+            targets = set_finger_joints(STATE.robot, STATE.dof_names, FINGER_CLOSE, targets)
+            STATE.robot.apply_action(ArticulationAction(joint_positions=targets))
+            for _ in range(150):
+                await omni.kit.app.get_app().next_update_async()
+        steps.append({"phase": "retract", "status": "ok"})
+
+        return {"status": "completed", "action": "pick_object",
+                "position": [x, y, z], "steps": steps}
+
+    except Exception as e:
+        return {"status": "error", "error": str(e), "steps": steps}
+    finally:
+        STATE.is_executing = False
+
+
+async def _place_object_ik(params):
+    """Full IK-based place sequence: transit → gantry → safe → descend → release → retract."""
+    import omni.kit.app, omni.usd
+    from isaacsim.core.utils.types import ArticulationAction
+
+    if not STATE.ik_ready:
+        return {"error": "IK solver not initialised"}
+
+    x = params.get("x", 0.5)
+    y = params.get("y", 0.0)
+    z = params.get("z", 0.02)
+    dest_prim = params.get("dest_prim", PLACE_BOX_PATH)
+
+    STATE.is_executing = True
+    steps = []
+    try:
+        locked_ori = normalize_quat(DOWNWARD_ORIENTATION)
+        tcp_z_offset = 0.0 if STATE.target_frame == "gripper_tcp" else GRIPPER_TCP_OFFSET
+
+        # Compute destination geometry
+        stage = omni.usd.get_context().get_stage()
+        try:
+            dest_geom = compute_bbox_geometry(stage, dest_prim, "DESTINATION")
+            dest_x = dest_geom["center_xy"][0]
+            dest_y = dest_geom["center_xy"][1]
+            dest_top_z = dest_geom["top_z"]
+        except Exception:
+            dest_x, dest_y, dest_top_z = x, y, z
+
+        place_z = dest_top_z + PLACE_DROP_HEIGHT + tcp_z_offset
+        place_safe_z = dest_top_z + BOX_ENTRY_MARGIN + tcp_z_offset
+
+        # 1. Transit — raise arm high before lateral gantry move
+        current_ee = get_world_pos(EE_PATH)
+        transit_z = current_ee[2] + TRANSIT_SAFE_HEIGHT
+        r = await _ik_move_to([current_ee[0], current_ee[1], transit_z])
+        steps.append({"phase": "transit_up", "status": "ok" if "error" not in r else "warn"})
+
+        # 2. Move gantry to destination X
+        await _move_gantry_x(dest_x)
+        _update_base_pose()
+        steps.append({"phase": "gantry_move", "status": "ok"})
+
+        # 3. Move to safe height above destination
+        r = await _ik_move_to([dest_x, dest_y, place_safe_z])
+        if "error" in r: return {**r, "steps": steps}
+        steps.append({"phase": "place_safe", "status": "ok"})
+
+        # 4. Descend to place height (fingers still closed)
+        r = await _ik_move_to([dest_x, dest_y, place_z], settle_frames=150)
+        if "error" in r: return {**r, "steps": steps}
+        steps.append({"phase": "place_descend", "status": "ok"})
+
+        # 5. Open gripper — release part
+        await _set_gripper(FINGER_OPEN)
+        steps.append({"phase": "release", "status": "ok"})
+
+        # 6. Retract
+        retract_z = dest_top_z + PLACE_RETRACT_HEIGHT + tcp_z_offset
+        r = await _ik_move_to([dest_x, dest_y, retract_z])
+        steps.append({"phase": "retract", "status": "ok"})
+
+        return {"status": "completed", "action": "place_object",
+                "position": [dest_x, dest_y, dest_top_z], "steps": steps}
+
+    except Exception as e:
+        return {"status": "error", "error": str(e), "steps": steps}
+    finally:
+        STATE.is_executing = False
+
+
+# ═════════════════════════════════════════════════════════════
+# EXECUTE PLAN (action primitive dispatcher)
+# ═════════════════════════════════════════════════════════════
+
+async def _execute_plan(plan_steps):
+    import omni.kit.app
+    STATE.is_executing = True
+    results = []
+    try:
+        for step in plan_steps:
+            step_num = step.get("step", "?")
+            action = step.get("action", "")
+            params = step.get("params", {})
+            step_result = {"step": step_num, "action": action}
+            t0 = time.time()
+            try:
+                if action == "move_home":
+                    r = await _move_home()
+                elif action == "open_gripper":
+                    r = await _set_gripper(FINGER_OPEN)
+                elif action == "close_gripper":
+                    r = await _set_gripper(FINGER_CLOSE)
+                elif action == "pick_object":
+                    r = await _pick_object_ik(params)
+                elif action == "place_object":
+                    r = await _place_object_ik(params)
+                elif action == "move_to_pose":
+                    pos = [params.get("x", 0), params.get("y", 0), params.get("z", 0)]
+                    r = await _ik_move_to(pos)
+                elif action == "verify_grasp":
+                    r = await _verify_grasp()
+                elif action == "request_perception_update":
+                    r = {"status": "ok", "note": "Perception handled by Streamlit"}
+                else:
+                    r = {"status": "skipped", "reason": f"Unknown: {action}"}
+                step_result["status"] = "success"
+                step_result["detail"] = r
+            except Exception as e:
+                step_result["status"] = "failed"
+                step_result["error"] = str(e)
+            step_result["duration"] = round(time.time() - t0, 2)
+            results.append(step_result)
+    finally:
+        STATE.is_executing = False
+
+    return {
+        "status": "completed",
+        "total_steps": len(results),
+        "successful": sum(1 for r in results if r["status"] == "success"),
+        "failed": sum(1 for r in results if r["status"] == "failed"),
+        "steps": results,
+    }
+
+
+# ═════════════════════════════════════════════════════════════
+# STARTUP
+# ═════════════════════════════════════════════════════════════
+
+async def start_bridge():
+    import omni.kit.app, omni.timeline
+    from isaacsim.core.api import World
+    from isaacsim.core.prims import SingleArticulation
+
+    print("=" * 60)
+    print("  KITTING BRIDGE SERVER v2 — Starting...")
+    print("=" * 60)
+
+    # ── World & Robot ────────────────────────────────────────
+    world = World.instance()
+    if not world:
+        world = World(physics_dt=1/60, rendering_dt=1/60)
+
+    robot = world.scene.get_object("kitting_bridge")
+    if not robot:
+        robot = SingleArticulation(prim_path=ROBOT_PRIM, name="kitting_bridge")
+        world.scene.add(robot)
+
+    timeline = omni.timeline.get_timeline_interface()
+    timeline.play()
+    for _ in range(10):
+        await omni.kit.app.get_app().next_update_async()
+
+    robot.initialize()
+
+    STATE.robot = robot
+    STATE.world = world
+    STATE.num_dof = robot.num_dof
+    STATE.dof_names = robot.dof_names
+    STATE.is_ready = True
+
+    print(f"[OK] Robot ready — {STATE.num_dof} DOFs")
+
+    # ── Lula IK Solver ───────────────────────────────────────
+    try:
+        from omni.isaac.motion_generation import LulaKinematicsSolver
+
+        fixed_urdf, fixed_yaml = patch_urdf_and_yaml()
+        print(f"[OK] URDF patched: {fixed_urdf}")
+
+        lula_solver = LulaKinematicsSolver(
+            robot_description_path=fixed_yaml, urdf_path=fixed_urdf)
+
+        # Determine target frame
+        target_frame = "ee_link"
+        try:
+            test_pos = np.array([0.0, -0.5, 1.2])
+            test_ori = normalize_quat(DOWNWARD_ORIENTATION)
+            _, test_ok = lula_solver.compute_inverse_kinematics(
+                frame_name="gripper_tcp", target_position=test_pos,
+                target_orientation=test_ori, warm_start=np.zeros(6))
+            if test_ok:
+                target_frame = "gripper_tcp"
+        except Exception:
+            pass
+
+        STATE.lula_solver = lula_solver
+        STATE.target_frame = target_frame
+        STATE.arm_names = lula_solver.get_joint_names()
+        STATE.ik_ready = True
+
+        # Set initial base pose
+        _update_base_pose()
+
+        print(f"[OK] Lula IK ready — frame='{target_frame}', joints={STATE.arm_names}")
+    except Exception as e:
+        print(f"[WARN] Lula IK init failed (motion will use set_joints): {e}")
+        STATE.ik_ready = False
+
+    # ── HTTP Server ──────────────────────────────────────────
+    server = HTTPServer(("0.0.0.0", BRIDGE_PORT), BridgeHandler)
+
+    def serve():
+        print(f"[OK] Bridge v2 on http://localhost:{BRIDGE_PORT}")
+        print(f"     IK: {'Lula ({})'.format(STATE.target_frame) if STATE.ik_ready else 'DISABLED'}")
+        print(f"     Cameras: RGB={CAMERA_RGB_PRIM}")
+        print(f"              Depth={CAMERA_DEPTH_PRIM}")
+        print("=" * 60)
+        server.serve_forever()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+
+    await process_commands()
+
+
+asyncio.ensure_future(start_bridge())
