@@ -245,6 +245,7 @@ class KittingWorkflowEngine:
             # PHASES 3-8: Execute plan step by step
             # ═══════════════════════════════════════════════════
             execution_results = []
+            last_finger_close = None  # track adaptive grip from last pick
 
             for step in plan.get("plan", []):
                 if self._cancelled:
@@ -262,10 +263,16 @@ class KittingWorkflowEngine:
                 if action == "pick_object":
                     step_result = self._execute_pick_sequence(
                         step, params, scene, step_num)
+                    # Remember the adaptive finger_close for the following place
+                    last_finger_close = step_result.get("finger_close")
 
                 elif action == "place_object":
+                    # Pass adaptive finger_close from the preceding pick
+                    if last_finger_close is not None:
+                        params["finger_close"] = last_finger_close
                     step_result = self._execute_place_sequence(
                         step, params, scene, step_num)
+                    last_finger_close = None  # reset after place
 
                 elif action == "move_home":
                     self._notify("move_home", "running", f"Step {step_num}")
@@ -540,6 +547,10 @@ class KittingWorkflowEngine:
         pick_result = self.camera.send_command("/api/pick", pick_payload)
         pick_ok = pick_result.get("status") == "completed"
 
+        # Store adaptive finger_close so place sequence can use it
+        if "finger_close" in pick_result:
+            result["finger_close"] = pick_result["finger_close"]
+
         result["sub_phases"].append({
             "phase": WorkflowPhase.PICK_EXECUTE,
             "status": "success" if pick_ok else "failed",
@@ -569,6 +580,8 @@ class KittingWorkflowEngine:
         }
         if "dest_prim" in params:
             place_payload["dest_prim"] = params["dest_prim"]
+        if "finger_close" in params:
+            place_payload["finger_close"] = params["finger_close"]
 
         place_result = self.camera.send_command("/api/place", place_payload)
         place_ok = place_result.get("status") == "completed"

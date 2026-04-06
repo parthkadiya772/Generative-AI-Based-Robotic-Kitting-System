@@ -17,4 +17,11 @@ implementation_plan.md
 task.md
 walkthrough.md
 test_results.txt
+.claude/
+.cursorrules
+.mcp.json
+.windsurfrules
+AGENTS.md
+GEMINI.md
+.code-review-graph/
 .gitignore
