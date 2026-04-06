@@ -54,12 +54,7 @@ perception:
       model: "qwen3-vl:32b"
       base_url: "http://10.7.0.35:11434"
 
-    - name: "Qwen3.5 9B (VPN Remote)"
-      provider: "ollama_qwen"
-      model: "qwen3.5:9b"
-      base_url: "http://10.7.0.35:11434"
-
-    - name: "Qwen3.5-VL 27B (VPN Remote)"
+    - name: "Qwen3.5 27B (VPN Remote)"
       provider: "ollama_qwen"
       model: "qwen3.5:27b"
       base_url: "http://10.7.0.35:11434"
@@ -67,6 +62,16 @@ perception:
     - name: "LLaVA 13B (VPN Remote)"
       provider: "ollama_llava"
       model: "llava:13b"
+      base_url: "http://10.7.0.35:11434"
+
+    - name: "Qwen3.5 9B (VPN Remote)"
+      provider: "ollama_qwen"
+      model: "qwen3.5:9b"
+      base_url: "http://10.7.0.35:11434"
+
+    - name: "Qwen2.5-VL 7B (VPN Remote)"
+      provider: "ollama_qwen"
+      model: "qwen2.5vl:7b"
       base_url: "http://10.7.0.35:11434"
 
 # ─── Orchestration (LLM) ────────────────────────────────────

@@ -13,3 +13,8 @@ aikido_paths.txt
 AIKIDO_test.usd
 AIKIDO_USDA.usda
 CLAUDE.md
+implementation_plan.md
+task.md
+walkthrough.md
+test_results.txt
+.gitignore

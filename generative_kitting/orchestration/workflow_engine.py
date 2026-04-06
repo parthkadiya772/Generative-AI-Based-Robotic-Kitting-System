@@ -337,7 +337,21 @@ class KittingWorkflowEngine:
         if not usd_parts:
             return "No USD part data available — use your best visual estimate."
 
-        lines = ["REAL WORLD PART POSITIONS (from USD bounding boxes):"]
+        # Count parts by type so VLM knows exactly how many of each exist
+        import re
+        from collections import Counter
+        type_counts = Counter()
+        for p in usd_parts:
+            # Strip trailing digits to get base type: "motor_valve_01" → "motor_valve"
+            base_type = re.sub(r'[_\-]?\d+$', '', p['name'].lower())
+            type_counts[base_type] += 1
+
+        lines = [f"TOTAL PARTS IN SCENE: {len(usd_parts)}"]
+        summary_parts = [f"{count}x {ptype}" for ptype, count in type_counts.items()]
+        lines.append(f"PART COUNTS: {', '.join(summary_parts)}")
+        lines.append(f"You MUST detect exactly {len(usd_parts)} parts — no more, no fewer.")
+        lines.append("")
+        lines.append("REAL WORLD PART POSITIONS (from USD bounding boxes):")
         for i, p in enumerate(usd_parts):
             c = p.get("center_xyz", [0, 0, 0])
             lines.append(
@@ -359,52 +373,82 @@ class KittingWorkflowEngine:
         """
         Replace VLM approximate_position with real USD coordinates.
 
-        Strategy: fuzzy match VLM labels to USD prim names.
-        If a VLM label matches a USD prim name (case-insensitive substring),
-        use the USD bounding box center as the real position.
+        Strategy: fuzzy match VLM labels to USD prim names.  When multiple
+        USD prims share the same part type (e.g. 3 motor_valves), each VLM
+        detection is matched to the *nearest unmatched* USD prim by comparing
+        the VLM estimate position to USD bounding box centres.
         """
         if not usd_parts:
             return scene
 
-        # Build lookup: lowercase prim name → part data
-        usd_lookup = {}
+        # Group USD prims by normalised part type label
+        # e.g. "motor_valve_01" → type key "motorvalve"
+        from collections import defaultdict
+        type_groups = defaultdict(list)
         for p in usd_parts:
-            name = p["name"].lower().replace("_", "").replace("-", "")
-            usd_lookup[name] = p
-            # Also add partial keys
-            for word in p["name"].lower().split("_"):
-                if len(word) > 3:
-                    usd_lookup[word] = p
+            name_lower = p["name"].lower()
+            # Extract part type: strip trailing digits/underscores (e.g. "_01", "_2")
+            import re
+            type_key = re.sub(r'[_\-]?\d+$', '', name_lower).replace("_", "").replace("-", "")
+            type_groups[type_key].append(dict(p))  # copy so we can pop
+
+        # Track which USD prims have already been claimed
+        claimed_paths = set()
 
         for obj in scene.get("detected_objects", []):
             label = obj.get("label", "").lower().replace("_", "").replace("-", "")
 
-            # Try exact match first
-            matched_part = usd_lookup.get(label)
-
-            # Try partial match
-            if not matched_part:
-                for key, part in usd_lookup.items():
-                    if key in label or label in key:
-                        matched_part = part
+            # Find the matching type group
+            candidates = None
+            # Exact type match
+            if label in type_groups:
+                candidates = type_groups[label]
+            else:
+                # Partial match
+                for type_key, parts in type_groups.items():
+                    if type_key in label or label in type_key:
+                        candidates = parts
                         break
 
-            if matched_part:
-                center = matched_part["center_xyz"]
-                obj["approximate_position"] = {
-                    "x": center[0], "y": center[1], "z": center[2]
-                }
-                obj["prim_path"] = matched_part["prim_path"]
-                obj["_source"] = "usd_bbox"
-                log.info(
-                    f"Matched VLM '{obj['label']}' → USD '{matched_part['name']}' "
-                    f"at ({center[0]:.3f}, {center[1]:.3f}, {center[2]:.3f})"
-                )
-            else:
+            if not candidates:
                 obj["_source"] = "vlm_estimate"
                 log.warning(
                     f"No USD match for VLM label '{obj['label']}' — using VLM estimate"
                 )
+                continue
+
+            # Filter out already-claimed prims
+            available = [p for p in candidates if p["prim_path"] not in claimed_paths]
+            if not available:
+                obj["_source"] = "vlm_estimate"
+                log.warning(
+                    f"All USD prims for '{obj['label']}' already claimed — using VLM estimate"
+                )
+                continue
+
+            # Pick the nearest unclaimed USD prim by distance to VLM estimate
+            vlm_pos = obj.get("approximate_position", {})
+            vlm_x = vlm_pos.get("x", 0.0)
+            vlm_y = vlm_pos.get("y", 0.0)
+
+            best = min(available, key=lambda p: (
+                (p["center_xyz"][0] - vlm_x) ** 2 +
+                (p["center_xyz"][1] - vlm_y) ** 2
+            ))
+
+            # Assign real coordinates and mark as claimed
+            center = best["center_xyz"]
+            obj["approximate_position"] = {
+                "x": center[0], "y": center[1], "z": center[2]
+            }
+            obj["prim_path"] = best["prim_path"]
+            obj["_source"] = "usd_bbox"
+            claimed_paths.add(best["prim_path"])
+
+            log.info(
+                f"Matched VLM '{obj['label']}' → USD '{best['name']}' "
+                f"at ({center[0]:.3f}, {center[1]:.3f}, {center[2]:.3f})"
+            )
 
         return scene
 

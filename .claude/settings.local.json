@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(chmod +x c:/KP/AI_and_Automation/Sem_4/Thesis/robot_in_air/generative_kitting/run_ui.sh)",
+      "Bash(python -m pytest tests/ -v)"
+    ]
+  }
+}
