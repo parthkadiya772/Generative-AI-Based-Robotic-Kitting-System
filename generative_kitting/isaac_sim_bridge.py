@@ -69,8 +69,8 @@ GRIP_OVERSHOOT = 0.060   # 60mm extra closing past part width for firm contact
 GRIPPER_TCP_OFFSET   = 0.150
 GRIPPER_BODY_WIDTH   = 0.160
 GRIPPER_HALF_WIDTH   = GRIPPER_BODY_WIDTH / 2.0
-HOVER_CLEARANCE      = 0.015
-GRASP_DEPTH_FRACTION = 0.5
+HOVER_CLEARANCE      = 0.020
+GRASP_DEPTH_FRACTION = 0.3   # 0.3 = upper third of part (avoids bin bottom)
 BOX_HEIGHT           = 0.05
 BOX_ENTRY_MARGIN     = 0.15
 PLACE_DROP_HEIGHT    = 0.02
@@ -78,9 +78,11 @@ PLACE_RETRACT_HEIGHT = 0.25
 TRANSIT_SAFE_HEIGHT  = 0.70
 DOWNWARD_ORIENTATION = np.array([1.0, 0.0, 1.0, 0.0])
 
-# Max angular step (radians) per interpolation segment — smaller = smoother
-# 0.2 rad (~11 deg) keeps the ceiling-mounted UR10 from swinging through itself
-INTERP_MAX_STEP = 0.2
+# Interpolation parameters for smooth motion
+INTERP_MAX_STEP  = 0.15   # rad per streaming waypoint (smaller = smoother path)
+INTERP_THRESHOLD = 0.5    # rad — only interpolate if any joint jumps more than this
+STREAM_FRAMES    = 3      # physics frames per streaming waypoint (low = continuous motion)
+SETTLE_FRAMES    = 60     # physics frames to settle at final position
 
 
 # ═════════════════════════════════════════════════════════════
@@ -192,10 +194,11 @@ def _check_self_collision_risk(current_joints, target_joints):
     """Check if a direct move risks self-collision (large joint angle jumps)."""
     if current_joints is None or target_joints is None:
         return True
-    arm_current = np.array(current_joints[:6] if len(current_joints) >= 6 else current_joints)
-    arm_target = np.array(target_joints[:6] if len(target_joints) >= 6 else target_joints)
+    n = min(7, len(current_joints), len(target_joints))
+    arm_current = np.array(current_joints[:n])
+    arm_target = np.array(target_joints[:n])
     max_delta = np.max(np.abs(arm_target - arm_current))
-    return max_delta > INTERP_MAX_STEP * 2
+    return max_delta > INTERP_THRESHOLD
 
 
 def _interpolate_joints(start, end, max_step=INTERP_MAX_STEP):
@@ -718,10 +721,10 @@ async def _move_home():
                               locked_ori, warm)
         if ok:
             targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, action)
-            await _apply_interpolated(targets, settle_frames=150)
+            await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES)
 
     # Interpolate to home position to prevent self-collision
-    await _apply_interpolated(home_all, settle_frames=150)
+    await _apply_interpolated(home_all, settle_frames=SETTLE_FRAMES)
     return {"status": "ok", "action": "move_home",
             "joint_positions": STATE.robot.get_joint_positions().tolist()}
 
@@ -746,8 +749,8 @@ async def _set_gripper(finger_value):
     from isaacsim.core.utils.types import ArticulationAction
     targets = set_finger_joints(STATE.robot, STATE.dof_names, finger_value)
     STATE.robot.apply_action(ArticulationAction(joint_positions=targets))
-    # 180 frames for gripper to fully close/open and settle against part
-    for _ in range(180):
+    # 90 frames for gripper to fully close/open (with boosted stiffness, faster settle)
+    for _ in range(90):
         await omni.kit.app.get_app().next_update_async()
     return {"status": "ok",
             "action": f"gripper_{'open' if finger_value < 0.1 else 'close'}",
@@ -820,57 +823,42 @@ def _update_base_pose():
     return base_pos
 
 
-async def _apply_interpolated(target_joints, settle_frames=150, finger_value=None):
-    """Apply joint targets with automatic interpolation if the jump is large.
+async def _apply_interpolated(target_joints, settle_frames=SETTLE_FRAMES, finger_value=None):
+    """Move arm to target with smooth continuous motion.
 
-    This prevents self-collision by splitting big joint-space jumps into
-    smooth intermediate waypoints.  When finger_value is provided, every
-    waypoint (and the final target) includes the finger PD target so the
-    gripper maintains hold throughout the motion.  The full target is
-    re-applied every GRIP_REFRESH_INTERVAL frames to prevent PD drift.
+    For large joint jumps (> INTERP_THRESHOLD): generates intermediate
+    waypoints and STREAMS them at STREAM_FRAMES per waypoint — creating
+    smooth continuous motion instead of step-pause jerks.
+
+    For small motions: single apply_action with settle.
+
+    In both cases, only the FINAL position gets a full settle.
     """
     import omni.kit.app
     from isaacsim.core.utils.types import ArticulationAction
-
-    GRIP_REFRESH_INTERVAL = 15  # re-apply target every N frames
 
     current_joints = STATE.robot.get_joint_positions()
 
+    # Build final target with finger values baked in
+    final_target = target_joints if finger_value is None else \
+        set_finger_joints(STATE.robot, STATE.dof_names, finger_value, target_joints.copy())
+
+    # Smooth streaming for large motions
     if _check_self_collision_risk(current_joints, target_joints):
-        waypoints = _interpolate_joints(current_joints, target_joints)
-        frames_per_wp = max(20, settle_frames // (len(waypoints) + 1))
+        waypoints = _interpolate_joints(current_joints, final_target)
         for wp in waypoints:
-            if finger_value is not None:
-                wp = set_finger_joints(STATE.robot, STATE.dof_names, finger_value, wp.copy())
             STATE.robot.apply_action(ArticulationAction(joint_positions=wp))
-            for fi in range(frames_per_wp):
+            for _ in range(STREAM_FRAMES):
                 await omni.kit.app.get_app().next_update_async()
-                # Periodically re-apply the SAME waypoint target to keep
-                # fingers locked (same arm target → no disruption to motion)
-                if finger_value is not None and fi % GRIP_REFRESH_INTERVAL == (GRIP_REFRESH_INTERVAL - 1):
-                    STATE.robot.apply_action(ArticulationAction(joint_positions=wp))
-    else:
-        if finger_value is not None:
-            target_joints = set_finger_joints(
-                STATE.robot, STATE.dof_names, finger_value, target_joints.copy())
-        STATE.robot.apply_action(ArticulationAction(joint_positions=target_joints))
-        for fi in range(settle_frames):
-            await omni.kit.app.get_app().next_update_async()
-            # Re-apply the same target periodically to reinforce finger grip
-            if finger_value is not None and fi % GRIP_REFRESH_INTERVAL == (GRIP_REFRESH_INTERVAL - 1):
-                STATE.robot.apply_action(ArticulationAction(joint_positions=target_joints))
+
+    # Final settle at exact target
+    STATE.robot.apply_action(ArticulationAction(joint_positions=final_target))
+    for _ in range(settle_frames):
+        await omni.kit.app.get_app().next_update_async()
 
 
-async def _ik_move_to(target_xyz, orientation=None, settle_frames=150):
-    """Move end-effector to XYZ using Lula IK.
-
-    Used for simple moves (approach, place). For the pick sequence,
-    use _pick_object_ik which chains warm-starts between phases.
-    Interpolation is applied when joint jumps exceed INTERP_MAX_STEP.
-    """
-    import omni.kit.app
-    from isaacsim.core.utils.types import ArticulationAction
-
+async def _ik_move_to(target_xyz, orientation=None, settle_frames=SETTLE_FRAMES):
+    """Move end-effector to XYZ using Lula IK with smooth streaming motion."""
     if not STATE.ik_ready:
         return {"error": "IK solver not initialised"}
 
@@ -882,21 +870,8 @@ async def _ik_move_to(target_xyz, orientation=None, settle_frames=150):
     if not ok:
         return {"error": f"IK failed for target {target_xyz}"}
 
-    current_joints = STATE.robot.get_joint_positions()
     target_joints = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, action)
-
-    # Interpolate if the joint-space jump is large (prevents self-collision)
-    if _check_self_collision_risk(current_joints, target_joints):
-        waypoints = _interpolate_joints(current_joints, target_joints)
-        frames_per_wp = max(20, settle_frames // (len(waypoints) + 1))
-        for wp in waypoints:
-            STATE.robot.apply_action(ArticulationAction(joint_positions=wp))
-            for _ in range(frames_per_wp):
-                await omni.kit.app.get_app().next_update_async()
-    else:
-        STATE.robot.apply_action(ArticulationAction(joint_positions=target_joints))
-        for _ in range(settle_frames):
-            await omni.kit.app.get_app().next_update_async()
+    await _apply_interpolated(target_joints, settle_frames=settle_frames)
 
     ee_pos = get_world_pos(EE_PATH)
     return {"status": "ok", "target": list(target_xyz), "ee_position": ee_pos.tolist()}
@@ -930,11 +905,8 @@ async def _move_gantry_x(target_x, finger_hold=None):
         targets = set_finger_joints(STATE.robot, STATE.dof_names, finger_hold, targets)
 
     STATE.robot.apply_action(ArticulationAction(joint_positions=targets))
-    for fi in range(120):
+    for _ in range(SETTLE_FRAMES):
         await omni.kit.app.get_app().next_update_async()
-        # Re-apply every 15 frames to keep finger grip locked during gantry move
-        if finger_hold is not None and fi % 15 == 14:
-            STATE.robot.apply_action(ArticulationAction(joint_positions=targets))
 
     _update_base_pose()
     return {"status": "ok", "gantry_x": float(targets[gantry_idx])}
@@ -1010,11 +982,13 @@ async def _pick_object_ik(params):
             grasp_z = z
 
         safe_z = part_top_z + BOX_HEIGHT + BOX_ENTRY_MARGIN + tcp_z_offset
+        entry_z = part_top_z + BOX_HEIGHT + tcp_z_offset  # just inside box rim
         hover_z = part_top_z + HOVER_CLEARANCE + tcp_z_offset
         grasp_target_z = grasp_z + tcp_z_offset
         transit_z = safe_z + TRANSIT_SAFE_HEIGHT
 
         safe_pos = np.array([x, y, safe_z])
+        entry_pos = np.array([x, y, entry_z])
         hover_pos = np.array([x, y, hover_z])
         grasp_pos = np.array([x, y, grasp_target_z])
         transit_pos = np.array([x, y, transit_z])
@@ -1040,25 +1014,36 @@ async def _pick_object_ik(params):
             return {"error": f"IK Phase 1 failed for safe_pos {safe_pos.tolist()}", "steps": steps}
 
         targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, p1_action)
-        await _apply_interpolated(targets, settle_frames=150)
+        await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES)
         steps.append({"phase": "safe_height", "status": "ok"})
 
-        # 4. PHASE 2 -- Re-solve from settled pose (same target, better seed)
+        # 4. Re-solve from settled pose (same target, better seed)
         settled_warm = _get_warm_start()
         p2_action, p2_ok = ik_solve(STATE.lula_solver, STATE.target_frame,
                                      safe_pos, locked_ori, settled_warm)
         if not p2_ok:
             p2_action = p1_action  # fallback: use Phase 1 result
 
-        # 5. PHASE 3a -- Hover: descend inside box, above part
-        #    Warm-start from Phase 2 solution (NOT from current joints)
+        # 5. Entry — descend vertically to just inside the box rim
+        #    This forces a pure vertical path through the rim opening,
+        #    preventing the IK solver from swinging the arm horizontally.
+        entry_action, entry_ok = ik_solve(STATE.lula_solver, STATE.target_frame,
+                                           entry_pos, locked_ori, p2_action)
+        if entry_ok:
+            targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, entry_action)
+            await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES)
+            steps.append({"phase": "entry", "status": "ok"})
+            # Use entry solution as warm-start for hover
+            p2_action = entry_action
+
+        # 6. Hover — descend inside box, above part
         hover_action, hover_ok = ik_solve(STATE.lula_solver, STATE.target_frame,
                                            hover_pos, locked_ori, p2_action)
         if not hover_ok:
             return {"error": f"IK hover failed for {hover_pos.tolist()}", "steps": steps}
 
         targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, hover_action)
-        await _apply_interpolated(targets, settle_frames=150)
+        await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES)
         steps.append({"phase": "hover", "status": "ok"})
 
         # 6. PHASE 3b -- Plunge to grasp height
@@ -1069,20 +1054,13 @@ async def _pick_object_ik(params):
             return {"error": f"IK grasp failed for {grasp_pos.tolist()}", "steps": steps}
 
         targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, grasp_action)
-        await _apply_interpolated(targets, settle_frames=100)
+        await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES)
         steps.append({"phase": "grasp_descend", "status": "ok"})
 
-        # 7. Close gripper (adaptive to part size)
+        # 7. Close gripper (adaptive to part size) + lock grip
         await _set_gripper(finger_close)
-        # Extra settle for fingers to fully close against the part surface
-        for _ in range(60):
-            await omni.kit.app.get_app().next_update_async()
+        _force_grip(finger_close)   # teleport + zero velocity + PD→FINGER_CLOSE_MAX
         steps.append({"phase": "close_gripper", "status": "ok", "finger_close": finger_close})
-
-        # 8. Lock grip BEFORE any arm motion — teleport fingers, zero velocity,
-        #    set PD target to FINGER_CLOSE_MAX so there is continuous closing
-        #    torque when the arm accelerates during retract
-        _force_grip(finger_close)
 
         # 9. Verify grasp
         grasp_check = await _verify_grasp()
@@ -1097,7 +1075,7 @@ async def _pick_object_ik(params):
             return {"error": f"IK retract failed for {safe_pos.tolist()}", "steps": steps}
 
         targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, retract_action)
-        await _apply_interpolated(targets, settle_frames=150, finger_value=FINGER_CLOSE_MAX)
+        await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES, finger_value=FINGER_CLOSE_MAX)
         _force_grip(finger_close)
         steps.append({"phase": "retract", "status": "ok"})
 
@@ -1107,7 +1085,7 @@ async def _pick_object_ik(params):
                                               transit_pos, locked_ori, transit_warm)
         if transit_ok:
             targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, transit_action)
-            await _apply_interpolated(targets, settle_frames=150, finger_value=FINGER_CLOSE_MAX)
+            await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES, finger_value=FINGER_CLOSE_MAX)
             _force_grip(finger_close)
         steps.append({"phase": "transit_safe", "status": "ok"})
 
@@ -1175,7 +1153,7 @@ async def _place_object_ik(params):
                                               locked_ori, warm)
         if transit_ok:
             targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, transit_action)
-            await _apply_interpolated(targets, settle_frames=150, finger_value=FINGER_CLOSE_MAX)
+            await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES, finger_value=FINGER_CLOSE_MAX)
             _force_grip(finger_close)
         steps.append({"phase": "transit_up", "status": "ok" if transit_ok else "warn"})
 
@@ -1200,7 +1178,7 @@ async def _place_object_ik(params):
             transit_pos, locked_ori, transit_dest_warm)
         if transit_dest_ok:
             targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, transit_dest_action)
-            await _apply_interpolated(targets, settle_frames=150, finger_value=FINGER_CLOSE_MAX)
+            await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES, finger_value=FINGER_CLOSE_MAX)
             _force_grip(finger_close)
         steps.append({"phase": "transit_at_dest", "status": "ok" if transit_dest_ok else "warn"})
 
@@ -1212,7 +1190,7 @@ async def _place_object_ik(params):
             return {"error": f"IK failed for place safe {safe_pos.tolist()}", "steps": steps}
 
         targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, safe_action)
-        await _apply_interpolated(targets, settle_frames=150, finger_value=FINGER_CLOSE_MAX)
+        await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES, finger_value=FINGER_CLOSE_MAX)
         _force_grip(finger_close)
         steps.append({"phase": "place_safe", "status": "ok"})
 
@@ -1223,7 +1201,7 @@ async def _place_object_ik(params):
             return {"error": f"IK failed for place descend {place_pos.tolist()}", "steps": steps}
 
         targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, place_action)
-        await _apply_interpolated(targets, settle_frames=150, finger_value=FINGER_CLOSE_MAX)
+        await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES, finger_value=FINGER_CLOSE_MAX)
         _force_grip(finger_close)
         steps.append({"phase": "place_descend", "status": "ok"})
 
@@ -1236,7 +1214,7 @@ async def _place_object_ik(params):
                                                retract_pos, locked_ori, place_action)
         if retract_ok:
             targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, retract_action)
-            await _apply_interpolated(targets, settle_frames=150)
+            await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES)
         steps.append({"phase": "retract", "status": "ok"})
 
         # 10. Transit safe height after retract (clear kitting tray before going home)
@@ -1247,7 +1225,7 @@ async def _place_object_ik(params):
                                      retract_transit_pos, locked_ori, retract_transit_warm)
         if rt_ok:
             targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, rt_action)
-            await _apply_interpolated(targets, settle_frames=150)
+            await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES)
         steps.append({"phase": "transit_safe_post_place", "status": "ok"})
 
         return {"status": "completed", "action": "place_object",
