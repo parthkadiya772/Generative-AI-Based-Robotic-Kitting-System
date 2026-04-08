@@ -216,7 +216,8 @@ class VLMPerception:
         """Route to the appropriate VLM backend."""
         if self.provider == "openai":
             return self._call_openai(image, prompt)
-        elif self.provider in ("ollama_qwen", "ollama_llava"):
+        elif self.provider in ("ollama_qwen", "ollama_llava", "ollama_gemma",
+                               "ollama_llama"):
             return self._call_ollama(image, prompt)
         elif self.provider == "huggingface":
             return self._call_huggingface(image, prompt)
@@ -252,16 +253,16 @@ class VLMPerception:
         return response.choices[0].message.content
 
     def _call_ollama(self, image: Image.Image, prompt: str) -> str:
-        """Send image + prompt to a local/VPN Ollama instance (Qwen2.5-VL or LLaVA)."""
+        """Send image + prompt to a local/VPN Ollama instance.
+
+        Handles both old ollama library (dict response) and new library
+        (ChatResponse object) to avoid silent empty-string returns when
+        the library version doesn't match what the dict-access code expects.
+        """
         import ollama
 
-        # Create client with custom base URL
         client = ollama.Client(host=self.base_url)
         b64_image = encode_image_base64(image, fmt="PNG")
-
-        # Ollama expects images as raw bytes or base64
-        import base64
-        image_bytes = base64.b64decode(b64_image)
 
         response = client.chat(
             model=self.model,
@@ -269,12 +270,28 @@ class VLMPerception:
                 {
                     "role": "user",
                     "content": prompt,
-                    "images": [image_bytes],
+                    "images": [b64_image],   # base64 string, not raw bytes
                 }
             ],
             options={"temperature": self.temperature},
+            stream=False,   # force complete response, not streaming tokens
         )
-        return response["message"]["content"]
+
+        # ollama <0.4: response is a dict  {"message": {"content": "..."}}
+        # ollama ≥0.4: response is a ChatResponse object  response.message.content
+        if isinstance(response, dict):
+            content = response.get("message", {}).get("content", "")
+        else:
+            msg = getattr(response, "message", None)
+            content = getattr(msg, "content", "") if msg is not None else ""
+
+        if not content:
+            raise ValueError(
+                f"Ollama returned an empty response for model '{self.model}'. "
+                f"Verify the model is installed on {self.base_url} "
+                f"(run: ollama list) and the server is reachable."
+            )
+        return content
 
     def _call_huggingface(self, image: Image.Image, prompt: str) -> str:
         """Run VLM inference locally via HuggingFace Transformers."""

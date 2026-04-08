@@ -714,7 +714,7 @@ with col_left:
             annotated_image = capture_and_annotate()
             st.image(
                 annotated_image,
-                use_container_width=True,
+                width="stretch",
                 caption=f"Overhead • {st.session_state.perception_mode}",
             )
         except Exception as e:
@@ -728,7 +728,7 @@ with col_left:
                 st.session_state.depth_image = depth_img
                 st.image(
                     depth_img,
-                    use_container_width=True,
+                    width="stretch",
                     caption="RealSense RSD455 • Pseudo Depth",
                 )
             except Exception as e:
