@@ -59,9 +59,9 @@ perception:
       model: "qwen3.5:27b"
       base_url: "http://10.7.0.35:11434"
 
-    - name: "LLaVA 13B (VPN Remote)"
-      provider: "ollama_llava"
-      model: "llava:13b"
+    - name: "Gemma4 4B (VPN Remote)"
+      provider: "ollama_gemma"
+      model: "gemma4:e4b"
       base_url: "http://10.7.0.35:11434"
 
     - name: "Qwen3.5 9B (VPN Remote)"
