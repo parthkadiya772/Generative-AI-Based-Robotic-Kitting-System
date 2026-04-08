@@ -24,4 +24,5 @@ test_results.txt
 AGENTS.md
 GEMINI.md
 .code-review-graph/
+.claude
 .gitignore
