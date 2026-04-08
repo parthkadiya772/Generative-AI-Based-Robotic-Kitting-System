@@ -70,12 +70,12 @@ GRIPPER_TCP_OFFSET   = 0.150
 GRIPPER_BODY_WIDTH   = 0.160
 GRIPPER_HALF_WIDTH   = GRIPPER_BODY_WIDTH / 2.0
 HOVER_CLEARANCE      = 0.020
-GRASP_DEPTH_FRACTION = 0.3   # 0.3 = upper third of part (avoids bin bottom)
+GRASP_DEPTH_FRACTION = 0.45  # 0.45 = below mid-height, longer grip span, avoids bin bottom
 BOX_HEIGHT           = 0.05
 BOX_ENTRY_MARGIN     = 0.15
 PLACE_DROP_HEIGHT    = 0.02
 PLACE_RETRACT_HEIGHT = 0.25
-TRANSIT_SAFE_HEIGHT  = 0.70
+TRANSIT_SAFE_HEIGHT  = 0.50
 DOWNWARD_ORIENTATION = np.array([1.0, 0.0, 1.0, 0.0])
 
 # Interpolation parameters for smooth motion
@@ -174,10 +174,24 @@ def apply_arm_joints(robot, dof_names, arm_names, ik_result):
 
 
 def set_finger_joints(robot, dof_names, value, base_targets=None):
+    """Set gripper joint targets for encompassing (adaptive) grip.
+
+    Robotiq 2F-140 joint geometry:
+      finger_joint = +value  (outer phalanx rotates inward)
+      inner_finger_joint = 0 (inner pad stays at 0 RELATIVE TO outer phalanx)
+        → inner pad absolute angle = outer_angle + 0 = outer_angle
+        → inner pad points inward/downward with the outer phalanx
+        → creates an encompassing undercut that prevents the part from
+          falling straight down during vertical lift (adaptive/encompassing mode)
+
+    The old behaviour was inner_finger_joint = -value, which counter-rotates
+    the inner pad to keep it vertical (absolute 0 rad = flat/parallel contact).
+    That grip has NO undercut — only side friction holds the part during lift.
+    """
     targets = base_targets if base_targets is not None else robot.get_joint_positions()
     for idx, name in enumerate(dof_names):
         if "inner_finger_joint" in name:
-            targets[idx] = -value
+            targets[idx] = 0.0  # encompassing: inner pad follows outer phalanx direction
         elif "finger_joint" in name or "knuckle_joint" in name:
             targets[idx] = value
     return targets
@@ -913,11 +927,18 @@ async def _move_gantry_x(target_x, finger_hold=None):
 
 
 async def _approach_target(params):
-    """Move arm near target XYZ at safe height (for depth camera inspection)."""
+    """Move arm near target XYZ at safe height (for depth camera inspection).
+
+    Keeps the gripper well above the bin rim so the depth camera can see
+    the parts clearly and there is no risk of collision during scanning.
+    The pick sequence will detect this position and descend straight down
+    without any lateral reconfiguration.
+    """
     x = params.get("x", 0.3)
     y = params.get("y", 0.0)
     z = params.get("z", 0.5)
-    safe_z = z + BOX_ENTRY_MARGIN + BOX_HEIGHT + GRIPPER_TCP_OFFSET
+    # Stay high: BOX_ENTRY_MARGIN above bin rim, not inside it
+    safe_z = z + BOX_ENTRY_MARGIN + BOX_HEIGHT + GRIPPER_TCP_OFFSET + 0.10
 
     # Move gantry first
     await _move_gantry_x(x)
@@ -1004,25 +1025,56 @@ async def _pick_object_ik(params):
         await _set_gripper(FINGER_OPEN)
         steps.append({"phase": "open_gripper", "status": "ok"})
 
-        # 3. PHASE 1 -- Safe height above box (initial IK from current pose)
-        #    This is the biggest joint-space jump (home → above box) so
-        #    interpolation is critical to prevent self-collision.
+        # 3. Move to safe height — VERTICAL-FIRST to avoid sweeping through bin walls.
+        #
+        #    Two-phase approach prevents lateral arm swing during bin exit:
+        #      3a) If arm is below safe_z (inside / near bin): solve IK at CURRENT
+        #          EE X,Y but target safe_z — pulls straight up with no lateral motion.
+        #      3b) Lateral align — from above the bin, move to exact [x, y, safe_z].
+        #          IK from safe height → safe height is a small, collision-free move.
+        #
+        #    Without this, IK re-solves for safe_pos (new bbox XY) from a position
+        #    that is offset in X and/or Z, and the solver finds a different arm
+        #    configuration that swings fingers through the bin walls on the way up.
+        current_ee = get_world_pos(EE_PATH)
         warm = _get_warm_start()
+
+        # Phase 3a: vertical-only retract (skip if already above safe_z)
+        if current_ee[2] < safe_z - 0.05:
+            v_pos = np.array([current_ee[0], current_ee[1], safe_z])
+            v_action, v_ok = ik_solve(STATE.lula_solver, STATE.target_frame,
+                                       v_pos, locked_ori, warm)
+            if not v_ok:
+                # Fallback: try direct solve for safe_pos if vertical-only fails
+                v_action, v_ok = ik_solve(STATE.lula_solver, STATE.target_frame,
+                                           safe_pos, locked_ori, warm)
+            if not v_ok:
+                return {"error": f"IK Phase 3a failed for {v_pos.tolist()}", "steps": steps}
+            targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, v_action)
+            await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES)
+            steps.append({"phase": "safe_height_retract", "status": "ok"})
+            warm = _get_warm_start()  # update seed for lateral phase
+
+        # Phase 3b: lateral align to exact [x, y, safe_z] (from above — safe)
         p1_action, p1_ok = ik_solve(STATE.lula_solver, STATE.target_frame,
                                      safe_pos, locked_ori, warm)
         if not p1_ok:
-            return {"error": f"IK Phase 1 failed for safe_pos {safe_pos.tolist()}", "steps": steps}
+            return {"error": f"IK Phase 3b failed for safe_pos {safe_pos.tolist()}", "steps": steps}
+        current_ee2 = get_world_pos(EE_PATH)
+        needs_align = (abs(current_ee2[0] - x) > 0.05
+                       or abs(current_ee2[1] - y) > 0.05
+                       or abs(current_ee2[2] - safe_z) > 0.08)
+        if needs_align:
+            targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, p1_action)
+            await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES)
+        steps.append({"phase": "safe_height", "status": "ok" if needs_align else "skipped"})
 
-        targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, p1_action)
-        await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES)
-        steps.append({"phase": "safe_height", "status": "ok"})
-
-        # 4. Re-solve from settled pose (same target, better seed)
+        # 4. Re-solve from current settled pose — this is the seed for the descent
         settled_warm = _get_warm_start()
         p2_action, p2_ok = ik_solve(STATE.lula_solver, STATE.target_frame,
                                      safe_pos, locked_ori, settled_warm)
         if not p2_ok:
-            p2_action = p1_action  # fallback: use Phase 1 result
+            p2_action = p1_action  # fallback
 
         # 5. Entry — descend vertically to just inside the box rim
         #    This forces a pure vertical path through the rim opening,
@@ -1080,14 +1132,17 @@ async def _pick_object_ik(params):
         steps.append({"phase": "retract", "status": "ok"})
 
         # 10. PHASE 4b -- Transit safe height (clear the blue bin before lateral move)
-        transit_warm = _get_warm_start()
+        #     Chain warm-start from retract_action (not a fresh _get_warm_start) so
+        #     the IK solver stays in the same joint-space neighbourhood as the retract
+        #     solution.  A fresh warm-start can find a wildly different configuration
+        #     that the arm reaches via a path through itself (self-collision).
         transit_action, transit_ok = ik_solve(STATE.lula_solver, STATE.target_frame,
-                                              transit_pos, locked_ori, transit_warm)
+                                              transit_pos, locked_ori, retract_action)
         if transit_ok:
             targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, transit_action)
             await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES, finger_value=FINGER_CLOSE_MAX)
             _force_grip(finger_close)
-        steps.append({"phase": "transit_safe", "status": "ok"})
+        steps.append({"phase": "transit_safe", "status": "ok" if transit_ok else "skipped"})
 
         return {"status": "completed", "action": "pick_object",
                 "position": [x, y, z], "steps": steps,
@@ -1327,20 +1382,20 @@ async def start_bridge():
     STATE.dof_names = robot.dof_names
     STATE.is_ready = True
 
-    # Boost finger joint stiffness so the PD controller can hold parts
-    # against inertial forces during arm motion.  Default URDF stiffness
-    # (~100-1000) is too low for reliable grasping in simulation.
+    # Moderately boost finger joint stiffness so the PD controller holds
+    # parts during arm motion without generating destructive contact forces.
+    # 2000 N·m/rad is ~5-20x the URDF default — firm grip, not explosive.
     try:
         controller = robot.get_articulation_controller()
         kps, kds = controller.get_gains()
         for idx, name in enumerate(STATE.dof_names):
             if "finger_joint" in name or "knuckle_joint" in name or "inner_finger_joint" in name:
-                kps[idx] = 1e5   # 100,000 N·m/rad — very stiff grip
-                kds[idx] = 1e3   # 1,000 N·m·s/rad — high damping
+                kps[idx] = 2000.0   # firm, not destructive
+                kds[idx] = 200.0
         controller.set_gains(kps, kds)
-        print("[OK] Finger joint stiffness boosted (Kp=1e5, Kd=1e3)")
+        print("[OK] Finger joint stiffness set (Kp=2000, Kd=200)")
     except Exception as e:
-        print(f"[WARN] Could not boost finger gains: {e}")
+        print(f"[WARN] Could not set finger gains: {e}")
 
     # Capture the robot's initial rest pose as HOME_JOINTS
     global HOME_JOINTS
