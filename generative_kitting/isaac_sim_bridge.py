@@ -891,6 +891,81 @@ async def _ik_move_to(target_xyz, orientation=None, settle_frames=SETTLE_FRAMES)
     return {"status": "ok", "target": list(target_xyz), "ee_position": ee_pos.tolist()}
 
 
+async def _retract_cartesian_up(target_z, x, y, locked_ori,
+                                 finger_value=None, step_size=0.04):
+    """Retract the end-effector straight up to target_z via Cartesian micro-steps.
+
+    A single large IK jump (grasp depth → safe height) lets the solver find a
+    distant joint-space solution that requires shoulder/elbow to flip — the arm
+    "hugs itself" or sweeps through self-collision on the way up.
+
+    Micro-step approach: divide the vertical distance into ~4 cm steps and chain
+    each IK result as the warm-start for the next.  Because each step is tiny,
+    the solver is constrained to the nearest solution and cannot flip to a
+    different arm configuration.  The arm rises smoothly in a straight line.
+
+    Args:
+        target_z:     world Z to reach (metres).
+        x, y:         world XY to hold while rising.
+        locked_ori:   normalised TCP quaternion (downward for pick).
+        finger_value: if not None, bake this finger target into every waypoint
+                      so the gripper never loses hold during the retract.
+        step_size:    max Cartesian distance (m) between IK solves (default 4 cm).
+    Returns:
+        True on success, False if an IK step fails mid-way.
+    """
+    import omni.kit.app
+    from isaacsim.core.utils.types import ArticulationAction
+
+    current_ee = get_world_pos(EE_PATH)
+    current_z  = current_ee[2]
+
+    if current_z >= target_z - 0.01:
+        return True  # already at or above target — nothing to do
+
+    n_steps = max(2, int(np.ceil((target_z - current_z) / step_size)))
+    warm    = _get_warm_start()
+    last_action = None
+
+    for step in range(1, n_steps + 1):
+        frac     = step / n_steps
+        z_step   = current_z + (target_z - current_z) * frac
+        step_pos = np.array([x, y, z_step])
+
+        action, ok = ik_solve(STATE.lula_solver, STATE.target_frame,
+                               step_pos, locked_ori, warm)
+        if not ok:
+            # Mid-retract IK failure — hold current position, report partial success
+            print(f"  [RETRACT] IK failed at step {step}/{n_steps} z={z_step:.3f} — stopping here")
+            break
+
+        targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, action)
+        if finger_value is not None:
+            targets = set_finger_joints(STATE.robot, STATE.dof_names, finger_value, targets)
+
+        STATE.robot.apply_action(ArticulationAction(joint_positions=targets))
+        for _ in range(STREAM_FRAMES):
+            await omni.kit.app.get_app().next_update_async()
+
+        warm        = action   # ← chain: each step seeds the next
+        last_action = action
+
+    # Final settle at the exact target position
+    final_pos    = np.array([x, y, target_z])
+    final_action, final_ok = ik_solve(STATE.lula_solver, STATE.target_frame,
+                                       final_pos, locked_ori, warm)
+    if final_ok:
+        targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, final_action)
+        if finger_value is not None:
+            targets = set_finger_joints(STATE.robot, STATE.dof_names, finger_value, targets)
+        STATE.robot.apply_action(ArticulationAction(joint_positions=targets))
+
+    for _ in range(SETTLE_FRAMES):
+        await omni.kit.app.get_app().next_update_async()
+
+    return final_ok
+
+
 async def _move_gantry_x(target_x, finger_hold=None):
     """Move the X-gantry to align with a target X coordinate.
 
@@ -1039,21 +1114,16 @@ async def _pick_object_ik(params):
         current_ee = get_world_pos(EE_PATH)
         warm = _get_warm_start()
 
-        # Phase 3a: vertical-only retract (skip if already above safe_z)
+        # Phase 3a: vertical retract via Cartesian micro-steps (skip if already above safe_z).
+        #   Each 4 cm IK step is warm-started from the previous result so the solver
+        #   cannot flip to a distant configuration — arm rises straight up, no swinging.
         if current_ee[2] < safe_z - 0.05:
-            v_pos = np.array([current_ee[0], current_ee[1], safe_z])
-            v_action, v_ok = ik_solve(STATE.lula_solver, STATE.target_frame,
-                                       v_pos, locked_ori, warm)
+            v_ok = await _retract_cartesian_up(
+                safe_z, current_ee[0], current_ee[1], locked_ori, step_size=0.04)
             if not v_ok:
-                # Fallback: try direct solve for safe_pos if vertical-only fails
-                v_action, v_ok = ik_solve(STATE.lula_solver, STATE.target_frame,
-                                           safe_pos, locked_ori, warm)
-            if not v_ok:
-                return {"error": f"IK Phase 3a failed for {v_pos.tolist()}", "steps": steps}
-            targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, v_action)
-            await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES)
+                return {"error": f"Cartesian retract (Phase 3a) failed", "steps": steps}
             steps.append({"phase": "safe_height_retract", "status": "ok"})
-            warm = _get_warm_start()  # update seed for lateral phase
+            warm = _get_warm_start()  # fresh seed for lateral align
 
         # Phase 3b: lateral align to exact [x, y, safe_z] (from above — safe)
         p1_action, p1_ok = ik_solve(STATE.lula_solver, STATE.target_frame,
@@ -1118,30 +1188,25 @@ async def _pick_object_ik(params):
         grasp_check = await _verify_grasp()
         steps.append({"phase": "verify_grasp", "status": "ok", "detail": grasp_check})
 
-        # 10. PHASE 4 -- Retract to safe height
-        #     finger_value=FINGER_CLOSE_MAX on every interpolation waypoint
-        retract_warm = _get_warm_start()
-        retract_action, retract_ok = ik_solve(STATE.lula_solver, STATE.target_frame,
-                                               safe_pos, locked_ori, retract_warm)
+        # PHASE 4 -- Retract from grasp depth to safe height via Cartesian micro-steps.
+        #   Single IK jump here causes shoulder/elbow to flip to a distant joint-space
+        #   solution — the arm "hugs itself" on the way up.  Micro-stepping keeps the
+        #   solver in the same configuration family: each 4 cm step is warm-started from
+        #   the previous result, so no flip is ever possible.
+        retract_ok = await _retract_cartesian_up(
+            safe_z, x, y, locked_ori,
+            finger_value=FINGER_CLOSE_MAX, step_size=0.04)
         if not retract_ok:
-            return {"error": f"IK retract failed for {safe_pos.tolist()}", "steps": steps}
-
-        targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, retract_action)
-        await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES, finger_value=FINGER_CLOSE_MAX)
+            return {"error": "Cartesian retract (Phase 4) failed", "steps": steps}
         _force_grip(finger_close)
         steps.append({"phase": "retract", "status": "ok"})
 
-        # 10. PHASE 4b -- Transit safe height (clear the blue bin before lateral move)
-        #     Chain warm-start from retract_action (not a fresh _get_warm_start) so
-        #     the IK solver stays in the same joint-space neighbourhood as the retract
-        #     solution.  A fresh warm-start can find a wildly different configuration
-        #     that the arm reaches via a path through itself (self-collision).
-        transit_action, transit_ok = ik_solve(STATE.lula_solver, STATE.target_frame,
-                                              transit_pos, locked_ori, retract_action)
-        if transit_ok:
-            targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, transit_action)
-            await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES, finger_value=FINGER_CLOSE_MAX)
-            _force_grip(finger_close)
+        # PHASE 4b -- Continue micro-stepping up to transit clear-height.
+        #   Still holding part — FINGER_CLOSE_MAX on every waypoint.
+        transit_ok = await _retract_cartesian_up(
+            transit_z, x, y, locked_ori,
+            finger_value=FINGER_CLOSE_MAX, step_size=0.04)
+        _force_grip(finger_close)
         steps.append({"phase": "transit_safe", "status": "ok" if transit_ok else "skipped"})
 
         return {"status": "completed", "action": "pick_object",
@@ -1198,19 +1263,16 @@ async def _place_object_ik(params):
         place_pos = np.array([dest_x, dest_y, place_z])
         retract_pos = np.array([dest_x, dest_y, retract_z])
 
-        # 1. Transit -- raise arm high before lateral gantry move
-        #    Interpolated + FINGER_CLOSE_MAX on every waypoint
-        current_ee = get_world_pos(EE_PATH)
-        transit_up_z = current_ee[2] + TRANSIT_SAFE_HEIGHT
-        warm = _get_warm_start()
-        transit_action, transit_ok = ik_solve(STATE.lula_solver, STATE.target_frame,
-                                              np.array([current_ee[0], current_ee[1], transit_up_z]),
-                                              locked_ori, warm)
-        if transit_ok:
-            targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, transit_action)
-            await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES, finger_value=FINGER_CLOSE_MAX)
-            _force_grip(finger_close)
-        steps.append({"phase": "transit_up", "status": "ok" if transit_ok else "warn"})
+        # 1. Transit -- raise arm high before lateral gantry move via micro-steps.
+        #    Same Cartesian stepping used for pick retract: prevents configuration
+        #    flips while ascending with a part in the gripper.
+        current_ee    = get_world_pos(EE_PATH)
+        transit_up_z  = current_ee[2] + TRANSIT_SAFE_HEIGHT
+        transit_up_ok = await _retract_cartesian_up(
+            transit_up_z, current_ee[0], current_ee[1], locked_ori,
+            finger_value=FINGER_CLOSE_MAX, step_size=0.04)
+        _force_grip(finger_close)
+        steps.append({"phase": "transit_up", "status": "ok" if transit_up_ok else "warn"})
 
         # 2. Force-lock grip before gantry move
         _force_grip(finger_close)
