@@ -58,12 +58,13 @@ GANTRY_X_OFFSET = 1.27
 # In simulation the finger pads are thick — the joint angle must overshoot
 # well past the part width so the pads actually squeeze the surface.
 FINGER_OPEN  = 0.0
-FINGER_CLOSE = 0.65      # default — firm grip for most parts
+FINGER_CLOSE = 0.5       # matches robot_control.py — physics stops fingers on part contact
 FINGER_CLOSE_MIN = 0.55  # minimum grip (large parts ~80mm)
 FINGER_CLOSE_MAX = 0.69  # near-closed grip (small parts ~15mm)
 ROBOTIQ_MAX_STROKE = 0.140  # 140mm max opening
 ROBOTIQ_MAX_RAD = 0.695     # joint rad at fully closed
 GRIP_OVERSHOOT = 0.060   # 60mm extra closing past part width for firm contact
+ENTRY_CLEARANCE = 0.020  # 20mm extra gap over part width for bin-entry pre-shape
 
 # Gripper geometry
 GRIPPER_TCP_OFFSET   = 0.150
@@ -75,7 +76,8 @@ BOX_HEIGHT           = 0.05
 BOX_ENTRY_MARGIN     = 0.15
 PLACE_DROP_HEIGHT    = 0.02
 PLACE_RETRACT_HEIGHT = 0.25
-TRANSIT_SAFE_HEIGHT  = 0.50
+TRANSIT_SAFE_HEIGHT  = 0.10  # just 10cm above safe_z — enough to clear bin rim without
+                             # going so high that Lula IK folds the ceiling-mounted arm
 DOWNWARD_ORIENTATION = np.array([1.0, 0.0, 1.0, 0.0])
 
 # Interpolation parameters for smooth motion
@@ -161,6 +163,23 @@ def compute_adaptive_finger_close(part_width):
     clamped = float(np.clip(finger_rad, FINGER_CLOSE_MIN, FINGER_CLOSE_MAX))
     print(f"  [GRIP] part_width={part_width*1000:.1f}mm overshoot={GRIP_OVERSHOOT*1000:.0f}mm -> finger_close={clamped:.3f} rad")
     return clamped
+
+
+def compute_entry_finger_shape(part_width):
+    """Finger angle for bin entry: wide enough to pass over part, narrow enough for bin walls.
+
+    Pre-shapes the gripper BEFORE descending into the bin so the open (140mm)
+    fingers cannot clip the bin walls.  The result is ENTRY_CLEARANCE (20mm)
+    wider than the part → fingers clear the part during the descent, then a
+    slow final close makes contact from the sides rather than top-down.
+
+    Returns a value between FINGER_OPEN and FINGER_CLOSE_MIN.
+    """
+    desired_opening = part_width + ENTRY_CLEARANCE
+    desired_opening = min(desired_opening, ROBOTIQ_MAX_STROKE)
+    finger_rad = ROBOTIQ_MAX_RAD * (1.0 - desired_opening / ROBOTIQ_MAX_STROKE)
+    # Must be wider than minimum grip (less closed) — we are still entering
+    return float(np.clip(finger_rad, FINGER_OPEN, FINGER_CLOSE_MIN - 0.05))
 
 
 def apply_arm_joints(robot, dof_names, arm_names, ik_result):
@@ -771,6 +790,40 @@ async def _set_gripper(finger_value):
             "finger_value": finger_value}
 
 
+async def _close_gripper_slow(target_value, n_steps=12):
+    """Slowly close (or open) the gripper by interpolating in n_steps.
+
+    Each step applies a new joint target and waits ~12 physics frames, giving
+    a smooth progressive closure the physics engine can track.  This prevents
+    the abrupt snap of a single apply_action that can knock parts or break
+    finger contact geometry.
+
+    Typical usage: close from entry pre-shape → adaptive finger_close at
+    grasp depth so the fingers wrap around the part rather than hammering it.
+    """
+    import omni.kit.app
+    from isaacsim.core.utils.types import ArticulationAction
+
+    # Read the current finger angle from the first non-inner, non-knuckle joint
+    current_joints = STATE.robot.get_joint_positions()
+    current_finger = 0.0
+    for idx, name in enumerate(STATE.dof_names):
+        if "finger_joint" in name and "inner" not in name and "knuckle" not in name:
+            current_finger = float(current_joints[idx])
+            break
+
+    frames_per_step = 12  # ~0.2 s per step at 60 Hz → full close in ~2.4 s
+    for step in range(1, n_steps + 1):
+        frac = step / n_steps
+        interp = current_finger + (target_value - current_finger) * frac
+        targets = set_finger_joints(STATE.robot, STATE.dof_names, interp)
+        STATE.robot.apply_action(ArticulationAction(joint_positions=targets))
+        for _ in range(frames_per_step):
+            await omni.kit.app.get_app().next_update_async()
+
+    return {"status": "ok", "finger_value": target_value}
+
+
 def _force_grip(finger_value):
     """Lock gripper on part with maximum holding force.
 
@@ -892,40 +945,41 @@ async def _ik_move_to(target_xyz, orientation=None, settle_frames=SETTLE_FRAMES)
 
 
 async def _retract_cartesian_up(target_z, x, y, locked_ori,
-                                 finger_value=None, step_size=0.04):
-    """Retract the end-effector straight up to target_z via Cartesian micro-steps.
+                                 finger_value=None, step_size=0.04,
+                                 stream_frames=None):
+    """Move the end-effector to target_z via Cartesian micro-steps (up or down).
 
-    A single large IK jump (grasp depth → safe height) lets the solver find a
-    distant joint-space solution that requires shoulder/elbow to flip — the arm
-    "hugs itself" or sweeps through self-collision on the way up.
+    Works for both retract (up) and slow descent (down) — direction is derived
+    from current EE Z vs. target_z.
 
-    Micro-step approach: divide the vertical distance into ~4 cm steps and chain
-    each IK result as the warm-start for the next.  Because each step is tiny,
-    the solver is constrained to the nearest solution and cannot flip to a
-    different arm configuration.  The arm rises smoothly in a straight line.
+    A single large IK jump lets the solver find a distant joint-space solution
+    that requires shoulder/elbow to flip.  Micro-stepping prevents this: each
+    step is warm-started from the previous result so the solver stays in the
+    same configuration family the entire way.
 
     Args:
-        target_z:     world Z to reach (metres).
-        x, y:         world XY to hold while rising.
-        locked_ori:   normalised TCP quaternion (downward for pick).
-        finger_value: if not None, bake this finger target into every waypoint
-                      so the gripper never loses hold during the retract.
-        step_size:    max Cartesian distance (m) between IK solves (default 4 cm).
+        target_z:      world Z to reach (metres).
+        x, y:          world XY to hold constant.
+        locked_ori:    normalised TCP quaternion.
+        finger_value:  if not None, bake this finger target into every waypoint.
+        step_size:     max Cartesian distance (m) per IK solve (default 4 cm).
+        stream_frames: physics frames per waypoint; defaults to global STREAM_FRAMES.
     Returns:
         True on success, False if an IK step fails mid-way.
     """
     import omni.kit.app
     from isaacsim.core.utils.types import ArticulationAction
 
+    frames_per_step = stream_frames if stream_frames is not None else STREAM_FRAMES
+
     current_ee = get_world_pos(EE_PATH)
     current_z  = current_ee[2]
 
-    if current_z >= target_z - 0.01:
-        return True  # already at or above target — nothing to do
+    if abs(current_z - target_z) < 0.01:
+        return True  # already close enough — nothing to do
 
-    n_steps = max(2, int(np.ceil((target_z - current_z) / step_size)))
+    n_steps = max(2, int(np.ceil(abs(target_z - current_z) / step_size)))
     warm    = _get_warm_start()
-    last_action = None
 
     for step in range(1, n_steps + 1):
         frac     = step / n_steps
@@ -935,8 +989,8 @@ async def _retract_cartesian_up(target_z, x, y, locked_ori,
         action, ok = ik_solve(STATE.lula_solver, STATE.target_frame,
                                step_pos, locked_ori, warm)
         if not ok:
-            # Mid-retract IK failure — hold current position, report partial success
-            print(f"  [RETRACT] IK failed at step {step}/{n_steps} z={z_step:.3f} — stopping here")
+            direction = "up" if target_z > current_z else "down"
+            print(f"  [CARTESIAN_{direction.upper()}] IK failed at step {step}/{n_steps} z={z_step:.3f} — stopping here")
             break
 
         targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, action)
@@ -944,11 +998,10 @@ async def _retract_cartesian_up(target_z, x, y, locked_ori,
             targets = set_finger_joints(STATE.robot, STATE.dof_names, finger_value, targets)
 
         STATE.robot.apply_action(ArticulationAction(joint_positions=targets))
-        for _ in range(STREAM_FRAMES):
+        for _ in range(frames_per_step):
             await omni.kit.app.get_app().next_update_async()
 
-        warm        = action   # ← chain: each step seeds the next
-        last_action = action
+        warm = action   # chain: each step seeds the next
 
     # Final settle at the exact target position
     final_pos    = np.array([x, y, target_z])
@@ -964,6 +1017,67 @@ async def _retract_cartesian_up(target_z, x, y, locked_ori,
         await omni.kit.app.get_app().next_update_async()
 
     return final_ok
+
+
+async def _smooth_joint_retract(safe_pos, locked_ori, finger_value=None):
+    """Lift arm to safe height in ONE smooth joint-space motion after grasping.
+
+    Strategy
+    --------
+    1. IK-solve for safe_pos using the current (grasp) joints as warm-start.
+       Because the warm-start is the actual grasping configuration, the solver
+       stays in the same joint-space neighbourhood — no shoulder/elbow flip.
+    2. Check: if any joint change > 0.8 rad the solver still flipped →
+       fall back to Cartesian micro-steps which are flip-proof.
+    3. If the solution is sane, joint-interpolate with fine steps (0.08 rad max
+       per waypoint) and 10 physics frames per waypoint — the arm appears to
+       perform a single, deliberate upward motion rather than jittery micro-IK.
+
+    This replaces the post-grasp _retract_cartesian_up call so the robot lifts
+    naturally with minimal joint changes (primarily shoulder_lift/elbow).
+    """
+    import omni.kit.app
+    from isaacsim.core.utils.types import ArticulationAction
+
+    grasp_warm = _get_warm_start()
+
+    target_action, ok = ik_solve(STATE.lula_solver, STATE.target_frame,
+                                  safe_pos, locked_ori, grasp_warm)
+    if not ok:
+        print("  [SMOOTH_RETRACT] IK failed — falling back to micro-steps")
+        return await _retract_cartesian_up(
+            safe_pos[2], safe_pos[0], safe_pos[1], locked_ori,
+            finger_value=finger_value, stream_frames=10)
+
+    # Detect configuration flip: any arm joint jumping > 0.8 rad = bad solution
+    max_delta = float(np.max(np.abs(np.array(target_action) - np.array(grasp_warm))))
+    if max_delta > 0.8:
+        print(f"  [SMOOTH_RETRACT] IK flip detected (Δ={max_delta:.2f} rad) — micro-steps")
+        return await _retract_cartesian_up(
+            safe_pos[2], safe_pos[0], safe_pos[1], locked_ori,
+            finger_value=finger_value, stream_frames=10)
+
+    # Build full joint target
+    current_full = STATE.robot.get_joint_positions()
+    target_full  = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, target_action)
+    if finger_value is not None:
+        target_full = set_finger_joints(STATE.robot, STATE.dof_names, finger_value, target_full.copy())
+
+    # Fine joint-space interpolation (0.08 rad/waypoint) with 10 frames each
+    waypoints = _interpolate_joints(current_full, target_full, max_step=0.08)
+    for wp in waypoints:
+        if finger_value is not None:
+            wp = set_finger_joints(STATE.robot, STATE.dof_names, finger_value, wp.copy())
+        STATE.robot.apply_action(ArticulationAction(joint_positions=wp))
+        for _ in range(10):   # 10 frames per step ≈ 0.17 s per 0.08 rad — visible, smooth
+            await omni.kit.app.get_app().next_update_async()
+
+    # Final settle at exact target
+    STATE.robot.apply_action(ArticulationAction(joint_positions=target_full))
+    for _ in range(SETTLE_FRAMES):
+        await omni.kit.app.get_app().next_update_async()
+
+    return True
 
 
 async def _move_gantry_x(target_x, finger_hold=None):
@@ -1004,19 +1118,34 @@ async def _move_gantry_x(target_x, finger_hold=None):
 async def _approach_target(params):
     """Move arm near target XYZ at safe height (for depth camera inspection).
 
-    Keeps the gripper well above the bin rim so the depth camera can see
-    the parts clearly and there is no risk of collision during scanning.
-    The pick sequence will detect this position and descend straight down
-    without any lateral reconfiguration.
+    Uses the real USD bbox centre X for gantry alignment so the robot is
+    FULLY positioned over the part before the depth scan — no lateral
+    correction is needed after scanning.
     """
     x = params.get("x", 0.3)
     y = params.get("y", 0.0)
     z = params.get("z", 0.5)
+    part_prim = params.get("part_prim", None)
+
+    # If a USD prim path is given, use the real bbox centre for gantry X
+    # so there is no second gantry slide after the depth scan.
+    if part_prim:
+        try:
+            import omni.usd
+            stage = omni.usd.get_context().get_stage()
+            geom = compute_bbox_geometry(stage, part_prim, "APPROACH")
+            x = geom["center_xy"][0]
+            y = geom["center_xy"][1]
+            z = geom["top_z"]
+        except Exception as e:
+            print(f"  [APPROACH] bbox failed ({e}), using param coords")
+
     # Stay high: BOX_ENTRY_MARGIN above bin rim, not inside it
     safe_z = z + BOX_ENTRY_MARGIN + BOX_HEIGHT + GRIPPER_TCP_OFFSET + 0.10
 
-    # Move gantry first
+    # Move gantry to EXACT part X first, then update base pose
     await _move_gantry_x(x)
+    _update_base_pose()
 
     # Move arm to safe height above target XY
     result = await _ik_move_to([x, y, safe_z])
@@ -1059,7 +1188,7 @@ async def _pick_object_ik(params):
         tcp_z_offset = 0.0 if STATE.target_frame == "gripper_tcp" else GRIPPER_TCP_OFFSET
 
         # Use bbox geometry if part_prim is provided
-        finger_close = FINGER_CLOSE  # default
+        finger_close = FINGER_CLOSE  # fixed value — physics stops fingers on contact
         if part_path:
             stage = omni.usd.get_context().get_stage()
             try:
@@ -1068,8 +1197,6 @@ async def _pick_object_ik(params):
                 y = geom["part_center_xy"][1]
                 part_top_z = geom["part_top_z"]
                 grasp_z = geom["grasp_z"]
-                # Adaptive grip based on part width
-                finger_close = compute_adaptive_finger_close(geom["part_width"])
             except Exception:
                 part_top_z = z
                 grasp_z = z
@@ -1091,8 +1218,17 @@ async def _pick_object_ik(params):
 
         print(f"  [PICK] target=({x:.3f}, {y:.3f}, {z:.3f}) safe_z={safe_z:.3f} hover_z={hover_z:.3f} grasp_z={grasp_target_z:.3f} finger={finger_close:.3f}")
 
-        # 1. Move gantry to align X axis
-        await _move_gantry_x(x)
+        # 1. Move gantry ONLY if not already aligned (approach already positioned it).
+        #    Skipping prevents the visible X-slide after depth scan.
+        gantry_aligned = False
+        current_joints = STATE.robot.get_joint_positions()
+        for idx, name in enumerate(STATE.dof_names):
+            if GANTRY_X_JOINT in name:
+                if abs(current_joints[idx] - (x - GANTRY_X_OFFSET)) < 0.01:
+                    gantry_aligned = True
+                break
+        if not gantry_aligned:
+            await _move_gantry_x(x)
         _update_base_pose()
         steps.append({"phase": "gantry", "status": "ok"})
 
@@ -1125,19 +1261,20 @@ async def _pick_object_ik(params):
             steps.append({"phase": "safe_height_retract", "status": "ok"})
             warm = _get_warm_start()  # fresh seed for lateral align
 
-        # Phase 3b: lateral align to exact [x, y, safe_z] (from above — safe)
+        # Phase 3b: lateral align to exact [x, y, safe_z] (from above — always safe).
+        #   Always apply — skipping with a "close enough" threshold was the root
+        #   cause of bin-wall collisions: the arm descended with a 2-4 cm offset
+        #   that put the open fingers into the bin wall.
         p1_action, p1_ok = ik_solve(STATE.lula_solver, STATE.target_frame,
                                      safe_pos, locked_ori, warm)
         if not p1_ok:
             return {"error": f"IK Phase 3b failed for safe_pos {safe_pos.tolist()}", "steps": steps}
-        current_ee2 = get_world_pos(EE_PATH)
-        needs_align = (abs(current_ee2[0] - x) > 0.05
-                       or abs(current_ee2[1] - y) > 0.05
-                       or abs(current_ee2[2] - safe_z) > 0.08)
-        if needs_align:
-            targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, p1_action)
-            await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES)
-        steps.append({"phase": "safe_height", "status": "ok" if needs_align else "skipped"})
+        targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, p1_action)
+        await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES)
+        steps.append({"phase": "safe_height", "status": "ok"})
+
+        # Gripper stays fully open during descent — physics stops fingers
+        # on part contact naturally (same as robot_control.py).
 
         # 4. Re-solve from current settled pose — this is the seed for the descent
         settled_warm = _get_warm_start()
@@ -1179,34 +1316,57 @@ async def _pick_object_ik(params):
         await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES)
         steps.append({"phase": "grasp_descend", "status": "ok"})
 
-        # 7. Close gripper (adaptive to part size) + lock grip
-        await _set_gripper(finger_close)
-        _force_grip(finger_close)   # teleport + zero velocity + PD→FINGER_CLOSE_MAX
+        # 7. Close gripper — direct joint target, physics stops fingers on
+        #    part contact naturally (matches robot_control.py exactly).
+        #    120 settle frames lets the PD controller reach the part surface
+        #    smoothly without snapping.
+        targets = STATE.robot.get_joint_positions()
+        targets = set_finger_joints(STATE.robot, STATE.dof_names, finger_close, targets)
+        STATE.robot.apply_action(ArticulationAction(joint_positions=targets))
+        for _ in range(120):
+            await omni.kit.app.get_app().next_update_async()
+        # Lock grip: by frame 120 fingers are nearly there — this snaps
+        # the last few degrees and sets PD target to FINGER_CLOSE_MAX so
+        # the controller holds firm during retract (prevents late-close).
+        _force_grip(finger_close)
+        for _ in range(SETTLE_FRAMES):
+            await omni.kit.app.get_app().next_update_async()
         steps.append({"phase": "close_gripper", "status": "ok", "finger_close": finger_close})
 
         # 9. Verify grasp
         grasp_check = await _verify_grasp()
         steps.append({"phase": "verify_grasp", "status": "ok", "detail": grasp_check})
 
-        # PHASE 4 -- Retract from grasp depth to safe height via Cartesian micro-steps.
-        #   Single IK jump here causes shoulder/elbow to flip to a distant joint-space
-        #   solution — the arm "hugs itself" on the way up.  Micro-stepping keeps the
-        #   solver in the same configuration family: each 4 cm step is warm-started from
-        #   the previous result, so no flip is ever possible.
-        retract_ok = await _retract_cartesian_up(
-            safe_z, x, y, locked_ori,
-            finger_value=FINGER_CLOSE_MAX, step_size=0.04)
+        # PHASE 4 -- Retract to safe height above bin.
+        #   Single IK solve warm-started from current settled joints so the
+        #   solver stays in the same configuration (no flip) — matches
+        #   robot_control.py Phase 4.  Isaac Sim physics makes the motion
+        #   naturally smooth over 150 frames; no manual interpolation needed.
+        settled_warm = _get_warm_start()
+        retract_action, retract_ok = ik_solve(STATE.lula_solver, STATE.target_frame,
+                                               safe_pos, locked_ori, settled_warm)
         if not retract_ok:
-            return {"error": "Cartesian retract (Phase 4) failed", "steps": steps}
+            return {"error": "IK retract (Phase 4) failed", "steps": steps}
+        targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, retract_action)
+        targets = set_finger_joints(STATE.robot, STATE.dof_names, FINGER_CLOSE_MAX, targets)
+        STATE.robot.apply_action(ArticulationAction(joint_positions=targets))
+        for _ in range(150):
+            await omni.kit.app.get_app().next_update_async()
         _force_grip(finger_close)
         steps.append({"phase": "retract", "status": "ok"})
 
-        # PHASE 4b -- Continue micro-stepping up to transit clear-height.
-        #   Still holding part — FINGER_CLOSE_MAX on every waypoint.
-        transit_ok = await _retract_cartesian_up(
-            transit_z, x, y, locked_ori,
-            finger_value=FINGER_CLOSE_MAX, step_size=0.04)
-        _force_grip(finger_close)
+        # PHASE 4b -- Rise to transit clear-height (same XY, higher Z).
+        #   Second single IK solve — robot_control.py Phase 4b pattern.
+        settled_transit_warm = _get_warm_start()
+        transit_action, transit_ok = ik_solve(STATE.lula_solver, STATE.target_frame,
+                                               transit_pos, locked_ori, settled_transit_warm)
+        if transit_ok:
+            targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, transit_action)
+            targets = set_finger_joints(STATE.robot, STATE.dof_names, FINGER_CLOSE_MAX, targets)
+            STATE.robot.apply_action(ArticulationAction(joint_positions=targets))
+            for _ in range(150):
+                await omni.kit.app.get_app().next_update_async()
+            _force_grip(finger_close)
         steps.append({"phase": "transit_safe", "status": "ok" if transit_ok else "skipped"})
 
         return {"status": "completed", "action": "pick_object",
@@ -1311,24 +1471,23 @@ async def _place_object_ik(params):
         _force_grip(finger_close)
         steps.append({"phase": "place_safe", "status": "ok"})
 
-        # 7. Descend — warm-start from safe_action, interpolated with grip
-        place_action, place_ok = ik_solve(STATE.lula_solver, STATE.target_frame,
-                                           place_pos, locked_ori, safe_action)
-        if not place_ok:
-            return {"error": f"IK failed for place descend {place_pos.tolist()}", "steps": steps}
-
-        targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, place_action)
-        await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES, finger_value=FINGER_CLOSE_MAX)
+        # 7. Descend slowly to place height via Cartesian micro-steps.
+        #    3 cm steps with 8 frames each creates a clearly visible, controlled
+        #    descent — the arm "lowers" the part rather than snapping to place height.
+        place_ok = await _retract_cartesian_up(
+            place_z, dest_x, dest_y, locked_ori,
+            finger_value=FINGER_CLOSE_MAX, step_size=0.03, stream_frames=8)
         _force_grip(finger_close)
-        steps.append({"phase": "place_descend", "status": "ok"})
+        steps.append({"phase": "place_descend", "status": "ok" if place_ok else "warn"})
 
         # 8. Open gripper — release part
         await _set_gripper(FINGER_OPEN)
         steps.append({"phase": "release", "status": "ok"})
 
         # 9. Retract — interpolated (no finger hold, part released)
+        retract_warm = _get_warm_start()
         retract_action, retract_ok = ik_solve(STATE.lula_solver, STATE.target_frame,
-                                               retract_pos, locked_ori, place_action)
+                                               retract_pos, locked_ori, retract_warm)
         if retract_ok:
             targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, retract_action)
             await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES)

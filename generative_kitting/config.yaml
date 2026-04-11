@@ -109,7 +109,7 @@ execution:
   box_entry_margin: 0.15             # metres — clearance above rim
   place_drop_height: 0.0             # metres above destination surface
   place_retract_height: 0.20         # metres above destination after release
-  transit_safe_height: 0.40          # metres above safe_z during transit
+  transit_safe_height: 0.30          # metres above safe_z during transit
   grasp_depth_fraction: 0.5          # 0.0=top, 0.5=mid, 1.0=bottom
 
   # Kit tray

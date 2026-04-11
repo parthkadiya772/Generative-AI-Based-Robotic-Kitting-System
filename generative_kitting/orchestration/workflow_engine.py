@@ -503,6 +503,8 @@ class KittingWorkflowEngine:
             "y": params.get("y", 0.0),
             "z": params.get("z", 0.02),
         }
+        if prim_path:
+            approach_payload["part_prim"] = prim_path
         approach_result = self.camera.send_command("/api/approach", approach_payload)
         result["sub_phases"].append({
             "phase": WorkflowPhase.APPROACH,
