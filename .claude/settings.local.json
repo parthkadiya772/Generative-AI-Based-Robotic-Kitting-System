@@ -8,7 +8,9 @@
       "Bash(python -c \"import py_compile; py_compile.compile\\('isaac_sim_bridge.py', doraise=True\\); print\\('OK'\\)\")",
       "Bash(python -c \"import py_compile; py_compile.compile\\('orchestration/workflow_engine.py', doraise=True\\); print\\('OK'\\)\")",
       "Bash(find \"c:/KP/AI_and_Automation/Sem_4/Thesis/robot_in_air/generative_kitting\" -name \"__pycache__\" -not -path \"*/.aikido/*\" -not -path \"*/site-packages/*\" -type d -exec rm -rf {} +)",
-      "Bash(find /c/KP/AI_and_Automation/Sem_4/Thesis/robot_in_air/generative_kitting -name \"__pycache__\" -not -path \"*/.aikido/*\" -exec rm -rf {} +)"
+      "Bash(find /c/KP/AI_and_Automation/Sem_4/Thesis/robot_in_air/generative_kitting -name \"__pycache__\" -not -path \"*/.aikido/*\" -exec rm -rf {} +)",
+      "Bash(.aikido/Scripts/pip install:*)",
+      "Bash(.aikido/Scripts/python -c \"from transformers import Owlv2Processor, Owlv2ForObjectDetection; print\\('OWL-ViT2 installed OK'\\)\")"
     ]
   }
 }

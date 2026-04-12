@@ -60,6 +60,12 @@ perception:
       model: "qwen2.5vl:7b"
       base_url: "http://10.7.0.35:11434"
 
+  # ── Zero-Shot Detector (precise bounding boxes — replaces VLM coord guesses) ──
+  # detector_url: "http://10.7.0.35:8700"  # uncomment to use remote server instead of local
+  detector_model: "owlv2"              # "owlv2" (lightweight) or "grounding_dino" (more accurate)
+  detector_confidence: 0.15            # minimum detection confidence
+  detector_device: "cpu"               # "cpu" or "cuda" (set to cuda if you have a local GPU)
+
   # ── Depth Estimation (fallback when bridge depth buffer unavailable) ──
   depth_method: "geometric"            # "geometric" (no ML) or "depth_anything" (Depth Anything V2)
   camera_height_m: 1.8                 # approx camera height above workspace (metres)

@@ -223,7 +223,37 @@ def ik_solve(lula_solver, frame, pos, ori, warm):
     action, ok = lula_solver.compute_inverse_kinematics(
         frame_name=frame, target_position=pos,
         target_orientation=ori, warm_start=warm)
+    if ok:
+        action = _clamp_shoulder_pan(action)
     return action, ok
+
+
+# ── Shoulder-Pan Safety Clamp ──────────────────────────────
+# The robot is ceiling-mounted on a gantry rail (along X).
+# Lula IK has no collision awareness of the gantry structure,
+# so it can find solutions where the arm swings THROUGH the
+# red gantry rail.  We constrain shoulder_pan (joint 0) to a
+# safe range that keeps the arm reaching downward into the
+# workspace, never backward through the gantry.
+#
+# shoulder_pan = 0 rad → arm hangs straight down (home)
+# Safe range: roughly -π/2 to +π/2 (arm stays in front)
+
+SHOULDER_PAN_MIN = -1.5708   # -π/2: arm reaches to one side
+SHOULDER_PAN_MAX =  1.5708   # +π/2: arm reaches to other side
+
+
+def _clamp_shoulder_pan(ik_result):
+    """Clamp shoulder_pan joint in IK result to prevent gantry collision."""
+    clamped = np.array(ik_result, dtype=np.float64)
+    # Joint 0 in Lula's 6-joint result is shoulder_pan
+    if len(clamped) > 0:
+        original = clamped[0]
+        clamped[0] = np.clip(clamped[0], SHOULDER_PAN_MIN, SHOULDER_PAN_MAX)
+        if abs(original - clamped[0]) > 0.01:
+            print(f"  [IK SAFETY] shoulder_pan clamped: {original:.3f} → {clamped[0]:.3f} rad "
+                  f"(preventing gantry collision)")
+    return clamped
 
 
 def _check_self_collision_risk(current_joints, target_joints):
@@ -681,6 +711,15 @@ async def _project_to_world(params):
         cam.initialize()
         for _ in range(10):
             await omni.kit.app.get_app().next_update_async()
+
+    # Attach depth annotator if not already present — required for get_depth()
+    try:
+        cam.add_distance_to_image_plane_to_frame()
+        print(f"  [project] Depth annotator attached to {cam_path}")
+        for _ in range(10):
+            await omni.kit.app.get_app().next_update_async()
+    except Exception:
+        pass  # may already be attached or unsupported
 
     # ── Camera intrinsics ──────────────────────────────────────
     w_res, h_res = res

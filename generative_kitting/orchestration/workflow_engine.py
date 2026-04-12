@@ -21,6 +21,7 @@ from typing import Any, Callable, Dict, List, Optional
 from PIL import Image
 
 from perception.depth_estimator import DepthEstimator
+from perception.object_detector import ZeroShotDetector
 from utils.logger import log
 
 
@@ -132,6 +133,9 @@ class KittingWorkflowEngine:
         self._depth_estimator = DepthEstimator(
             self.config.get("perception", {})
         )
+        self._detector = ZeroShotDetector(
+            self.config.get("perception", {})
+        )
 
     def set_phase_callback(self, callback: Callable):
         """Set a callback function(phase, status, detail) for UI updates."""
@@ -173,7 +177,25 @@ class KittingWorkflowEngine:
                 rgb_image, custom_prompt=SCENE_ANALYSIS_PROMPT)
             num_vlm_objects = len(scene.get("detected_objects", []))
 
-            # ── Depth projection: image coords → world XYZ ──
+            # ── Refine positions with zero-shot detector ───────
+            # VLMs give rough coordinate guesses (~15% pixel error).
+            # A detection model (OWL-ViT2) gives precise bounding boxes.
+            # Use detector coords when available, VLM coords as fallback.
+            if self._detector.is_available:
+                self._notify(WorkflowPhase.SCENE_ANALYSIS, "running",
+                             "Running zero-shot detector for precise localization...")
+                vlm_labels = [
+                    obj.get("label", "") for obj in scene.get("detected_objects", [])
+                ]
+                detections = self._detector.detect_with_labels(rgb_image, vlm_labels)
+
+                if detections:
+                    log.info(f"Detector found {len(detections)} objects with precise coords")
+                    self._merge_detector_with_vlm(scene, detections)
+            else:
+                log.info("Zero-shot detector not available — using VLM coordinates")
+
+            # ── Build projection points from best available coords ──
             proj_points = []
             for obj in scene.get("detected_objects", []):
                 img_pos = obj.get("image_position", {})
@@ -691,6 +713,66 @@ class KittingWorkflowEngine:
                      f"Place {'completed' if place_ok else 'FAILED'}")
 
         return result
+
+    # ─── Detector ↔ VLM Merge ─────────────────────────────
+
+    @staticmethod
+    def _merge_detector_with_vlm(scene: dict, detections: list) -> None:
+        """Replace VLM image_position estimates with precise detector coords.
+
+        Matches detector bounding boxes to VLM-detected objects by label.
+        The VLM keeps ownership of semantic fields (affordance, description);
+        only image_position is overwritten with the detector's precise center.
+        """
+        det_by_label = {}
+        for det in detections:
+            label = det["label"].lower().replace(" ", "_")
+            if label not in det_by_label:
+                det_by_label[label] = []
+            det_by_label[label].append(det)
+
+        matched = 0
+        for obj in scene.get("detected_objects", []):
+            vlm_label = obj.get("label", "").lower().replace(" ", "_")
+
+            # Try exact match first, then partial
+            candidates = det_by_label.get(vlm_label, [])
+            if not candidates:
+                # Try partial match
+                for det_label, dets in det_by_label.items():
+                    if vlm_label in det_label or det_label in vlm_label:
+                        candidates = dets
+                        break
+
+            if candidates:
+                # Use the highest-confidence detection
+                best = candidates.pop(0)
+                obj["image_position"] = best["center"]
+                obj["_detector_bbox"] = best["bbox"]
+                obj["_detector_confidence"] = best["confidence"]
+                obj["_position_source"] = "detector"
+                matched += 1
+                log.info(
+                    f"Detector matched '{vlm_label}' → "
+                    f"center({best['center']['x']:.3f}, {best['center']['y']:.3f}) "
+                    f"conf={best['confidence']:.2f}"
+                )
+            else:
+                obj["_position_source"] = "vlm_estimate"
+                log.debug(f"No detector match for '{vlm_label}' — keeping VLM estimate")
+
+        # Also try to detect the kitting tray
+        tray = scene.get("kitting_tray", {})
+        if tray.get("detected"):
+            for label_key in ("kitting_tray", "white_box", "box", "tray"):
+                if label_key in det_by_label and det_by_label[label_key]:
+                    best = det_by_label[label_key][0]
+                    tray["image_position"] = best["center"]
+                    tray["_position_source"] = "detector"
+                    log.info(f"Detector matched tray → center({best['center']['x']:.3f}, {best['center']['y']:.3f})")
+                    break
+
+        log.info(f"Detector merge: {matched}/{len(scene.get('detected_objects', []))} objects matched")
 
     # ─── USD Fallback Matching ─────────────────────────────
 
