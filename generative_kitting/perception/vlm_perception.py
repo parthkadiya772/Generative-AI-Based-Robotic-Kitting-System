@@ -128,6 +128,7 @@ class VLMPerception:
                 log.debug(f"VLM raw response ({len(raw_response)} chars): {raw_response[:500]}")
 
                 parsed = self.parse_vlm_response(raw_response)
+                self._normalize_positions(parsed)
                 validated = validate_scene_response(
                     parsed,
                     confidence_threshold=self.confidence_threshold,
@@ -154,6 +155,28 @@ class VLMPerception:
             f"VLM perception failed after {self.max_retries + 1} attempts. "
             f"Last error: {last_error}"
         )
+
+    # ─── Field Normalization ────────────────────────────────
+
+    @staticmethod
+    def _normalize_positions(parsed: Dict[str, Any]) -> None:
+        """Normalize VLM position fields so the validator always sees
+        ``approximate_position``.
+
+        The scene-analysis prompt asks for ``image_position`` (normalised
+        2D coords) while the validator requires ``approximate_position``.
+        This bridges the two: when an object has ``image_position`` but no
+        ``approximate_position``, one is created with z=0 as a placeholder.
+        The workflow engine overwrites z with depth-projected values later.
+        """
+        for obj in parsed.get("detected_objects", []):
+            if "approximate_position" not in obj and "image_position" in obj:
+                img = obj["image_position"]
+                obj["approximate_position"] = {
+                    "x": img.get("x", 0.5),
+                    "y": img.get("y", 0.5),
+                    "z": 0.0,
+                }
 
     # ─── Response Parsing ────────────────────────────────────
 

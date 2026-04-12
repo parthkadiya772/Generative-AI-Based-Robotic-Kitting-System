@@ -286,6 +286,31 @@ class BridgeCameraInterface:
         """Fetch a depth camera frame from the arm-mounted RealSense."""
         return self.capture_workspace_image(cam_type="depth")
 
+    def capture_wrist_image(self) -> Image.Image:
+        """Fetch an RGB frame from the wrist-mounted RealSense."""
+        return self.capture_workspace_image(cam_type="wrist")
+
+    def project_to_world(self, points: list, camera: str = "rgb") -> dict:
+        """Project normalised image coordinates to world XYZ via depth.
+
+        Parameters
+        ----------
+        points : list of dict
+            Each dict has ``x`` and ``y`` in [0, 1] (normalised image coords).
+        camera : str
+            Camera alias: "rgb", "depth", or "wrist".
+
+        Returns
+        -------
+        dict
+            ``world_points`` list with ``x``, ``y``, ``z``, ``depth_m`` per point.
+        """
+        return self.send_command(
+            "/api/project_to_world",
+            {"points": points, "camera": camera},
+            timeout=15,
+        )
+
     def _placeholder_image(self) -> Image.Image:
         """Generate a placeholder when the bridge is unreachable."""
         arr = np.zeros((480, 640, 3), dtype=np.uint8)
@@ -400,6 +425,11 @@ class BridgeCameraInterface:
     def execute_place(self, params: dict) -> dict:
         """Execute a full IK-based place sequence."""
         return self.send_command("/api/place", params, timeout=60)
+
+    def check_connection(self) -> bool:
+        """Re-ping the bridge and update the connection flag."""
+        self._check_connection()
+        return self._connected
 
     @property
     def is_available(self) -> bool:

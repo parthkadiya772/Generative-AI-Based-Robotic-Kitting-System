@@ -34,7 +34,9 @@ from perception.visualiser import (
     PERCEPTION_MODES,
 )
 from orchestration.llm_planner import LLMPlanner
-from orchestration.workflow_engine import KittingWorkflowEngine, WorkflowPhase
+from orchestration.workflow_engine import (
+    KittingWorkflowEngine, WorkflowPhase, SCENE_ANALYSIS_PROMPT,
+)
 from knowledge.parts_database import PartsDatabase
 from knowledge.seed_data import seed_parts, seed_kits
 
@@ -214,9 +216,10 @@ st.markdown("""
         text-transform: uppercase;
     }
 
-    .status-ready { background: rgba(22,163,74,0.2); color: #22c55e; border: 1px solid rgba(22,163,74,0.3); }
-    .status-busy  { background: rgba(234,179,8,0.2); color: #eab308; border: 1px solid rgba(234,179,8,0.3); }
-    .status-error { background: rgba(220,38,38,0.2); color: #ef4444; border: 1px solid rgba(220,38,38,0.3); }
+    .status-ready   { background: rgba(22,163,74,0.2); color: #22c55e; border: 1px solid rgba(22,163,74,0.3); }
+    .status-busy    { background: rgba(234,179,8,0.2); color: #eab308; border: 1px solid rgba(234,179,8,0.3); }
+    .status-error   { background: rgba(220,38,38,0.2); color: #ef4444; border: 1px solid rgba(220,38,38,0.3); }
+    .status-offline { background: rgba(100,116,139,0.2); color: #94a3b8; border: 1px solid rgba(100,116,139,0.3); }
 
     /* ── Buttons ───────────────────────────────── */
     .stButton > button {
@@ -318,12 +321,15 @@ def init_session_state():
             seed_parts(st.session_state.db)
             seed_kits(st.session_state.db)
 
+    # Set initial status based on connection
+    _initial_status = "ready" if st.session_state.get("bridge_connected", False) else "offline"
+
     defaults = {
         "chat_history": [],
         "scene_description": None,
         "task_plan": None,
         "execution_log": [],
-        "system_status": "ready",
+        "system_status": _initial_status,
         "perception_mode": "🎯 VLM Detections",
         "auto_stream": False,
         "stream_fps": 1.0,
@@ -365,13 +371,35 @@ with st.sidebar:
         "ready": "status-ready",
         "busy": "status-busy",
         "error": "status-error",
-    }.get(status, "status-ready")
+        "offline": "status-offline",
+    }.get(status, "status-offline")
     st.markdown(
         f'<span class="status-badge {badge_class}">{status}</span>',
         unsafe_allow_html=True,
     )
 
-    # Isaac Sim bridge connection indicator
+    # Isaac Sim bridge connection indicator — live check every render
+    _cam = st.session_state.get("camera")
+    if isinstance(_cam, BridgeCameraInterface):
+        _cam._check_connection()
+        if _cam.is_available:
+            st.session_state.bridge_connected = True
+            # Restore ready status if it was offline (but not if in error/busy)
+            if st.session_state.system_status == "offline":
+                st.session_state.system_status = "ready"
+        else:
+            # Bridge went down — fall back to mock camera
+            st.session_state.bridge_connected = False
+            st.session_state.camera = MockCameraInterface()
+            # Set offline unless user triggered emergency stop
+            if st.session_state.system_status not in ("error", "busy"):
+                st.session_state.system_status = "offline"
+    else:
+        # Using mock camera — not connected
+        if not st.session_state.get("bridge_connected", False):
+            if st.session_state.system_status not in ("error", "busy"):
+                st.session_state.system_status = "offline"
+
     if st.session_state.get("bridge_connected", False):
         st.markdown('🟢 **Isaac Sim Connected**')
     else:
@@ -381,6 +409,7 @@ with st.sidebar:
             if bridge.is_available:
                 st.session_state.camera = bridge
                 st.session_state.bridge_connected = True
+                st.session_state.system_status = "ready"
                 st.success("Connected to Isaac Sim!")
                 st.rerun()
             else:
@@ -550,6 +579,33 @@ with st.sidebar:
         })
         st.warning("Emergency stop triggered!")
 
+    # ── Reset (clears emergency state) ────────────────────────
+    if st.session_state.system_status == "error":
+        if st.button(
+            "🔄 Reset System",
+            use_container_width=True,
+            key="reset_estop",
+        ):
+            # Send robot home if bridge is connected
+            _cam_reset = st.session_state.get("camera")
+            if isinstance(_cam_reset, BridgeCameraInterface) and _cam_reset.is_available:
+                try:
+                    _cam_reset.send_home()
+                except Exception:
+                    pass
+
+            # Clear error state
+            is_connected = st.session_state.get("bridge_connected", False)
+            st.session_state.system_status = "ready" if is_connected else "offline"
+            st.session_state.execution_log.append({
+                "time": datetime.now().strftime("%H:%M:%S"),
+                "action": "SYSTEM_RESET",
+                "status": "emergency state cleared",
+                "type": "success",
+            })
+            st.success("System reset — ready for commands")
+            st.rerun()
+
     st.divider()
 
     # ── Parts Database ───────────────────────────────────────
@@ -652,7 +708,8 @@ with col_left:
         try:
             with st.spinner("🧠 Phase 1: Overhead VLM analysis..."):
                 image = st.session_state.camera.capture_workspace_image()
-                scene = st.session_state.vlm.analyze_scene(image)
+                scene = st.session_state.vlm.analyze_scene(
+                    image, custom_prompt=SCENE_ANALYSIS_PROMPT)
                 st.session_state.scene_description = scene
                 st.session_state.system_status = "ready"
 

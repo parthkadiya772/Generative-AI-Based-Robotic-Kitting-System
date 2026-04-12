@@ -60,6 +60,15 @@ perception:
       model: "qwen2.5vl:7b"
       base_url: "http://10.7.0.35:11434"
 
+  # ── Depth Estimation (fallback when bridge depth buffer unavailable) ──
+  depth_method: "geometric"            # "geometric" (no ML) or "depth_anything" (Depth Anything V2)
+  camera_height_m: 1.8                 # approx camera height above workspace (metres)
+  camera_fov_h_deg: 60.0               # horizontal FOV of overhead camera (degrees)
+  camera_resolution: [1920, 1080]      # overhead camera resolution
+  workspace_surface_z: 0.02            # Z height of bin surface where parts sit (metres)
+  camera_world_x: 0.3                  # camera world X position (metres)
+  camera_world_y: 0.0                  # camera world Y position (metres)
+
 # ─── Orchestration (LLM) ────────────────────────────────────
 orchestration:
   llm_provider: "ollama_llama"        # Active provider (overridden by UI model selection)

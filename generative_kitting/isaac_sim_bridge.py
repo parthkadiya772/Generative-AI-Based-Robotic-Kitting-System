@@ -33,6 +33,7 @@ ROBOT_PRIM  = "/World"
 # Dual cameras
 CAMERA_RGB_PRIM   = "/World/Camera"
 CAMERA_DEPTH_PRIM = "/World/Realsense/RSD455/Camera_Pseudo_Depth"
+CAMERA_WRIST_PRIM = "/World/Realsense/RSD455/Camera_OmniVision_OV9782_Color"
 IMU_PRIM          = "/World/Realsense/RSD455/Imu_Sensor"
 
 # Robot geometry
@@ -71,7 +72,9 @@ GRIPPER_TCP_OFFSET   = 0.150
 GRIPPER_BODY_WIDTH   = 0.160
 GRIPPER_HALF_WIDTH   = GRIPPER_BODY_WIDTH / 2.0
 HOVER_CLEARANCE      = 0.020
-GRASP_DEPTH_FRACTION = 0.45  # 0.45 = below mid-height, longer grip span, avoids bin bottom
+GRASP_LIFT           = 0.015  # 15mm — TCP stays ABOVE part top; finger pads wrap down
+                              # around the part body without touching the bin bottom
+GRASP_DEPTH_FRACTION = 0.45   # only used by compute_grasp_geometry (legacy/debug)
 BOX_HEIGHT           = 0.05
 BOX_ENTRY_MARGIN     = 0.15
 PLACE_DROP_HEIGHT    = 0.02
@@ -308,6 +311,7 @@ class BridgeState:
         self.world = None
         self.camera_rgb = None
         self.camera_depth = None
+        self.camera_wrist = None
         self.lula_solver = None
         self.target_frame = "ee_link"
         self.arm_names = []
@@ -389,7 +393,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         elif path == "/api/ping":
             self._send_json({
                 "status": "ok", "bridge": "isaac_sim", "port": BRIDGE_PORT,
-                "cameras": ["rgb", "depth"], "ik_ready": STATE.ik_ready,
+                "cameras": ["rgb", "depth", "wrist"], "ik_ready": STATE.ik_ready,
             })
         elif path == "/api/scene_parts":
             self._handle_scene_parts()
@@ -411,8 +415,16 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self._handle_approach(body)
         elif path == "/api/pick":
             self._handle_pick(body)
+        elif path == "/api/pick_descend":
+            self._handle_pick_descend(body)
+        elif path == "/api/pick_close":
+            self._handle_pick_close(body)
+        elif path == "/api/pick_retract":
+            self._handle_pick_retract(body)
         elif path == "/api/place":
             self._handle_place(body)
+        elif path == "/api/project_to_world":
+            self._handle_project(body)
         else:
             self._send_json({"error": f"Unknown endpoint: {path}"}, 404)
 
@@ -494,53 +506,33 @@ class BridgeHandler(BaseHTTPRequestHandler):
         STATE.push_command({"action": "pick_object_ik", "params": body})
         self._send_json(STATE.pop_result(timeout=60))
 
+    def _handle_pick_descend(self, body):
+        """Descend to grasp with open fingers, return wrist image."""
+        STATE.push_command({"action": "pick_descend", "params": body})
+        self._send_json(STATE.pop_result(timeout=60))
+
+    def _handle_pick_close(self, body):
+        """Close gripper and confirm grasp, return wrist image."""
+        STATE.push_command({"action": "pick_close", "params": body})
+        self._send_json(STATE.pop_result(timeout=60))
+
+    def _handle_pick_retract(self, body):
+        """Retract with grasped part."""
+        STATE.push_command({"action": "pick_retract", "params": body})
+        self._send_json(STATE.pop_result(timeout=60))
+
     def _handle_place(self, body):
         """Full place sequence at XYZ."""
         STATE.push_command({"action": "place_object_ik", "params": body})
         self._send_json(STATE.pop_result(timeout=60))
 
+    def _handle_project(self, body):
+        """Project normalised image coords to world XYZ via depth."""
+        STATE.push_command({"action": "project_to_world", "params": body})
+        self._send_json(STATE.pop_result(timeout=15))
 
-# ═════════════════════════════════════════════════════════════
-# ASYNC COMMAND PROCESSOR
-# ═════════════════════════════════════════════════════════════
 
-async def process_commands():
-    import omni.kit.app
-    while True:
-        cmd = STATE.pop_command()
-        if cmd is None:
-            await omni.kit.app.get_app().next_update_async()
-            continue
-
-        action = cmd.get("action", "")
-        try:
-            if action == "camera_capture":
-                result = await _capture_camera(cmd.get("camera", "rgb"))
-            elif action == "move_home":
-                result = await _move_home()
-            elif action == "set_joints":
-                result = await _set_joints(cmd["positions"])
-            elif action == "gripper_open":
-                result = await _set_gripper(FINGER_OPEN)
-            elif action == "gripper_close":
-                result = await _set_gripper(FINGER_CLOSE)
-            elif action == "execute_plan":
-                result = await _execute_plan(cmd["plan"])
-            elif action == "scan_scene_parts":
-                result = await _scan_scene_parts()
-            elif action == "approach":
-                result = await _approach_target(cmd.get("params", {}))
-            elif action == "pick_object_ik":
-                result = await _pick_object_ik(cmd.get("params", {}))
-            elif action == "place_object_ik":
-                result = await _place_object_ik(cmd.get("params", {}))
-            else:
-                result = {"error": f"Unknown action: {action}"}
-        except Exception as e:
-            result = {"error": str(e), "traceback": traceback.format_exc()}
-            STATE.last_error = str(e)
-
-        STATE.push_result(result)
+# (Async command processor is now _process_commands_loop in the lifecycle section)
 
 
 # ═════════════════════════════════════════════════════════════
@@ -559,6 +551,13 @@ async def _capture_camera(cam_type="rgb"):
                 for _ in range(10):
                     await omni.kit.app.get_app().next_update_async()
             cam = STATE.camera_depth
+        elif cam_type == "wrist":
+            if STATE.camera_wrist is None:
+                STATE.camera_wrist = Camera(prim_path=CAMERA_WRIST_PRIM, resolution=(1280, 720))
+                STATE.camera_wrist.initialize()
+                for _ in range(10):
+                    await omni.kit.app.get_app().next_update_async()
+            cam = STATE.camera_wrist
         else:
             if STATE.camera_rgb is None:
                 STATE.camera_rgb = Camera(prim_path=CAMERA_RGB_PRIM, resolution=(1920, 1080))
@@ -596,6 +595,232 @@ async def _capture_camera(cam_type="rgb"):
 
     except Exception as e:
         return {"error": f"{cam_type} camera failed: {e}"}
+
+
+# ═════════════════════════════════════════════════════════════
+# DEPTH-BASED WORLD PROJECTION
+#
+#   Converts VLM normalised image coordinates (0-1) into real-world
+#   XYZ by reading the depth buffer from the same camera that took
+#   the RGB frame.  This replaces USD prim-path lookups so that
+#   coordinates come purely from vision.
+#
+#   Pipeline:  VLM (nx,ny) → pixel (px,py) → depth d →
+#              camera intrinsics → camera-frame 3D →
+#              camera extrinsics → world-frame XYZ
+# ═════════════════════════════════════════════════════════════
+
+def _get_workspace_surface_z():
+    """Get Z height of workspace surface where parts sit.
+
+    Reads the parts container prim position from USD.  Falls back to
+    a reasonable default if the prim isn't available.
+    """
+    import omni.usd
+    try:
+        stage = omni.usd.get_context().get_stage()
+        prim = stage.GetPrimAtPath(PARTS_CONTAINER)
+        if prim.IsValid():
+            mat = omni.usd.get_world_transform_matrix(prim)
+            z = float(mat.GetRow(3)[2])
+            print(f"  [workspace_z] Parts container Z = {z:.4f}")
+            return z
+    except Exception as e:
+        print(f"  [workspace_z] USD read failed: {e}")
+    return 0.02  # reasonable default for bin surface
+
+
+async def _project_to_world(params):
+    """Project normalised image coordinates to world XYZ.
+
+    Two methods (automatic fallback):
+      1. **Depth buffer** — per-pixel depth from Isaac Sim camera.
+         Most accurate; gives true Z for each object.
+      2. **Geometric ray-plane** — intersect camera ray with the
+         workspace surface plane (Z = bin surface).  No depth buffer
+         needed; assumes objects sit on a flat surface.
+
+    Args (in params dict):
+        points: list of {x, y} with values in [0, 1]
+        camera: prim path or alias ("rgb", "depth") — default "rgb"
+
+    Returns:
+        {status, world_points: [{x, y, z, depth_m, method}, ...]}
+    """
+    import omni.kit.app, omni.usd
+    from omni.isaac.sensor import Camera
+    from pxr import UsdGeom, Gf
+    import math
+
+    points = params.get("points", [])
+    cam_alias = params.get("camera", "rgb")
+
+    # Resolve alias → prim path
+    if cam_alias == "rgb":
+        cam_path = CAMERA_RGB_PRIM
+        res = (1920, 1080)
+    elif cam_alias == "depth":
+        cam_path = CAMERA_DEPTH_PRIM
+        res = (1280, 720)
+    elif cam_alias == "wrist":
+        cam_path = CAMERA_WRIST_PRIM
+        res = (1280, 720)
+    else:
+        cam_path = cam_alias
+        res = (1280, 720)
+
+    # ── Initialise camera ──────────────────────────────────────
+    if cam_alias == "rgb" and STATE.camera_rgb is not None:
+        cam = STATE.camera_rgb
+    elif cam_alias == "depth" and STATE.camera_depth is not None:
+        cam = STATE.camera_depth
+    elif cam_alias == "wrist" and STATE.camera_wrist is not None:
+        cam = STATE.camera_wrist
+    else:
+        cam = Camera(prim_path=cam_path, resolution=res)
+        cam.initialize()
+        for _ in range(10):
+            await omni.kit.app.get_app().next_update_async()
+
+    # ── Camera intrinsics ──────────────────────────────────────
+    w_res, h_res = res
+    try:
+        intrinsics = cam.get_intrinsics_matrix()  # 3×3 numpy
+        fx, fy = float(intrinsics[0, 0]), float(intrinsics[1, 1])
+        cx, cy = float(intrinsics[0, 2]), float(intrinsics[1, 2])
+        print(f"  [project] Intrinsics: fx={fx:.1f} fy={fy:.1f} cx={cx:.1f} cy={cy:.1f}")
+    except Exception:
+        hfov_rad = math.radians(60)
+        fx = fy = (w_res / 2.0) / math.tan(hfov_rad / 2.0)
+        cx, cy = w_res / 2.0, h_res / 2.0
+        print(f"  [project] Intrinsics (estimated): fx={fx:.1f} fy={fy:.1f}")
+
+    # ── Camera extrinsics (world transform) ────────────────────
+    stage = omni.usd.get_context().get_stage()
+    cam_prim = stage.GetPrimAtPath(cam_path)
+    cam_world_mat = omni.usd.get_world_transform_matrix(cam_prim)
+
+    cam_pos = cam_world_mat.GetRow(3)
+    print(f"  [project] Camera world pos: ({cam_pos[0]:.3f}, {cam_pos[1]:.3f}, {cam_pos[2]:.3f})")
+
+    # ── Try depth buffer ───────────────────────────────────────
+    has_depth = False
+    depth_buf = None
+
+    # Warm up camera for depth
+    for _ in range(8):
+        cam.get_current_frame()
+        await omni.kit.app.get_app().next_update_async()
+
+    try:
+        depth_buf = cam.get_depth()
+        if depth_buf is not None and depth_buf.size > 0:
+            valid_mask = (depth_buf > 0.01) & (depth_buf < 100.0)
+            valid_count = int(valid_mask.sum())
+            total_pixels = depth_buf.size
+            print(f"  [project] Depth buffer: {depth_buf.shape}, "
+                  f"{valid_count}/{total_pixels} valid pixels "
+                  f"({100*valid_count/total_pixels:.1f}%), "
+                  f"range=[{depth_buf[valid_mask].min():.3f}, {depth_buf[valid_mask].max():.3f}]"
+                  if valid_count > 0 else f"  [project] Depth buffer: {depth_buf.shape}, 0 valid pixels")
+            if valid_count > total_pixels * 0.01:  # at least 1% valid
+                has_depth = True
+                h_depth, w_depth = depth_buf.shape[:2]
+            else:
+                print(f"  [project] WARNING: depth buffer has too few valid pixels — using geometric fallback")
+        else:
+            print(f"  [project] Depth buffer empty or None")
+    except Exception as e:
+        print(f"  [project] Depth buffer read failed: {e}")
+
+    # ── Workspace surface Z for geometric fallback ─────────────
+    workspace_z = _get_workspace_surface_z()
+
+    method_used = "depth" if has_depth else "geometric"
+    print(f"  [project] Method: {method_used} | {len(points)} points to project")
+
+    # ── Project each point ─────────────────────────────────────
+    world_points = []
+    for i, pt in enumerate(points):
+        nx = float(pt.get("x", 0.5))
+        ny = float(pt.get("y", 0.5))
+
+        point_method = None
+
+        # ── Method 1: Depth buffer projection ──────────────────
+        if has_depth:
+            px = min(int(nx * (w_depth - 1)), w_depth - 1)
+            py = min(int(ny * (h_depth - 1)), h_depth - 1)
+
+            # Sample depth in 5×5 neighbourhood (robust to noise/edges)
+            r = 2
+            y0, y1 = max(0, py - r), min(h_depth, py + r + 1)
+            x0, x1 = max(0, px - r), min(w_depth, px + r + 1)
+            patch = depth_buf[y0:y1, x0:x1]
+            valid = patch[(patch > 0.01) & (patch < 100.0)]
+
+            if valid.size > 0:
+                d = float(np.median(valid))
+
+                # Unproject pixel → camera frame (OpenGL: +X right, +Y up, -Z forward)
+                cam_x =  (px - cx) * d / fx
+                cam_y = -(py - cy) * d / fy
+                cam_z = -d
+
+                cam_pt = Gf.Vec4d(cam_x, cam_y, cam_z, 1.0)
+                world_pt = cam_world_mat.GetTranspose() * cam_pt
+
+                world_points.append({
+                    "x": float(world_pt[0]),
+                    "y": float(world_pt[1]),
+                    "z": float(world_pt[2]),
+                    "depth_m": d,
+                    "method": "depth",
+                })
+                point_method = "depth"
+
+        # ── Method 2: Geometric ray-plane intersection ─────────
+        if point_method is None:
+            px = min(int(nx * (w_res - 1)), w_res - 1)
+            py = min(int(ny * (h_res - 1)), h_res - 1)
+
+            # Ray direction in camera frame
+            ray_cam = Gf.Vec4d(
+                (px - cx) / fx,
+                -(py - cy) / fy,
+                -1.0,
+                0.0,   # direction vector (w=0)
+            )
+            # Transform ray direction to world frame
+            ray_world = cam_world_mat.GetTranspose() * ray_cam
+
+            dz = ray_world[2]
+            if abs(dz) < 1e-6:
+                world_points.append({
+                    "x": 0, "y": 0, "z": workspace_z, "depth_m": -1,
+                    "error": "ray parallel to plane", "method": "geometric",
+                })
+                continue
+
+            # Intersect ray with Z = workspace_z plane
+            t = (workspace_z - cam_pos[2]) / dz
+            world_x = cam_pos[0] + t * ray_world[0]
+            world_y = cam_pos[1] + t * ray_world[1]
+
+            world_points.append({
+                "x": float(world_x),
+                "y": float(world_y),
+                "z": float(workspace_z),
+                "depth_m": float(abs(cam_pos[2] - workspace_z)),
+                "method": "geometric",
+            })
+            point_method = "geometric"
+
+        wp = world_points[-1]
+        print(f"  [{i}] image({nx:.2f},{ny:.2f}) → world({wp['x']:.3f}, {wp['y']:.3f}, {wp['z']:.3f}) [{point_method}]")
+
+    return {"status": "ok", "world_points": world_points,
+            "camera": cam_path, "method": method_used}
 
 
 # ═════════════════════════════════════════════════════════════
@@ -1118,27 +1343,13 @@ async def _move_gantry_x(target_x, finger_hold=None):
 async def _approach_target(params):
     """Move arm near target XYZ at safe height (for depth camera inspection).
 
-    Uses the real USD bbox centre X for gantry alignment so the robot is
-    FULLY positioned over the part before the depth scan — no lateral
-    correction is needed after scanning.
+    All coordinates come from VLM + depth projection — no USD prim paths.
+    The workflow engine already resolved image coords to world XYZ via
+    the /api/project_to_world endpoint before calling this.
     """
     x = params.get("x", 0.3)
     y = params.get("y", 0.0)
     z = params.get("z", 0.5)
-    part_prim = params.get("part_prim", None)
-
-    # If a USD prim path is given, use the real bbox centre for gantry X
-    # so there is no second gantry slide after the depth scan.
-    if part_prim:
-        try:
-            import omni.usd
-            stage = omni.usd.get_context().get_stage()
-            geom = compute_bbox_geometry(stage, part_prim, "APPROACH")
-            x = geom["center_xy"][0]
-            y = geom["center_xy"][1]
-            z = geom["top_z"]
-        except Exception as e:
-            print(f"  [APPROACH] bbox failed ({e}), using param coords")
 
     # Stay high: BOX_ENTRY_MARGIN above bin rim, not inside it
     safe_z = z + BOX_ENTRY_MARGIN + BOX_HEIGHT + GRIPPER_TCP_OFFSET + 0.10
@@ -1156,21 +1367,33 @@ async def _approach_target(params):
             "target": [x, y, z], "ee_position": result["ee_position"]}
 
 
-async def _pick_object_ik(params):
-    """Full IK-based pick sequence with chained warm-starts.
+def _pick_z_positions(z):
+    """Shared Z waypoint calculations for the 3-phase pick sequence."""
+    tcp_z_offset = 0.0 if STATE.target_frame == "gripper_tcp" else GRIPPER_TCP_OFFSET
+    part_top_z = z
+    grasp_z = z + GRASP_LIFT       # TCP stays ABOVE part top, pads wrap below
+    safe_z = part_top_z + BOX_HEIGHT + BOX_ENTRY_MARGIN + tcp_z_offset
+    entry_z = part_top_z + BOX_HEIGHT + tcp_z_offset
+    hover_z = part_top_z + HOVER_CLEARANCE + tcp_z_offset
+    grasp_target_z = grasp_z + tcp_z_offset
+    transit_z = safe_z + TRANSIT_SAFE_HEIGHT
+    return dict(safe_z=safe_z, entry_z=entry_z, hover_z=hover_z,
+                grasp_target_z=grasp_target_z, transit_z=transit_z,
+                tcp_z_offset=tcp_z_offset)
 
-    Ported from the proven robot_control.py multi-phase approach:
-      Phase 1: IK solve for safe height above target
-      Phase 2: Re-solve from settled joints (same target, better seed)
-      Phase 3a: Hover — warm-start from Phase 2 solution
-      Phase 3b: Grasp — warm-start from hover solution
-      Phase 4: Retract — warm-start from settled post-grasp joints
 
-    Each phase chains the IK solution as warm-start for the next,
-    keeping the solver in the same joint-space neighbourhood and
-    preventing self-collision on this ceiling-mounted gantry UR10.
+# ─── PICK PHASE 1: Descend to grasp position ───────────────
+
+async def _pick_descend(params):
+    """Descend to grasp position with open fingers.
+
+    Gantry aligns → arm descends to grasp height → captures wrist image.
+    The gripper stays OPEN — the caller must verify part placement via the
+    returned wrist image before requesting gripper close.
+
+    Returns wrist_image (base64) so the workflow can run VLM verification.
     """
-    import omni.kit.app, omni.usd
+    import omni.kit.app
     from isaacsim.core.utils.types import ArticulationAction
 
     if not STATE.ik_ready:
@@ -1179,47 +1402,28 @@ async def _pick_object_ik(params):
     x = params.get("x", 0.3)
     y = params.get("y", 0.0)
     z = params.get("z", 0.02)
-    part_path = params.get("part_prim", None)
 
     STATE.is_executing = True
     steps = []
     try:
         locked_ori = normalize_quat(DOWNWARD_ORIENTATION)
-        tcp_z_offset = 0.0 if STATE.target_frame == "gripper_tcp" else GRIPPER_TCP_OFFSET
-
-        # Use bbox geometry if part_prim is provided
-        finger_close = FINGER_CLOSE  # fixed value — physics stops fingers on contact
-        if part_path:
-            stage = omni.usd.get_context().get_stage()
-            try:
-                geom = compute_grasp_geometry(stage, part_path, GRASP_DEPTH_FRACTION)
-                x = geom["part_center_xy"][0]
-                y = geom["part_center_xy"][1]
-                part_top_z = geom["part_top_z"]
-                grasp_z = geom["grasp_z"]
-            except Exception:
-                part_top_z = z
-                grasp_z = z
-        else:
-            part_top_z = z
-            grasp_z = z
-
-        safe_z = part_top_z + BOX_HEIGHT + BOX_ENTRY_MARGIN + tcp_z_offset
-        entry_z = part_top_z + BOX_HEIGHT + tcp_z_offset  # just inside box rim
-        hover_z = part_top_z + HOVER_CLEARANCE + tcp_z_offset
-        grasp_target_z = grasp_z + tcp_z_offset
-        transit_z = safe_z + TRANSIT_SAFE_HEIGHT
+        zp = _pick_z_positions(z)
+        safe_z = zp["safe_z"]
 
         safe_pos = np.array([x, y, safe_z])
-        entry_pos = np.array([x, y, entry_z])
-        hover_pos = np.array([x, y, hover_z])
-        grasp_pos = np.array([x, y, grasp_target_z])
-        transit_pos = np.array([x, y, transit_z])
+        entry_pos = np.array([x, y, zp["entry_z"]])
+        hover_pos = np.array([x, y, zp["hover_z"]])
+        grasp_pos = np.array([x, y, zp["grasp_target_z"]])
 
-        print(f"  [PICK] target=({x:.3f}, {y:.3f}, {z:.3f}) safe_z={safe_z:.3f} hover_z={hover_z:.3f} grasp_z={grasp_target_z:.3f} finger={finger_close:.3f}")
+        print(f"  [DESCEND] target=({x:.3f}, {y:.3f}, {z:.3f}) "
+              f"safe_z={safe_z:.3f} hover_z={zp['hover_z']:.3f} "
+              f"grasp_z={zp['grasp_target_z']:.3f}")
 
-        # 1. Move gantry ONLY if not already aligned (approach already positioned it).
-        #    Skipping prevents the visible X-slide after depth scan.
+        # 1. Open gripper
+        await _set_gripper(FINGER_OPEN)
+        steps.append({"phase": "open_gripper", "status": "ok"})
+
+        # 2. Gantry alignment — keep EE world position STABLE while gantry slides.
         gantry_aligned = False
         current_joints = STATE.robot.get_joint_positions()
         for idx, name in enumerate(STATE.dof_names):
@@ -1228,150 +1432,91 @@ async def _pick_object_ik(params):
                     gantry_aligned = True
                 break
         if not gantry_aligned:
+            ee_before = get_world_pos(EE_PATH).copy()
+            print(f"  [DESCEND] Gantry re-align — holding EE at {ee_before.tolist()}")
             await _move_gantry_x(x)
-        _update_base_pose()
+            _update_base_pose()
+            restore_warm = _get_warm_start()
+            restore_pos = np.array(ee_before)
+            restore_action, restore_ok = ik_solve(
+                STATE.lula_solver, STATE.target_frame,
+                restore_pos, locked_ori, restore_warm)
+            if restore_ok:
+                targets = apply_arm_joints(
+                    STATE.robot, STATE.dof_names, STATE.arm_names, restore_action)
+                await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES)
+                print(f"  [DESCEND] EE restored to {get_world_pos(EE_PATH).tolist()}")
+            else:
+                print("  [DESCEND] WARNING: EE restore IK failed")
+        else:
+            _update_base_pose()
         steps.append({"phase": "gantry", "status": "ok"})
 
-        # 2. Open gripper before any arm movement
-        await _set_gripper(FINGER_OPEN)
-        steps.append({"phase": "open_gripper", "status": "ok"})
-
-        # 3. Move to safe height — VERTICAL-FIRST to avoid sweeping through bin walls.
-        #
-        #    Two-phase approach prevents lateral arm swing during bin exit:
-        #      3a) If arm is below safe_z (inside / near bin): solve IK at CURRENT
-        #          EE X,Y but target safe_z — pulls straight up with no lateral motion.
-        #      3b) Lateral align — from above the bin, move to exact [x, y, safe_z].
-        #          IK from safe height → safe height is a small, collision-free move.
-        #
-        #    Without this, IK re-solves for safe_pos (new bbox XY) from a position
-        #    that is offset in X and/or Z, and the solver finds a different arm
-        #    configuration that swings fingers through the bin walls on the way up.
+        # 3. Safe height (vertical-first to avoid bin wall sweeps)
         current_ee = get_world_pos(EE_PATH)
         warm = _get_warm_start()
-
-        # Phase 3a: vertical retract via Cartesian micro-steps (skip if already above safe_z).
-        #   Each 4 cm IK step is warm-started from the previous result so the solver
-        #   cannot flip to a distant configuration — arm rises straight up, no swinging.
         if current_ee[2] < safe_z - 0.05:
             v_ok = await _retract_cartesian_up(
                 safe_z, current_ee[0], current_ee[1], locked_ori, step_size=0.04)
             if not v_ok:
-                return {"error": f"Cartesian retract (Phase 3a) failed", "steps": steps}
-            steps.append({"phase": "safe_height_retract", "status": "ok"})
-            warm = _get_warm_start()  # fresh seed for lateral align
+                return {"error": "Cartesian retract failed", "steps": steps}
+            steps.append({"phase": "safe_retract", "status": "ok"})
+            warm = _get_warm_start()
 
-        # Phase 3b: lateral align to exact [x, y, safe_z] (from above — always safe).
-        #   Always apply — skipping with a "close enough" threshold was the root
-        #   cause of bin-wall collisions: the arm descended with a 2-4 cm offset
-        #   that put the open fingers into the bin wall.
         p1_action, p1_ok = ik_solve(STATE.lula_solver, STATE.target_frame,
                                      safe_pos, locked_ori, warm)
         if not p1_ok:
-            return {"error": f"IK Phase 3b failed for safe_pos {safe_pos.tolist()}", "steps": steps}
+            return {"error": f"IK safe failed {safe_pos.tolist()}", "steps": steps}
         targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, p1_action)
         await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES)
         steps.append({"phase": "safe_height", "status": "ok"})
 
-        # Gripper stays fully open during descent — physics stops fingers
-        # on part contact naturally (same as robot_control.py).
-
-        # 4. Re-solve from current settled pose — this is the seed for the descent
+        # 4. Re-solve seed
         settled_warm = _get_warm_start()
         p2_action, p2_ok = ik_solve(STATE.lula_solver, STATE.target_frame,
                                      safe_pos, locked_ori, settled_warm)
         if not p2_ok:
-            p2_action = p1_action  # fallback
+            p2_action = p1_action
 
-        # 5. Entry — descend vertically to just inside the box rim
-        #    This forces a pure vertical path through the rim opening,
-        #    preventing the IK solver from swinging the arm horizontally.
+        # 5. Entry — just inside box rim
         entry_action, entry_ok = ik_solve(STATE.lula_solver, STATE.target_frame,
                                            entry_pos, locked_ori, p2_action)
         if entry_ok:
-            targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, entry_action)
+            targets = apply_arm_joints(
+                STATE.robot, STATE.dof_names, STATE.arm_names, entry_action)
             await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES)
             steps.append({"phase": "entry", "status": "ok"})
-            # Use entry solution as warm-start for hover
             p2_action = entry_action
 
-        # 6. Hover — descend inside box, above part
+        # 6. Hover — above part
         hover_action, hover_ok = ik_solve(STATE.lula_solver, STATE.target_frame,
                                            hover_pos, locked_ori, p2_action)
         if not hover_ok:
-            return {"error": f"IK hover failed for {hover_pos.tolist()}", "steps": steps}
-
-        targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, hover_action)
+            return {"error": f"IK hover failed {hover_pos.tolist()}", "steps": steps}
+        targets = apply_arm_joints(
+            STATE.robot, STATE.dof_names, STATE.arm_names, hover_action)
         await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES)
         steps.append({"phase": "hover", "status": "ok"})
 
-        # 6. PHASE 3b -- Plunge to grasp height
-        #    Warm-start from hover solution
+        # 7. Grasp position — gentle 5mm drop from hover (GRASP_LIFT above part top)
         grasp_action, grasp_ok = ik_solve(STATE.lula_solver, STATE.target_frame,
                                            grasp_pos, locked_ori, hover_action)
         if not grasp_ok:
-            return {"error": f"IK grasp failed for {grasp_pos.tolist()}", "steps": steps}
-
-        targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, grasp_action)
+            return {"error": f"IK grasp failed {grasp_pos.tolist()}", "steps": steps}
+        targets = apply_arm_joints(
+            STATE.robot, STATE.dof_names, STATE.arm_names, grasp_action)
         await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES)
         steps.append({"phase": "grasp_descend", "status": "ok"})
 
-        # 7. Close gripper — direct joint target, physics stops fingers on
-        #    part contact naturally (matches robot_control.py exactly).
-        #    120 settle frames lets the PD controller reach the part surface
-        #    smoothly without snapping.
-        targets = STATE.robot.get_joint_positions()
-        targets = set_finger_joints(STATE.robot, STATE.dof_names, finger_close, targets)
-        STATE.robot.apply_action(ArticulationAction(joint_positions=targets))
-        for _ in range(120):
-            await omni.kit.app.get_app().next_update_async()
-        # Lock grip: by frame 120 fingers are nearly there — this snaps
-        # the last few degrees and sets PD target to FINGER_CLOSE_MAX so
-        # the controller holds firm during retract (prevents late-close).
-        _force_grip(finger_close)
-        for _ in range(SETTLE_FRAMES):
-            await omni.kit.app.get_app().next_update_async()
-        steps.append({"phase": "close_gripper", "status": "ok", "finger_close": finger_close})
+        # 8. Capture wrist camera — caller uses this for VLM "part between fingers?" check
+        wrist_frame = await _capture_camera("wrist")
+        wrist_b64 = wrist_frame.get("image_base64")
+        steps.append({"phase": "wrist_capture",
+                       "status": "ok" if wrist_b64 else "warn"})
 
-        # 9. Verify grasp
-        grasp_check = await _verify_grasp()
-        steps.append({"phase": "verify_grasp", "status": "ok", "detail": grasp_check})
-
-        # PHASE 4 -- Retract to safe height above bin.
-        #   Single IK solve warm-started from current settled joints so the
-        #   solver stays in the same configuration (no flip) — matches
-        #   robot_control.py Phase 4.  Isaac Sim physics makes the motion
-        #   naturally smooth over 150 frames; no manual interpolation needed.
-        settled_warm = _get_warm_start()
-        retract_action, retract_ok = ik_solve(STATE.lula_solver, STATE.target_frame,
-                                               safe_pos, locked_ori, settled_warm)
-        if not retract_ok:
-            return {"error": "IK retract (Phase 4) failed", "steps": steps}
-        targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, retract_action)
-        targets = set_finger_joints(STATE.robot, STATE.dof_names, FINGER_CLOSE_MAX, targets)
-        STATE.robot.apply_action(ArticulationAction(joint_positions=targets))
-        for _ in range(150):
-            await omni.kit.app.get_app().next_update_async()
-        _force_grip(finger_close)
-        steps.append({"phase": "retract", "status": "ok"})
-
-        # PHASE 4b -- Rise to transit clear-height (same XY, higher Z).
-        #   Second single IK solve — robot_control.py Phase 4b pattern.
-        settled_transit_warm = _get_warm_start()
-        transit_action, transit_ok = ik_solve(STATE.lula_solver, STATE.target_frame,
-                                               transit_pos, locked_ori, settled_transit_warm)
-        if transit_ok:
-            targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, transit_action)
-            targets = set_finger_joints(STATE.robot, STATE.dof_names, FINGER_CLOSE_MAX, targets)
-            STATE.robot.apply_action(ArticulationAction(joint_positions=targets))
-            for _ in range(150):
-                await omni.kit.app.get_app().next_update_async()
-            _force_grip(finger_close)
-        steps.append({"phase": "transit_safe", "status": "ok" if transit_ok else "skipped"})
-
-        return {"status": "completed", "action": "pick_object",
+        return {"status": "ok", "action": "pick_descend",
                 "position": [x, y, z], "steps": steps,
-                "finger_close": finger_close}
+                "wrist_image": wrist_b64}
 
     except Exception as e:
         return {"status": "error", "error": str(e), "steps": steps}
@@ -1379,13 +1524,195 @@ async def _pick_object_ik(params):
         STATE.is_executing = False
 
 
+# ─── PICK PHASE 2: Close gripper and confirm ───────────────
+
+async def _pick_close(params):
+    """Close the gripper and confirm the part is grasped.
+
+    Retries up to 3 times with increasing settle time.
+    Returns a wrist camera image so the caller can run VLM verification
+    that the part is properly held before requesting retract.
+    """
+    import omni.kit.app
+    from isaacsim.core.utils.types import ArticulationAction
+
+    finger_close = params.get("finger_close", FINGER_CLOSE)
+    GRASP_CONFIRM_THRESHOLD = 0.05  # rad
+
+    STATE.is_executing = True
+    try:
+        grasp_confirmed = False
+        actual_finger = 0.0
+        grip_attempt = 0
+
+        for grip_attempt in range(1, 4):
+            print(f"  [CLOSE] attempt {grip_attempt}/3  target={finger_close:.3f}")
+            targets = STATE.robot.get_joint_positions()
+            targets = set_finger_joints(
+                STATE.robot, STATE.dof_names, finger_close, targets)
+            STATE.robot.apply_action(ArticulationAction(joint_positions=targets))
+
+            settle = 120 if grip_attempt == 1 else 180
+            for _ in range(settle):
+                await omni.kit.app.get_app().next_update_async()
+
+            actual_joints = STATE.robot.get_joint_positions()
+            for idx, name in enumerate(STATE.dof_names):
+                if ("finger_joint" in name and "inner" not in name
+                        and "knuckle" not in name):
+                    actual_finger = float(actual_joints[idx])
+                    break
+
+            print(f"  [CLOSE] actual={actual_finger:.4f}  "
+                  f"threshold={GRASP_CONFIRM_THRESHOLD}")
+
+            if actual_finger >= GRASP_CONFIRM_THRESHOLD:
+                grasp_confirmed = True
+                print(f"  [CLOSE] ✓ Grasp confirmed (attempt {grip_attempt})")
+                break
+            print(f"  [CLOSE] ✗ Retrying...")
+
+        grip_hold = finger_close
+        grasp_check = await _verify_grasp()
+
+        # Capture wrist image for "is part properly grasped?" VLM check
+        wrist_frame = await _capture_camera("wrist")
+        wrist_b64 = wrist_frame.get("image_base64")
+
+        return {"status": "ok", "action": "pick_close",
+                "grasp_confirmed": grasp_confirmed,
+                "finger_close": finger_close,
+                "actual_finger": round(actual_finger, 4),
+                "grip_hold": grip_hold,
+                "attempts": grip_attempt,
+                "grasp_check": grasp_check,
+                "wrist_image": wrist_b64}
+
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+    finally:
+        STATE.is_executing = False
+
+
+# ─── PICK PHASE 3: Retract with part ───────────────────────
+
+async def _pick_retract(params):
+    """Retract the arm to safe + transit height while holding the part.
+
+    Must be called after _pick_close — the gripper is already closed.
+    """
+    import omni.kit.app
+    from isaacsim.core.utils.types import ArticulationAction
+
+    if not STATE.ik_ready:
+        return {"error": "IK solver not initialised"}
+
+    x = params.get("x", 0.3)
+    y = params.get("y", 0.0)
+    z = params.get("z", 0.02)
+    grip_hold = params.get("grip_hold", FINGER_CLOSE)
+
+    STATE.is_executing = True
+    steps = []
+    try:
+        locked_ori = normalize_quat(DOWNWARD_ORIENTATION)
+        zp = _pick_z_positions(z)
+        safe_pos = np.array([x, y, zp["safe_z"]])
+        transit_pos = np.array([x, y, zp["transit_z"]])
+
+        # Retract to safe height
+        settled_warm = _get_warm_start()
+        retract_action, retract_ok = ik_solve(
+            STATE.lula_solver, STATE.target_frame,
+            safe_pos, locked_ori, settled_warm)
+        if not retract_ok:
+            return {"error": "IK retract failed", "steps": steps}
+        targets = apply_arm_joints(
+            STATE.robot, STATE.dof_names, STATE.arm_names, retract_action)
+        targets = set_finger_joints(
+            STATE.robot, STATE.dof_names, grip_hold, targets)
+        STATE.robot.apply_action(ArticulationAction(joint_positions=targets))
+        for _ in range(150):
+            await omni.kit.app.get_app().next_update_async()
+        steps.append({"phase": "retract", "status": "ok"})
+
+        # Transit to clear-height
+        transit_warm = _get_warm_start()
+        transit_action, transit_ok = ik_solve(
+            STATE.lula_solver, STATE.target_frame,
+            transit_pos, locked_ori, transit_warm)
+        if transit_ok:
+            targets = apply_arm_joints(
+                STATE.robot, STATE.dof_names, STATE.arm_names, transit_action)
+            targets = set_finger_joints(
+                STATE.robot, STATE.dof_names, grip_hold, targets)
+            STATE.robot.apply_action(ArticulationAction(joint_positions=targets))
+            for _ in range(150):
+                await omni.kit.app.get_app().next_update_async()
+        steps.append({"phase": "transit_safe",
+                       "status": "ok" if transit_ok else "skipped"})
+
+        return {"status": "completed", "action": "pick_retract",
+                "position": [x, y, z], "steps": steps,
+                "grip_hold": grip_hold}
+
+    except Exception as e:
+        return {"status": "error", "error": str(e), "steps": steps}
+    finally:
+        STATE.is_executing = False
+
+
+# ─── Combined pick (backward-compatible) ───────────────────
+
+async def _pick_object_ik(params):
+    """Full pick sequence — calls descend → close → retract in one shot.
+
+    Kept for /api/pick backward compatibility. The 3-step workflow with
+    wrist-camera VLM checks between phases uses the individual endpoints
+    /api/pick_descend, /api/pick_close, /api/pick_retract.
+    """
+    # Phase 1: Descend
+    descend_result = await _pick_descend(params)
+    if descend_result.get("status") == "error":
+        return descend_result
+
+    # Phase 2: Close
+    close_result = await _pick_close(params)
+    if close_result.get("status") == "error":
+        return close_result
+
+    # Phase 3: Retract
+    retract_params = dict(params)
+    retract_params["grip_hold"] = close_result.get("grip_hold", FINGER_CLOSE)
+    retract_result = await _pick_retract(retract_params)
+
+    # Merge results
+    all_steps = (descend_result.get("steps", []) +
+                 [{"phase": "close_gripper",
+                   "grasp_confirmed": close_result.get("grasp_confirmed"),
+                   "actual_finger": close_result.get("actual_finger")}] +
+                 retract_result.get("steps", []))
+
+    return {"status": retract_result.get("status", "error"),
+            "action": "pick_object",
+            "position": descend_result.get("position"),
+            "steps": all_steps,
+            "finger_close": close_result.get("finger_close", FINGER_CLOSE),
+            "grip_hold": close_result.get("grip_hold", FINGER_CLOSE),
+            "wrist_image": close_result.get("wrist_image")}
+
+
 async def _place_object_ik(params):
     """Full IK-based place sequence with chained warm-starts.
+
+    All coordinates come from VLM + depth projection — no USD prim paths.
+    The workflow engine passes x/y/z from the depth-projected kitting tray
+    position detected by the VLM in Phase 0+1.
 
     Same multi-phase pattern as pick — each IK solution chains
     as warm-start for the next to prevent self-collision.
     """
-    import omni.kit.app, omni.usd
+    import omni.kit.app
     from isaacsim.core.utils.types import ArticulationAction
 
     if not STATE.ik_ready:
@@ -1394,9 +1721,9 @@ async def _place_object_ik(params):
     x = params.get("x", 0.5)
     y = params.get("y", 0.0)
     z = params.get("z", 0.02)
-    dest_prim = params.get("dest_prim", PLACE_BOX_PATH)
-    # Use adaptive finger_close from the pick result if provided
+    # Use finger_close and contact-aware grip_hold from pick result
     finger_close = params.get("finger_close", FINGER_CLOSE)
+    grip_hold = params.get("grip_hold", finger_close)
 
     STATE.is_executing = True
     steps = []
@@ -1404,15 +1731,8 @@ async def _place_object_ik(params):
         locked_ori = normalize_quat(DOWNWARD_ORIENTATION)
         tcp_z_offset = 0.0 if STATE.target_frame == "gripper_tcp" else GRIPPER_TCP_OFFSET
 
-        # Compute destination geometry
-        stage = omni.usd.get_context().get_stage()
-        try:
-            dest_geom = compute_bbox_geometry(stage, dest_prim, "DESTINATION")
-            dest_x = dest_geom["center_xy"][0]
-            dest_y = dest_geom["center_xy"][1]
-            dest_top_z = dest_geom["top_z"]
-        except Exception:
-            dest_x, dest_y, dest_top_z = x, y, z
+        # Use the passed coordinates directly (from VLM + depth projection)
+        dest_x, dest_y, dest_top_z = x, y, z
 
         place_z = dest_top_z + PLACE_DROP_HEIGHT + tcp_z_offset
         place_safe_z = dest_top_z + BOX_ENTRY_MARGIN + tcp_z_offset
@@ -1423,43 +1743,42 @@ async def _place_object_ik(params):
         place_pos = np.array([dest_x, dest_y, place_z])
         retract_pos = np.array([dest_x, dest_y, retract_z])
 
-        # 1. Transit -- raise arm high before lateral gantry move via micro-steps.
-        #    Same Cartesian stepping used for pick retract: prevents configuration
-        #    flips while ascending with a part in the gripper.
-        current_ee    = get_world_pos(EE_PATH)
-        transit_up_z  = current_ee[2] + TRANSIT_SAFE_HEIGHT
-        transit_up_ok = await _retract_cartesian_up(
-            transit_up_z, current_ee[0], current_ee[1], locked_ori,
-            finger_value=FINGER_CLOSE_MAX, step_size=0.04)
-        _force_grip(finger_close)
+        # 1. Transit -- move arm to safe height before lateral gantry move.
+        #    Single IK solve (same pattern as pick retract).
+        current_ee = get_world_pos(EE_PATH)
+        transit_up_z = current_ee[2] + TRANSIT_SAFE_HEIGHT
+        transit_up_pos = np.array([current_ee[0], current_ee[1], transit_up_z])
+        transit_up_warm = _get_warm_start()
+        transit_up_action, transit_up_ok = ik_solve(
+            STATE.lula_solver, STATE.target_frame,
+            transit_up_pos, locked_ori, transit_up_warm)
+        if transit_up_ok:
+            targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, transit_up_action)
+            targets = set_finger_joints(STATE.robot, STATE.dof_names, grip_hold, targets)
+            STATE.robot.apply_action(ArticulationAction(joint_positions=targets))
+            for _ in range(150):
+                await omni.kit.app.get_app().next_update_async()
         steps.append({"phase": "transit_up", "status": "ok" if transit_up_ok else "warn"})
 
-        # 2. Force-lock grip before gantry move
-        _force_grip(finger_close)
-
-        # 3. Move gantry to destination X — finger_hold=FINGER_CLOSE_MAX keeps
-        #    PD target at max during the 120-frame gantry settle
-        await _move_gantry_x(dest_x, finger_hold=FINGER_CLOSE_MAX)
+        # 2. Move gantry to destination X — grip_hold keeps soft contact
+        await _move_gantry_x(dest_x, finger_hold=grip_hold)
         _update_base_pose()
         steps.append({"phase": "gantry_move", "status": "ok"})
 
-        # 4. Force-lock grip after gantry move
-        _force_grip(finger_close)
-
-        # 5. Transit height at destination — stay high above tray before descending
-        #    This prevents the arm from swinging through the kitting tray
-        #    when the IK solver reconfigures for the new XY position.
+        # 3. Transit height at destination
         transit_dest_warm = _get_warm_start()
         transit_dest_action, transit_dest_ok = ik_solve(
             STATE.lula_solver, STATE.target_frame,
             transit_pos, locked_ori, transit_dest_warm)
         if transit_dest_ok:
             targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, transit_dest_action)
-            await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES, finger_value=FINGER_CLOSE_MAX)
-            _force_grip(finger_close)
+            targets = set_finger_joints(STATE.robot, STATE.dof_names, grip_hold, targets)
+            STATE.robot.apply_action(ArticulationAction(joint_positions=targets))
+            for _ in range(150):
+                await omni.kit.app.get_app().next_update_async()
         steps.append({"phase": "transit_at_dest", "status": "ok" if transit_dest_ok else "warn"})
 
-        # 6. Safe height above destination — descend from transit to just above tray rim
+        # 4. Safe height above destination
         settled_warm = _get_warm_start()
         safe_action, safe_ok = ik_solve(STATE.lula_solver, STATE.target_frame,
                                          safe_pos, locked_ori, settled_warm)
@@ -1467,17 +1786,16 @@ async def _place_object_ik(params):
             return {"error": f"IK failed for place safe {safe_pos.tolist()}", "steps": steps}
 
         targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, safe_action)
-        await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES, finger_value=FINGER_CLOSE_MAX)
-        _force_grip(finger_close)
+        targets = set_finger_joints(STATE.robot, STATE.dof_names, grip_hold, targets)
+        STATE.robot.apply_action(ArticulationAction(joint_positions=targets))
+        for _ in range(150):
+            await omni.kit.app.get_app().next_update_async()
         steps.append({"phase": "place_safe", "status": "ok"})
 
-        # 7. Descend slowly to place height via Cartesian micro-steps.
-        #    3 cm steps with 8 frames each creates a clearly visible, controlled
-        #    descent — the arm "lowers" the part rather than snapping to place height.
+        # 5. Descend slowly to place height via Cartesian micro-steps.
         place_ok = await _retract_cartesian_up(
             place_z, dest_x, dest_y, locked_ori,
-            finger_value=FINGER_CLOSE_MAX, step_size=0.03, stream_frames=8)
-        _force_grip(finger_close)
+            finger_value=grip_hold, step_size=0.03, stream_frames=8)
         steps.append({"phase": "place_descend", "status": "ok" if place_ok else "warn"})
 
         # 8. Open gripper — release part
@@ -1568,13 +1886,87 @@ async def _execute_plan(plan_steps):
 
 
 # ═════════════════════════════════════════════════════════════
-# STARTUP
+# BRIDGE LIFECYCLE MANAGEMENT
+#
+# The bridge starts when this script runs in Isaac Sim's Script
+# Editor and stops automatically when the simulation is stopped.
+# This releases port 8600 so Streamlit can detect disconnection.
 # ═════════════════════════════════════════════════════════════
 
+_bridge_server = None          # HTTPServer instance (set on start, cleared on stop)
+_bridge_server_thread = None   # server thread
+_timeline_sub = None           # timeline event subscription (for cleanup)
+_bridge_running = False        # flag for the async command loop
+
+
+def _shutdown_bridge(reason="simulation stopped"):
+    """Shut down the HTTP server and reset bridge state.
+
+    Called when the simulation is stopped or paused in Isaac Sim.
+    Releases port 8600 so Streamlit sees "bridge not reachable".
+    """
+    global _bridge_server, _bridge_server_thread, _bridge_running
+
+    if not _bridge_running and _bridge_server is None:
+        return  # already shut down
+
+    _bridge_running = False
+
+    print(f"\n{'=' * 60}")
+    print(f"  KITTING BRIDGE — Shutting down ({reason})")
+    print(f"{'=' * 60}")
+
+    # Stop HTTP server — releases port 8600
+    if _bridge_server is not None:
+        try:
+            _bridge_server.shutdown()
+            _bridge_server.server_close()
+            print("[OK] HTTP server stopped — port 8600 released")
+        except Exception as e:
+            print(f"[WARN] HTTP server shutdown error: {e}")
+        _bridge_server = None
+
+    _bridge_server_thread = None
+
+    # Reset shared state so a fresh start_bridge() re-initialises everything
+    STATE.is_ready = False
+    STATE.ik_ready = False
+    STATE.is_executing = False
+    STATE.camera_rgb = None
+    STATE.camera_depth = None
+    STATE.camera_wrist = None
+    STATE.lula_solver = None
+
+    # Drain any pending commands/results so they don't leak into next session
+    with STATE._lock:
+        STATE._command_queue.clear()
+        STATE._result_queue.clear()
+
+    print("[OK] Bridge state reset — Streamlit will see 'disconnected'")
+    print(f"{'=' * 60}\n")
+
+
+def _on_timeline_event(event):
+    """Callback fired by Isaac Sim when the timeline state changes.
+
+    Shuts down the bridge when the simulation is stopped or paused.
+    """
+    import omni.timeline
+    if event.type == int(omni.timeline.TimelineEventType.STOP):
+        _shutdown_bridge("simulation stopped")
+    elif event.type == int(omni.timeline.TimelineEventType.PAUSE):
+        _shutdown_bridge("simulation paused")
+
+
 async def start_bridge():
+    global _bridge_server, _bridge_server_thread, _timeline_sub, _bridge_running
+
     import omni.kit.app, omni.timeline
     from isaacsim.core.api import World
     from isaacsim.core.prims import SingleArticulation
+
+    # ── Clean up any previous session ────────────────────────
+    _shutdown_bridge("restarting")
 
     print("=" * 60)
     print("  KITTING BRIDGE SERVER v2 — Starting...")
@@ -1617,6 +2009,16 @@ async def start_bridge():
         print("[OK] Finger joint stiffness set (Kp=2000, Kd=200)")
     except Exception as e:
         print(f"[WARN] Could not set finger gains: {e}")
+
+    # Hold current pose at startup — tell the PD controller "stay here"
+    # BEFORE physics advances, so the boosted Kp=2000 fingers don't snap
+    # closed and the arm doesn't jerk to default zero targets.
+    from isaacsim.core.utils.types import ArticulationAction
+    startup_joints = robot.get_joint_positions()
+    startup_joints = set_finger_joints(robot, STATE.dof_names, FINGER_OPEN, startup_joints.copy())
+    robot.apply_action(ArticulationAction(joint_positions=startup_joints))
+    for _ in range(30):
+        await omni.kit.app.get_app().next_update_async()
 
     # Capture the robot's initial rest pose as HOME_JOINTS
     global HOME_JOINTS
@@ -1661,21 +2063,87 @@ async def start_bridge():
         print(f"[WARN] Lula IK init failed (motion will use set_joints): {e}")
         STATE.ik_ready = False
 
+    # ── Subscribe to timeline events (stop/pause → shutdown) ─
+    if _timeline_sub is not None:
+        try:
+            _timeline_sub.unsubscribe()
+        except Exception:
+            pass
+
+    stream = timeline.get_timeline_event_stream()
+    _timeline_sub = stream.create_subscription_to_pop(_on_timeline_event)
+    print("[OK] Timeline subscription active — bridge will auto-stop on sim stop")
+
     # ── HTTP Server ──────────────────────────────────────────
-    server = HTTPServer(("0.0.0.0", BRIDGE_PORT), BridgeHandler)
+    _bridge_server = HTTPServer(("0.0.0.0", BRIDGE_PORT), BridgeHandler)
+    _bridge_server.timeout = 1  # so shutdown() isn't blocked forever
 
     def serve():
         print(f"[OK] Bridge v2 on http://localhost:{BRIDGE_PORT}")
         print(f"     IK: {'Lula ({})'.format(STATE.target_frame) if STATE.ik_ready else 'DISABLED'}")
         print(f"     Cameras: RGB={CAMERA_RGB_PRIM}")
         print(f"              Depth={CAMERA_DEPTH_PRIM}")
+        print(f"              Wrist={CAMERA_WRIST_PRIM}")
         print("=" * 60)
-        server.serve_forever()
+        _bridge_server.serve_forever()
+        print("[OK] HTTP server thread exited")
 
-    thread = threading.Thread(target=serve, daemon=True)
-    thread.start()
+    _bridge_server_thread = threading.Thread(target=serve, daemon=True)
+    _bridge_server_thread.start()
 
-    await process_commands()
+    # ── Async command loop (exits when _bridge_running = False) ──
+    _bridge_running = True
+    await _process_commands_loop()
+
+
+async def _process_commands_loop():
+    """Command loop that exits cleanly when the bridge is shut down."""
+    import omni.kit.app
+    while _bridge_running:
+        cmd = STATE.pop_command()
+        if cmd is None:
+            await omni.kit.app.get_app().next_update_async()
+            continue
+
+        action = cmd.get("action", "")
+        try:
+            if action == "camera_capture":
+                result = await _capture_camera(cmd.get("camera", "rgb"))
+            elif action == "move_home":
+                result = await _move_home()
+            elif action == "set_joints":
+                result = await _set_joints(cmd["positions"])
+            elif action == "gripper_open":
+                result = await _set_gripper(FINGER_OPEN)
+            elif action == "gripper_close":
+                result = await _set_gripper(FINGER_CLOSE)
+            elif action == "execute_plan":
+                result = await _execute_plan(cmd["plan"])
+            elif action == "scan_scene_parts":
+                result = await _scan_scene_parts()
+            elif action == "approach":
+                result = await _approach_target(cmd.get("params", {}))
+            elif action == "pick_object_ik":
+                result = await _pick_object_ik(cmd.get("params", {}))
+            elif action == "pick_descend":
+                result = await _pick_descend(cmd.get("params", {}))
+            elif action == "pick_close":
+                result = await _pick_close(cmd.get("params", {}))
+            elif action == "pick_retract":
+                result = await _pick_retract(cmd.get("params", {}))
+            elif action == "place_object_ik":
+                result = await _place_object_ik(cmd.get("params", {}))
+            elif action == "project_to_world":
+                result = await _project_to_world(cmd.get("params", {}))
+            else:
+                result = {"error": f"Unknown action: {action}"}
+        except Exception as e:
+            result = {"error": str(e), "traceback": traceback.format_exc()}
+            STATE.last_error = str(e)
+
+        STATE.push_result(result)
+
+    print("[OK] Command loop exited")
 
 
 asyncio.ensure_future(start_bridge())
