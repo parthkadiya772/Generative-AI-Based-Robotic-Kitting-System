@@ -187,6 +187,9 @@ class KittingWorkflowEngine:
                 vlm_labels = [
                     obj.get("label", "") for obj in scene.get("detected_objects", [])
                 ]
+                # Also detect the kitting tray / white box for place target
+                if scene.get("kitting_tray", {}).get("detected"):
+                    vlm_labels.extend(["kitting tray", "white box"])
                 detections = self._detector.detect_with_labels(rgb_image, vlm_labels)
 
                 if detections:
@@ -263,7 +266,10 @@ class KittingWorkflowEngine:
                     except Exception as e:
                         log.warning(f"Bridge project_to_world call failed: {e}")
 
-                # ── Fallback 2: USD scene_parts matching ───────────
+                # ── Fallback 2: USD scene_parts for part coords only ──
+                # Place target is NOT taken from USD — it must come from
+                # perception (VLM + detector + depth projection) so the
+                # system works when the tray moves between runs.
                 if not bridge_ok and hasattr(self.camera, "get_scene_parts"):
                     try:
                         scene_parts = self.camera.get_scene_parts()
@@ -272,9 +278,6 @@ class KittingWorkflowEngine:
                             log.info(f"Fallback: {len(usd_parts)} USD parts for matching")
                             self._match_vlm_to_usd(scene, usd_parts)
                             coord_source = "usd_fallback"
-
-                            if not place_target:
-                                place_target = self._find_place_target_usd(usd_parts)
                     except Exception as e:
                         log.warning(f"USD scene_parts fallback failed: {e}")
 
@@ -297,12 +300,35 @@ class KittingWorkflowEngine:
                                     obj["depth_m"] = wp.get("depth_m", -1)
                                     obj["_source"] = coord_source
 
+                            # Extract tray from local depth estimation
+                            if (not place_target and tray_img
+                                    and kitting_tray.get("detected")):
+                                tray_wp = world_pts[-1]
+                                place_target = {
+                                    "center_xy": [tray_wp["x"], tray_wp["y"]],
+                                    "top_z": tray_wp["z"],
+                                }
+
                             log.info(
                                 f"Depth estimation: {len(world_pts)} points "
                                 f"via {self._depth_estimator.method}"
                             )
                     except Exception as e:
                         log.warning(f"Local depth estimation failed: {e}")
+
+            # ── Place target logging ──────────────────────────────
+            if place_target:
+                log.info(
+                    f"Place target (perception): "
+                    f"({place_target['center_xy'][0]:.3f}, "
+                    f"{place_target['center_xy'][1]:.3f}) "
+                    f"top_z={place_target['top_z']:.3f}"
+                )
+            else:
+                log.warning(
+                    "Kitting tray not localized by perception pipeline. "
+                    "LLM will use default position from config."
+                )
 
             num_objects = len(scene.get("detected_objects", []))
             result["scene_description"] = scene

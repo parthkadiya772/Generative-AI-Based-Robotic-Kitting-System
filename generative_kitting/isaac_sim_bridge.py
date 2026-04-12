@@ -72,8 +72,9 @@ GRIPPER_TCP_OFFSET   = 0.150
 GRIPPER_BODY_WIDTH   = 0.160
 GRIPPER_HALF_WIDTH   = GRIPPER_BODY_WIDTH / 2.0
 HOVER_CLEARANCE      = 0.020
-GRASP_LIFT           = 0.015  # 15mm — TCP stays ABOVE part top; finger pads wrap down
-                              # around the part body without touching the bin bottom
+GRASP_LIFT           = 0.040  # 40mm above surface Z — finger pads grip at part mid-height
+                              # (parts are ~20-50mm tall, so 40mm puts pads at ~mid-body)
+                              # Must keep clearance from bin bottom so fingers can close
 GRASP_DEPTH_FRACTION = 0.45   # only used by compute_grasp_geometry (legacy/debug)
 BOX_HEIGHT           = 0.05
 BOX_ENTRY_MARGIN     = 0.15
@@ -1659,35 +1660,34 @@ async def _pick_retract(params):
         safe_pos = np.array([x, y, zp["safe_z"]])
         transit_pos = np.array([x, y, zp["transit_z"]])
 
-        # Retract to safe height
-        settled_warm = _get_warm_start()
-        retract_action, retract_ok = ik_solve(
-            STATE.lula_solver, STATE.target_frame,
-            safe_pos, locked_ori, settled_warm)
-        if not retract_ok:
-            return {"error": "IK retract failed", "steps": steps}
-        targets = apply_arm_joints(
-            STATE.robot, STATE.dof_names, STATE.arm_names, retract_action)
+        # Re-enforce grip before any retract motion — extra settle ensures
+        # fingers are fully closed and physics contacts are established
+        print(f"  [RETRACT] Re-enforcing grip (hold={grip_hold:.3f}) before lift")
+        targets = STATE.robot.get_joint_positions()
         targets = set_finger_joints(
             STATE.robot, STATE.dof_names, grip_hold, targets)
         STATE.robot.apply_action(ArticulationAction(joint_positions=targets))
-        for _ in range(150):
+        for _ in range(90):  # extra 90 frames (~1.5s) to let fingers fully seat
             await omni.kit.app.get_app().next_update_async()
-        steps.append({"phase": "retract", "status": "ok"})
 
-        # Transit to clear-height
-        transit_warm = _get_warm_start()
-        transit_action, transit_ok = ik_solve(
-            STATE.lula_solver, STATE.target_frame,
-            transit_pos, locked_ori, transit_warm)
-        if transit_ok:
-            targets = apply_arm_joints(
-                STATE.robot, STATE.dof_names, STATE.arm_names, transit_action)
-            targets = set_finger_joints(
-                STATE.robot, STATE.dof_names, grip_hold, targets)
-            STATE.robot.apply_action(ArticulationAction(joint_positions=targets))
-            for _ in range(150):
-                await omni.kit.app.get_app().next_update_async()
+        # Retract to safe height using Cartesian micro-steps (slow lift)
+        # Micro-steps keep the solver in the same joint neighbourhood AND
+        # continuously enforce finger_value at every waypoint — so the grip
+        # is maintained throughout the lift instead of relaxing mid-jump.
+        print(f"  [RETRACT] Lifting to safe_z={safe_pos[2]:.3f} via micro-steps")
+        retract_ok = await _retract_cartesian_up(
+            safe_pos[2], x, y, locked_ori,
+            finger_value=grip_hold, step_size=0.03, stream_frames=8)
+        steps.append({"phase": "retract",
+                       "status": "ok" if retract_ok else "failed"})
+        if not retract_ok:
+            return {"error": "Cartesian retract failed", "steps": steps}
+
+        # Transit to clear-height (also micro-stepped to maintain grip)
+        print(f"  [RETRACT] Transit to z={transit_pos[2]:.3f}")
+        transit_ok = await _retract_cartesian_up(
+            transit_pos[2], x, y, locked_ori,
+            finger_value=grip_hold, step_size=0.04, stream_frames=6)
         steps.append({"phase": "transit_safe",
                        "status": "ok" if transit_ok else "skipped"})
 
