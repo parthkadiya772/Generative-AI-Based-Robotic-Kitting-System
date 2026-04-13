@@ -209,13 +209,14 @@ class KittingApplication:
             llm_start = time.time()
 
             workspace_bounds = self.config.get("execution", {}).get("workspace_bounds")
-            kit_tray = self.config.get("execution", {}).get("kit_tray_position")
-
+            # Kit tray position is detected by the perception pipeline,
+            # not hardcoded.  In CLI mode (no bridge), pass None so the
+            # LLM knows the tray wasn't localized.
             task_plan = self.planner.generate_plan(
                 user_command=user_command,
                 scene_description=scene_description,
                 workspace_bounds=workspace_bounds,
-                kit_tray_position=kit_tray,
+                kit_tray_position=None,
             )
             llm_time = time.time() - llm_start
 

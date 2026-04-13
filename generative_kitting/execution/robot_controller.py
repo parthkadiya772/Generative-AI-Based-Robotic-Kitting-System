@@ -251,7 +251,9 @@ class RobotController:
         self.downward_orientation = normalize_quat(
             self.exec_cfg.get("downward_orientation", [1.0, 0.0, 1.0, 0.0])
         )
-        self.kit_tray_position = self.exec_cfg.get("kit_tray_position", [0.5, 0.0, 0.02])
+        # Kit tray position is detected dynamically by the perception
+        # pipeline (VLM + detector + depth projection), not hardcoded.
+        self.kit_tray_position = self.exec_cfg.get("kit_tray_position")
 
         # Gantry parameters
         self.gantry_joint = self.sim_cfg.get("gantry_x_joint", "gantry_vagn_joint")

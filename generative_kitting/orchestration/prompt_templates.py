@@ -38,7 +38,7 @@ CRITICAL RULES:
 - NEVER generate raw joint angles or inverse kinematics parameters
 - NEVER invent action primitives not listed above
 - For pick_object: use the EXACT x, y, z coordinates from the detected_objects list
-- For place_object: use the KIT TRAY POSITION provided in the prompt
+- For place_object: use the KIT TRAY POSITION provided in the prompt (detected by camera)
 - Coordinates are in METRES (real world), NOT normalized image coordinates
 
 OUTPUT FORMAT:
@@ -53,7 +53,7 @@ Required JSON structure:
     {"step": 2, "action": "open_gripper", "params": {}},
     {"step": 3, "action": "pick_object", "params": {"object_id": "obj_001", "x": 0.35, "y": -0.12, "z": 0.02}},
     {"step": 4, "action": "verify_grasp", "params": {}},
-    {"step": 5, "action": "place_object", "params": {"object_id": "obj_001", "x": 0.5, "y": 0.0, "z": 0.02}},
+    {"step": 5, "action": "place_object", "params": {"object_id": "obj_001", "x": "<tray_x>", "y": "<tray_y>", "z": "<tray_z>"}},
     {"step": 6, "action": "open_gripper", "params": {}},
     {"step": 7, "action": "move_home", "params": {}}
   ]
@@ -78,21 +78,34 @@ def format_user_prompt(
         Structured output from the VLM perception layer containing
         ``detected_objects`` and ``scene_summary``.
     kit_tray_position : list, optional
-        [x, y, z] position of the kit tray. Defaults to [0.5, 0.0, 0.02].
+        [x, y, z] position of the kit tray as detected by the camera
+        perception pipeline.  None if the tray was not detected.
 
     Returns
     -------
     str
         Formatted prompt string for the LLM.
     """
-    tray_pos = kit_tray_position or [0.5, 0.0, 0.02]
+    if kit_tray_position:
+        tray_line = (
+            f"KIT TRAY / DESTINATION POSITION (detected by camera): "
+            f"x={kit_tray_position[0]}, y={kit_tray_position[1]}, "
+            f"z={kit_tray_position[2]}"
+        )
+    else:
+        tray_line = (
+            "KIT TRAY / DESTINATION: NOT DETECTED by camera. "
+            "If the command requires placing parts, use the kitting_tray "
+            "position from the scene description if available. "
+            "If no tray is visible, report that the destination was not found."
+        )
 
     prompt = f"""OPERATOR COMMAND: {user_command}
 
 CURRENT WORKSPACE STATE (from VLM + USD scene scan):
 {json.dumps(scene_description, indent=2)}
 
-KIT TRAY / DESTINATION POSITION: x={tray_pos[0]}, y={tray_pos[1]}, z={tray_pos[2]}
+{tray_line}
 
 Generate a complete task plan to fulfill the operator's command using ONLY the available action primitives.
 

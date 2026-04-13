@@ -24,13 +24,13 @@ REQUIRED_OBJECT_FIELDS = {
     "confidence": (int, float),
 }
 
-VALID_AFFORDANCES = {"graspable", "stackable", "fragile", "fixed"}
+VALID_AFFORDANCES = {"graspable", "stackable", "fragile", "fixed", "destination"}
 
-# Default workspace bounds for position validation
+# Default workspace bounds for position validation (UR10 + gantry reach)
 DEFAULT_WORKSPACE_BOUNDS = {
-    "x_min": -1.0, "x_max": 2.0,
-    "y_min": -1.0, "y_max": 1.0,
-    "z_min": -0.1, "z_max": 1.0,
+    "x_min": -2.5, "x_max": 3.5,
+    "y_min": -2.0, "y_max": 2.0,
+    "z_min": -0.1, "z_max": 2.0,
 }
 
 

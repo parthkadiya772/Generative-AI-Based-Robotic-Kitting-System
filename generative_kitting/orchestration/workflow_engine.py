@@ -42,7 +42,9 @@ KNOWN PART TYPES (parts are inside the blue bin):
 
 INSTRUCTIONS:
 1. Detect every PICKABLE PART visible inside the blue bin.
-2. Also detect the WHITE BOX / KITTING TRAY (the destination area).
+2. ALSO detect the WHITE BOX / KITTING TRAY as a detected object with
+   label "kitting_tray" and affordance "destination". This is CRITICAL
+   for the robot to know where to place picked parts.
 3. For every detection give its centre position as a NORMALISED image
    coordinate (x, y) where (0,0) = top-left and (1,1) = bottom-right.
    The system will convert these to real-world coordinates via depth.
@@ -59,13 +61,16 @@ RESPOND ONLY WITH VALID JSON:
       "affordance": "graspable",
       "image_position": {{"x": 0.35, "y": 0.60}},
       "confidence": 0.92
+    }},
+    {{
+      "object_id": "obj_tray",
+      "label": "kitting_tray",
+      "semantic_description": "white plastic box used as destination tray",
+      "affordance": "destination",
+      "image_position": {{"x": 0.75, "y": 0.50}},
+      "confidence": 0.95
     }}
   ],
-  "kitting_tray": {{
-    "detected": true,
-    "image_position": {{"x": 0.75, "y": 0.50}},
-    "confidence": 0.95
-  }},
   "scene_summary": "..."
 }}"""
 
@@ -187,31 +192,58 @@ class KittingWorkflowEngine:
                 vlm_labels = [
                     obj.get("label", "") for obj in scene.get("detected_objects", [])
                 ]
-                # Also detect the kitting tray / white box for place target
-                if scene.get("kitting_tray", {}).get("detected"):
-                    vlm_labels.extend(["kitting tray", "white box"])
+                # Always detect the kitting tray with multiple query variations
+                tray_queries = [
+                    "kitting tray", "white box", "white container",
+                    "white plastic box", "destination box", "place tray",
+                ]
+                vlm_labels.extend(tray_queries)
                 detections = self._detector.detect_with_labels(rgb_image, vlm_labels)
 
                 if detections:
                     log.info(f"Detector found {len(detections)} objects with precise coords")
+                    # Log tray-related detections specifically
+                    for det in detections:
+                        label = det["label"].lower()
+                        if any(kw in label for kw in ("tray", "box", "container", "destination")):
+                            log.info(
+                                f"Tray candidate: '{det['label']}' "
+                                f"center=({det['center']['x']:.3f}, {det['center']['y']:.3f}) "
+                                f"conf={det['confidence']:.3f}"
+                            )
                     self._merge_detector_with_vlm(scene, detections)
             else:
                 log.info("Zero-shot detector not available — using VLM coordinates")
 
             # ── Build projection points from best available coords ──
+            # All objects (parts AND kitting tray) are in detected_objects.
+            # The tray has affordance "destination" and may sit on a
+            # different surface, so we pass a surface_z hint for it.
+            tray_surface_z = self.config.get("perception", {}).get(
+                "tray_surface_z", 0.02)
             proj_points = []
             for obj in scene.get("detected_objects", []):
                 img_pos = obj.get("image_position", {})
                 if img_pos:
-                    proj_points.append({"x": img_pos.get("x", 0.5),
-                                        "y": img_pos.get("y", 0.5)})
+                    point = {
+                        "x": img_pos.get("x", 0.5),
+                        "y": img_pos.get("y", 0.5),
+                    }
+                    # Tray may be on a different surface than parts
+                    if obj.get("affordance") == "destination" or \
+                       "tray" in obj.get("label", "").lower():
+                        point["surface_z"] = tray_surface_z
+                    proj_points.append(point)
 
-            # Also project the kitting tray
+            # Also handle legacy kitting_tray field (if VLM still returns it)
             kitting_tray = scene.get("kitting_tray", {})
             tray_img = kitting_tray.get("image_position", {})
             if tray_img and kitting_tray.get("detected"):
-                proj_points.append({"x": tray_img.get("x", 0.5),
-                                     "y": tray_img.get("y", 0.5)})
+                proj_points.append({
+                    "x": tray_img.get("x", 0.5),
+                    "y": tray_img.get("y", 0.5),
+                    "surface_z": tray_surface_z,
+                })
 
             # ── 2D → 3D Coordinate Resolution ──────────────────
             # Three fallback methods (in priority order):
@@ -246,18 +278,24 @@ class KittingWorkflowEngine:
                                     obj["depth_m"] = wp.get("depth_m", -1)
                                     obj["_source"] = coord_source
 
-                            # Extract kitting tray world position
-                            if tray_img and kitting_tray.get("detected"):
-                                tray_wp = world_pts[-1]
-                                place_target = {
-                                    "center_xy": [tray_wp["x"], tray_wp["y"]],
-                                    "top_z": tray_wp["z"],
-                                }
-                                scene["kitting_tray"]["world_position"] = {
-                                    "x": tray_wp["x"],
-                                    "y": tray_wp["y"],
-                                    "z": tray_wp["z"],
-                                }
+                            # Extract kitting tray from detected_objects
+                            # (same pipeline as parts — no special case)
+                            place_target = self._extract_tray_from_objects(scene)
+
+                            # Also handle legacy kitting_tray field
+                            if not place_target and tray_img and kitting_tray.get("detected"):
+                                n_objs = len(scene.get("detected_objects", []))
+                                if n_objs < len(world_pts):
+                                    tray_wp = world_pts[n_objs]
+                                elif world_pts:
+                                    tray_wp = world_pts[-1]
+                                else:
+                                    tray_wp = None
+                                if tray_wp:
+                                    place_target = {
+                                        "center_xy": [tray_wp["x"], tray_wp["y"]],
+                                        "top_z": tray_wp["z"],
+                                    }
                         else:
                             log.warning(
                                 f"Bridge projection failed: "
@@ -300,14 +338,9 @@ class KittingWorkflowEngine:
                                     obj["depth_m"] = wp.get("depth_m", -1)
                                     obj["_source"] = coord_source
 
-                            # Extract tray from local depth estimation
-                            if (not place_target and tray_img
-                                    and kitting_tray.get("detected")):
-                                tray_wp = world_pts[-1]
-                                place_target = {
-                                    "center_xy": [tray_wp["x"], tray_wp["y"]],
-                                    "top_z": tray_wp["z"],
-                                }
+                            # Extract tray from detected_objects
+                            if not place_target:
+                                place_target = self._extract_tray_from_objects(scene)
 
                             log.info(
                                 f"Depth estimation: {len(world_pts)} points "
@@ -412,9 +445,16 @@ class KittingWorkflowEngine:
                 step_num = step.get("step", "?")
                 step_result = {"step": step_num, "action": action}
 
-                # ── Resolve place coordinates from VLM-detected tray ──
+                # ── Resolve place coordinates from perception-detected tray ──
                 if action == "place_object":
                     params = self._resolve_place_coordinates(params, place_target)
+                    if params is None:
+                        self._notify(WorkflowPhase.PLACE_EXECUTE, "failed",
+                                     "Kitting tray not detected — cannot place")
+                        step_result["status"] = "failed"
+                        step_result["error"] = "Kitting tray not detected by camera"
+                        execution_results.append(step_result)
+                        continue
 
                 if action == "pick_object":
                     step_result = self._execute_pick_sequence(
@@ -496,18 +536,77 @@ class KittingWorkflowEngine:
 
     # ─── Coordinate Resolution ─────────────────────────────
 
+    def _extract_tray_from_objects(self, scene: dict) -> Optional[dict]:
+        """Extract the kitting tray position from detected_objects.
+
+        The tray is detected as a regular object with label containing
+        "tray" or affordance "destination".  XY comes from depth projection
+        (same pipeline as parts).  Z is taken from config (tray_surface_z)
+        because depth projection often gives unreliable Z for the tray
+        (open-top container, background depth bleed, etc.).
+        """
+        tray_surface_z = self.config.get("perception", {}).get(
+            "tray_surface_z", 0.02)
+        workspace = self.config.get("execution", {}).get("workspace_bounds", {})
+        z_max = workspace.get("z_max", 1.5)
+
+        tray_keywords = ("tray", "kitting", "destination")
+        for obj in scene.get("detected_objects", []):
+            label = obj.get("label", "").lower()
+            affordance = obj.get("affordance", "").lower()
+            pos = obj.get("approximate_position")
+            if pos and (affordance == "destination" or
+                        any(kw in label for kw in tray_keywords)):
+                # Use projected XY, but override Z with tray_surface_z
+                # Depth projection Z is unreliable for the tray
+                proj_z = pos["z"]
+                use_z = tray_surface_z
+                z_min = workspace.get("z_min", -0.1)
+                if proj_z > z_max or proj_z < z_min:
+                    log.warning(
+                        f"Tray projected z={proj_z:.3f} outside bounds — "
+                        f"using tray_surface_z={tray_surface_z}"
+                    )
+                else:
+                    use_z = proj_z
+
+                place_target = {
+                    "center_xy": [pos["x"], pos["y"]],
+                    "top_z": use_z,
+                }
+                log.info(
+                    f"Tray from detected_objects: '{obj.get('label')}' "
+                    f"XY=({pos['x']:.3f}, {pos['y']:.3f}) "
+                    f"proj_z={proj_z:.3f} → use_z={use_z:.3f}"
+                )
+                return place_target
+        return None
+
     def _resolve_place_coordinates(self, params, place_target):
         """
-        For place actions, override x/y/z with the VLM-detected kitting tray.
+        For place actions, override x/y/z with the perception-detected
+        kitting tray position.
 
-        All coordinates come from depth projection of the VLM-detected tray
-        position — no USD prim paths.
+        All coordinates come from: VLM detection → OWL-ViT2 refinement →
+        depth projection.  No hardcoded positions or USD prims.
+
+        Returns None if the tray was not detected (caller should abort).
         """
+        if not place_target:
+            log.error(
+                "Cannot place: kitting tray not detected by perception. "
+                "Make sure the tray is visible to the camera."
+            )
+            return None
+
         resolved = dict(params)
-        if place_target:
-            resolved["x"] = place_target["center_xy"][0]
-            resolved["y"] = place_target["center_xy"][1]
-            resolved["z"] = place_target["top_z"]
+        resolved["x"] = place_target["center_xy"][0]
+        resolved["y"] = place_target["center_xy"][1]
+        resolved["z"] = place_target["top_z"]
+        log.info(
+            f"Place target (perception): "
+            f"({resolved['x']:.3f}, {resolved['y']:.3f}, {resolved['z']:.3f})"
+        )
         return resolved
 
     # ─── Pick Sequence (3-phase with wrist VLM) ──────────────
@@ -787,16 +886,38 @@ class KittingWorkflowEngine:
                 obj["_position_source"] = "vlm_estimate"
                 log.debug(f"No detector match for '{vlm_label}' — keeping VLM estimate")
 
-        # Also try to detect the kitting tray
+        # Also try to detect the kitting tray — search all tray-like labels
         tray = scene.get("kitting_tray", {})
-        if tray.get("detected"):
-            for label_key in ("kitting_tray", "white_box", "box", "tray"):
-                if label_key in det_by_label and det_by_label[label_key]:
-                    best = det_by_label[label_key][0]
-                    tray["image_position"] = best["center"]
-                    tray["_position_source"] = "detector"
-                    log.info(f"Detector matched tray → center({best['center']['x']:.3f}, {best['center']['y']:.3f})")
-                    break
+        tray_keywords = (
+            "kitting_tray", "white_box", "white_container",
+            "white_plastic_box", "destination_box", "place_tray",
+            "box", "tray", "container",
+        )
+        # Find best tray detection across all matching labels
+        best_tray = None
+        best_tray_conf = 0.0
+        for label_key in tray_keywords:
+            if label_key in det_by_label:
+                for det in det_by_label[label_key]:
+                    if det["confidence"] > best_tray_conf:
+                        best_tray = det
+                        best_tray_conf = det["confidence"]
+
+        if best_tray:
+            if not tray.get("detected"):
+                # VLM missed the tray but detector found it
+                scene["kitting_tray"] = {"detected": True}
+                tray = scene["kitting_tray"]
+            tray["image_position"] = best_tray["center"]
+            tray["_detector_bbox"] = best_tray["bbox"]
+            tray["_position_source"] = "detector"
+            log.info(
+                f"Tray detected: '{best_tray['label']}' → "
+                f"center({best_tray['center']['x']:.3f}, {best_tray['center']['y']:.3f}) "
+                f"conf={best_tray_conf:.3f}"
+            )
+        else:
+            log.warning("No tray-like detection from OWL-ViT2")
 
         log.info(f"Detector merge: {matched}/{len(scene.get('detected_objects', []))} objects matched")
 

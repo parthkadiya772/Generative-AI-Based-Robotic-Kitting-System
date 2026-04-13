@@ -80,7 +80,7 @@ BOX_HEIGHT           = 0.05
 BOX_ENTRY_MARGIN     = 0.15
 PLACE_DROP_HEIGHT    = 0.02
 PLACE_RETRACT_HEIGHT = 0.25
-TRANSIT_SAFE_HEIGHT  = 0.10  # just 10cm above safe_z — enough to clear bin rim without
+TRANSIT_SAFE_HEIGHT  = 0.14  # just 10cm above safe_z — enough to clear bin rim without
                              # going so high that Lula IK folds the ceiling-mounted arm
 DOWNWARD_ORIENTATION = np.array([1.0, 0.0, 1.0, 0.0])
 
@@ -92,7 +92,7 @@ SETTLE_FRAMES    = 60     # physics frames to settle at final position
 
 
 # ═════════════════════════════════════════════════════════════
-# HELPERS (ported from robot_control.py)
+# HELPERS
 # ═════════════════════════════════════════════════════════════
 
 def normalize_quat(q):
@@ -672,7 +672,10 @@ async def _project_to_world(params):
          needed; assumes objects sit on a flat surface.
 
     Args (in params dict):
-        points: list of {x, y} with values in [0, 1]
+        points: list of {x, y} with values in [0, 1].
+                Each point may include an optional "surface_z" to override
+                the default workspace Z for geometric fallback (useful for
+                objects on different surfaces, e.g. kitting tray vs. bin).
         camera: prim path or alias ("rgb", "depth") — default "rgb"
 
     Returns:
@@ -824,6 +827,9 @@ async def _project_to_world(params):
             px = min(int(nx * (w_res - 1)), w_res - 1)
             py = min(int(ny * (h_res - 1)), h_res - 1)
 
+            # Per-point surface Z override (e.g. tray on different surface)
+            point_z = float(pt.get("surface_z", workspace_z))
+
             # Ray direction in camera frame
             ray_cam = Gf.Vec4d(
                 (px - cx) / fx,
@@ -837,21 +843,21 @@ async def _project_to_world(params):
             dz = ray_world[2]
             if abs(dz) < 1e-6:
                 world_points.append({
-                    "x": 0, "y": 0, "z": workspace_z, "depth_m": -1,
+                    "x": 0, "y": 0, "z": point_z, "depth_m": -1,
                     "error": "ray parallel to plane", "method": "geometric",
                 })
                 continue
 
-            # Intersect ray with Z = workspace_z plane
-            t = (workspace_z - cam_pos[2]) / dz
+            # Intersect ray with Z = point_z plane
+            t = (point_z - cam_pos[2]) / dz
             world_x = cam_pos[0] + t * ray_world[0]
             world_y = cam_pos[1] + t * ray_world[1]
 
             world_points.append({
                 "x": float(world_x),
                 "y": float(world_y),
-                "z": float(workspace_z),
-                "depth_m": float(abs(cam_pos[2] - workspace_z)),
+                "z": float(point_z),
+                "depth_m": float(abs(cam_pos[2] - point_z)),
                 "method": "geometric",
             })
             point_method = "geometric"
@@ -1463,7 +1469,10 @@ async def _pick_descend(params):
         await _set_gripper(FINGER_OPEN)
         steps.append({"phase": "open_gripper", "status": "ok"})
 
-        # 2. Gantry alignment — keep EE world position STABLE while gantry slides.
+        # 2. Gantry alignment — slide gantry to part X while keeping
+        #    EE at its current world position (depth-scan pose).
+        #    The arm joints adjust to compensate for the gantry slide,
+        #    so the gripper stays looking at the same spot.
         gantry_aligned = False
         current_joints = STATE.robot.get_joint_positions()
         for idx, name in enumerate(STATE.dof_names):
@@ -1473,21 +1482,24 @@ async def _pick_descend(params):
                 break
         if not gantry_aligned:
             ee_before = get_world_pos(EE_PATH).copy()
-            print(f"  [DESCEND] Gantry re-align — holding EE at {ee_before.tolist()}")
+            print(f"  [DESCEND] Gantry re-align to x={x:.3f}, "
+                  f"holding EE at ({ee_before[0]:.3f}, {ee_before[1]:.3f}, {ee_before[2]:.3f})")
             await _move_gantry_x(x)
             _update_base_pose()
+            # Solve IK to keep EE at same world position after gantry moved
             restore_warm = _get_warm_start()
-            restore_pos = np.array(ee_before)
             restore_action, restore_ok = ik_solve(
                 STATE.lula_solver, STATE.target_frame,
-                restore_pos, locked_ori, restore_warm)
+                ee_before, locked_ori, restore_warm)
             if restore_ok:
                 targets = apply_arm_joints(
                     STATE.robot, STATE.dof_names, STATE.arm_names, restore_action)
                 await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES)
-                print(f"  [DESCEND] EE restored to {get_world_pos(EE_PATH).tolist()}")
+                ee_after = get_world_pos(EE_PATH)
+                print(f"  [DESCEND] EE held at ({ee_after[0]:.3f}, {ee_after[1]:.3f}, {ee_after[2]:.3f}) "
+                      f"drift={np.linalg.norm(ee_after - ee_before):.4f}m")
             else:
-                print("  [DESCEND] WARNING: EE restore IK failed")
+                print("  [DESCEND] WARNING: EE restore IK failed — EE may have shifted")
         else:
             _update_base_pose()
         steps.append({"phase": "gantry", "status": "ok"})

@@ -72,6 +72,8 @@ perception:
   camera_fov_h_deg: 60.0               # horizontal FOV of overhead camera (degrees)
   camera_resolution: [1920, 1080]      # overhead camera resolution
   workspace_surface_z: 0.02            # Z height of bin surface where parts sit (metres)
+  tray_surface_z: 0.02                 # Z height of kitting tray surface (geometric fallback)
+                                       # Adjust if tray sits higher/lower than parts bin
   camera_world_x: 0.3                  # camera world X position (metres)
   camera_world_y: 0.0                  # camera world Y position (metres)
 
@@ -102,12 +104,12 @@ execution:
   home_joint_positions: [0.0, 0, -1.5708, 1.5708, -1.5708, -1.5708, 0]
 
   workspace_bounds:
-    x_min: -1.5
-    x_max: 2.0
-    y_min: -1.5
-    y_max: 1.5
+    x_min: -2.5
+    x_max: 3.5
+    y_min: -2.0
+    y_max: 2.0
     z_min: -0.1
-    z_max: 1.5
+    z_max: 2.0
 
   # Robotiq 2F-140 parameters
   gripper_tcp_offset: 0.170           # metres: ee_link → finger contact pad
@@ -127,8 +129,9 @@ execution:
   transit_safe_height: 0.30          # metres above safe_z during transit
   grasp_depth_fraction: 0.5          # 0.0=top, 0.5=mid, 1.0=bottom
 
-  # Kit tray
-  kit_tray_position: [0.5, 0.0, 0.02]
+  # Kit tray — detected dynamically via camera + perception pipeline.
+  # No fixed position: VLM + OWL-ViT2 + depth projection localize
+  # the tray at runtime so it works even if the tray moves.
 
   # Safety
   action_timeout_seconds: 30         # max seconds per action primitive

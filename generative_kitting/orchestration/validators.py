@@ -38,9 +38,9 @@ ACTION_PARAMS = {
 
 # Default workspace bounds (matches actual UR10 + gantry reach)
 DEFAULT_WORKSPACE_BOUNDS = {
-    "x_min": -1.5, "x_max": 2.0,
-    "y_min": -1.5, "y_max": 1.5,
-    "z_min": -0.1, "z_max": 1.5,
+    "x_min": -2.5, "x_max": 3.5,
+    "y_min": -2.0, "y_max": 2.0,
+    "z_min": -0.1, "z_max": 2.0,
 }
 
 # Joint angle patterns to reject (hallucination detection)
