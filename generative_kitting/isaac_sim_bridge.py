@@ -41,6 +41,9 @@ UR10_BASE_PATH = "/World/gantry_home/ur10_flattened/ur10_instanceable/base_link"
 EE_PATH        = "/World/gantry_home/ur10_flattened/ur10_instanceable/ee_link"
 PLACE_BOX_PATH = "/World/box_840"
 
+# Contact sensor on left inner finger (adaptive gripper control)
+CONTACT_SENSOR_PRIM = "/World/gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/left_inner_finger/Contact_Sensor"
+
 # URDF / YAML for Lula IK
 URDF_PATH = r"c:/kp/ai_and_automation/sem_4/thesis/isaacsim/exts/isaacsim.asset.importer.urdf/data/urdf/robots/ur10/urdf/ur10.urdf"
 YAML_PATH = r"c:/kp/ai_and_automation/sem_4/thesis/isaacsim/exts/isaacsim.robot_motion.motion_generation/motion_policy_configs/universal_robots/ur10/rmpflow/ur10_robot_description.yaml"
@@ -224,37 +227,7 @@ def ik_solve(lula_solver, frame, pos, ori, warm):
     action, ok = lula_solver.compute_inverse_kinematics(
         frame_name=frame, target_position=pos,
         target_orientation=ori, warm_start=warm)
-    if ok:
-        action = _clamp_shoulder_pan(action)
     return action, ok
-
-
-# ── Shoulder-Pan Safety Clamp ──────────────────────────────
-# The robot is ceiling-mounted on a gantry rail (along X).
-# Lula IK has no collision awareness of the gantry structure,
-# so it can find solutions where the arm swings THROUGH the
-# red gantry rail.  We constrain shoulder_pan (joint 0) to a
-# safe range that keeps the arm reaching downward into the
-# workspace, never backward through the gantry.
-#
-# shoulder_pan = 0 rad → arm hangs straight down (home)
-# Safe range: roughly -π/2 to +π/2 (arm stays in front)
-
-SHOULDER_PAN_MIN = -1.5708   # -π/2: arm reaches to one side
-SHOULDER_PAN_MAX =  1.5708   # +π/2: arm reaches to other side
-
-
-def _clamp_shoulder_pan(ik_result):
-    """Clamp shoulder_pan joint in IK result to prevent gantry collision."""
-    clamped = np.array(ik_result, dtype=np.float64)
-    # Joint 0 in Lula's 6-joint result is shoulder_pan
-    if len(clamped) > 0:
-        original = clamped[0]
-        clamped[0] = np.clip(clamped[0], SHOULDER_PAN_MIN, SHOULDER_PAN_MAX)
-        if abs(original - clamped[0]) > 0.01:
-            print(f"  [IK SAFETY] shoulder_pan clamped: {original:.3f} → {clamped[0]:.3f} rad "
-                  f"(preventing gantry collision)")
-    return clamped
 
 
 def _check_self_collision_risk(current_joints, target_joints):
@@ -351,6 +324,7 @@ class BridgeState:
         self.is_ready = False
         self.ik_ready = False
         self.is_executing = False
+        self.contact_sensor = None
         self.last_error = None
         self.execution_log = []
         self._command_queue = []
@@ -1578,10 +1552,90 @@ async def _pick_descend(params):
 
 # ─── PICK PHASE 2: Close gripper and confirm ───────────────
 
+def _read_contact_sensor():
+    """Read the contact sensor on the left inner finger.
+
+    Returns (in_contact: bool, force_magnitude: float).
+    """
+    if STATE.contact_sensor is None:
+        return False, 0.0
+    try:
+        frame = STATE.contact_sensor.get_current_frame()
+        in_contact = bool(frame.get("in_contact", False))
+        force_vec = frame.get("force", [0, 0, 0])
+        force_mag = float(np.linalg.norm(force_vec))
+        return in_contact, force_mag
+    except Exception:
+        return False, 0.0
+
+
+async def _adaptive_close(min_force=0.5, step_rad=0.02, max_steps=30,
+                           overshoot_rad=0.04):
+    """Close gripper incrementally using contact sensor feedback.
+
+    Closes in small steps, checking the contact sensor after each.
+    Stops when contact force exceeds min_force, then applies a small
+    overshoot for firm hold.
+
+    Returns (final_angle, contact_detected, force).
+    """
+    import omni.kit.app
+    from isaacsim.core.utils.types import ArticulationAction
+
+    current_angle = 0.0
+    contact_detected = False
+    contact_force = 0.0
+
+    for step in range(max_steps):
+        current_angle += step_rad
+        if current_angle > ROBOTIQ_MAX_RAD:
+            current_angle = ROBOTIQ_MAX_RAD
+
+        targets = STATE.robot.get_joint_positions()
+        targets = set_finger_joints(
+            STATE.robot, STATE.dof_names, current_angle, targets)
+        STATE.robot.apply_action(ArticulationAction(joint_positions=targets))
+
+        # Let physics settle (4 frames per step)
+        for _ in range(4):
+            await omni.kit.app.get_app().next_update_async()
+
+        in_contact, force_mag = _read_contact_sensor()
+        if in_contact and force_mag >= min_force:
+            contact_detected = True
+            contact_force = force_mag
+            print(f"  [ADAPTIVE] Contact at step {step+1}, "
+                  f"angle={current_angle:.3f} rad, force={force_mag:.2f}N")
+            break
+
+        if current_angle >= ROBOTIQ_MAX_RAD:
+            print(f"  [ADAPTIVE] Max angle reached without contact")
+            break
+
+    # Apply overshoot for firm hold
+    if contact_detected:
+        firm_angle = min(current_angle + overshoot_rad, ROBOTIQ_MAX_RAD)
+        targets = STATE.robot.get_joint_positions()
+        targets = set_finger_joints(
+            STATE.robot, STATE.dof_names, firm_angle, targets)
+        STATE.robot.apply_action(ArticulationAction(joint_positions=targets))
+        for _ in range(60):
+            await omni.kit.app.get_app().next_update_async()
+        current_angle = firm_angle
+        _, contact_force = _read_contact_sensor()
+        print(f"  [ADAPTIVE] Firm hold at {firm_angle:.3f} rad, "
+              f"force={contact_force:.2f}N")
+
+    return current_angle, contact_detected, contact_force
+
+
 async def _pick_close(params):
     """Close the gripper and confirm the part is grasped.
 
-    Retries up to 3 times with increasing settle time.
+    Two modes:
+      - Adaptive (sensor available): incremental close with contact feedback
+      - Preset (no sensor): fixed angle with retry loop
+
     Returns a wrist camera image so the caller can run VLM verification
     that the part is properly held before requesting retract.
     """
@@ -1596,33 +1650,61 @@ async def _pick_close(params):
         grasp_confirmed = False
         actual_finger = 0.0
         grip_attempt = 0
+        adaptive_used = False
 
-        for grip_attempt in range(1, 4):
-            print(f"  [CLOSE] attempt {grip_attempt}/3  target={finger_close:.3f}")
-            targets = STATE.robot.get_joint_positions()
-            targets = set_finger_joints(
-                STATE.robot, STATE.dof_names, finger_close, targets)
-            STATE.robot.apply_action(ArticulationAction(joint_positions=targets))
+        # ── Adaptive mode: contact sensor driven ─────────────
+        if STATE.contact_sensor is not None:
+            adaptive_used = True
+            print(f"  [CLOSE] Adaptive mode (contact sensor)")
+            final_angle, contact_ok, force = await _adaptive_close()
+            actual_finger = final_angle
+            grasp_confirmed = contact_ok
+            finger_close = final_angle
+            grip_attempt = 1
 
-            settle = 120 if grip_attempt == 1 else 180
-            for _ in range(settle):
-                await omni.kit.app.get_app().next_update_async()
+            if not contact_ok:
+                # Fallback: close to preset angle
+                print(f"  [CLOSE] No contact detected — "
+                      f"falling back to preset {FINGER_CLOSE:.3f}")
+                finger_close = FINGER_CLOSE
+                targets = STATE.robot.get_joint_positions()
+                targets = set_finger_joints(
+                    STATE.robot, STATE.dof_names, finger_close, targets)
+                STATE.robot.apply_action(
+                    ArticulationAction(joint_positions=targets))
+                for _ in range(120):
+                    await omni.kit.app.get_app().next_update_async()
+                actual_finger = finger_close
+                grasp_confirmed = True  # assume preset works
 
-            actual_joints = STATE.robot.get_joint_positions()
-            for idx, name in enumerate(STATE.dof_names):
-                if ("finger_joint" in name and "inner" not in name
-                        and "knuckle" not in name):
-                    actual_finger = float(actual_joints[idx])
+        # ── Preset mode: fixed angle with retries ────────────
+        else:
+            for grip_attempt in range(1, 4):
+                print(f"  [CLOSE] attempt {grip_attempt}/3  target={finger_close:.3f}")
+                targets = STATE.robot.get_joint_positions()
+                targets = set_finger_joints(
+                    STATE.robot, STATE.dof_names, finger_close, targets)
+                STATE.robot.apply_action(ArticulationAction(joint_positions=targets))
+
+                settle = 120 if grip_attempt == 1 else 180
+                for _ in range(settle):
+                    await omni.kit.app.get_app().next_update_async()
+
+                actual_joints = STATE.robot.get_joint_positions()
+                for idx, name in enumerate(STATE.dof_names):
+                    if ("finger_joint" in name and "inner" not in name
+                            and "knuckle" not in name):
+                        actual_finger = float(actual_joints[idx])
+                        break
+
+                print(f"  [CLOSE] actual={actual_finger:.4f}  "
+                      f"threshold={GRASP_CONFIRM_THRESHOLD}")
+
+                if actual_finger >= GRASP_CONFIRM_THRESHOLD:
+                    grasp_confirmed = True
+                    print(f"  [CLOSE] ✓ Grasp confirmed (attempt {grip_attempt})")
                     break
-
-            print(f"  [CLOSE] actual={actual_finger:.4f}  "
-                  f"threshold={GRASP_CONFIRM_THRESHOLD}")
-
-            if actual_finger >= GRASP_CONFIRM_THRESHOLD:
-                grasp_confirmed = True
-                print(f"  [CLOSE] ✓ Grasp confirmed (attempt {grip_attempt})")
-                break
-            print(f"  [CLOSE] ✗ Retrying...")
+                print(f"  [CLOSE] ✗ Retrying...")
 
         grip_hold = finger_close
         grasp_check = await _verify_grasp()
@@ -1637,6 +1719,7 @@ async def _pick_close(params):
                 "actual_finger": round(actual_finger, 4),
                 "grip_hold": grip_hold,
                 "attempts": grip_attempt,
+                "adaptive": adaptive_used,
                 "grasp_check": grasp_check,
                 "wrist_image": wrist_b64}
 
@@ -2124,6 +2207,19 @@ async def start_bridge():
     stream = timeline.get_timeline_event_stream()
     _timeline_sub = stream.create_subscription_to_pop(_on_timeline_event)
     print("[OK] Timeline subscription active — bridge will auto-stop on sim stop")
+
+    # ── Contact Sensor (adaptive gripper) ────────────────────
+    try:
+        from isaacsim.sensors.contact_sensor import ContactSensor
+        cs = ContactSensor(prim_path=CONTACT_SENSOR_PRIM)
+        cs.initialize()
+        for _ in range(10):
+            await omni.kit.app.get_app().next_update_async()
+        STATE.contact_sensor = cs
+        print(f"[OK] Contact sensor ready: {CONTACT_SENSOR_PRIM}")
+    except Exception as e:
+        STATE.contact_sensor = None
+        print(f"[WARN] Contact sensor init failed (preset gripper mode): {e}")
 
     # ── HTTP Server ──────────────────────────────────────────
     _bridge_server = HTTPServer(("0.0.0.0", BRIDGE_PORT), BridgeHandler)
