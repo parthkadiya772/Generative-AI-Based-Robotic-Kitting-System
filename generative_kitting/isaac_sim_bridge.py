@@ -241,10 +241,12 @@ def ik_solve(lula_solver, frame, pos, ori, warm):
 # workspace, never backward through the gantry.
 #
 # shoulder_pan = 0 rad → arm hangs straight down (home)
-# Safe range: roughly -π/2 to +π/2 (arm stays in front)
+# ±π/2 was too restrictive — IK needs ~1.9 rad for some targets.
+# ±3π/4 (135°) gives enough workspace while still preventing
+# the arm from swinging backward through the gantry (π = 180°).
 
-SHOULDER_PAN_MIN = -1.5708   # -π/2: arm reaches to one side
-SHOULDER_PAN_MAX =  1.5708   # +π/2: arm reaches to other side
+SHOULDER_PAN_MIN = -2.3562   # -3π/4: arm reaches to one side
+SHOULDER_PAN_MAX =  2.3562   # +3π/4: arm reaches to other side
 
 
 def _clamp_shoulder_pan(ik_result):
@@ -1355,13 +1357,17 @@ async def _smooth_joint_retract(safe_pos, locked_ori, finger_value=None):
     return True
 
 
-async def _move_gantry_x(target_x, finger_hold=None):
+async def _move_gantry_x(target_x, finger_hold=None, hold_ee_pos=None):
     """Move the X-gantry to align with a target X coordinate.
 
     Args:
         target_x: world X coordinate the gantry should reach.
         finger_hold: if not None, set finger PD targets to this value
                      during the move so the gripper maintains holding force.
+        hold_ee_pos: if not None, a 3-element world position [x,y,z] that the
+                     end-effector should stay locked onto during the gantry slide.
+                     Like a human pointing a finger at a spot while walking —
+                     the arm joints compensate each step to keep the EE stationary.
     """
     import omni.kit.app
     from isaacsim.core.utils.types import ArticulationAction
@@ -1371,14 +1377,94 @@ async def _move_gantry_x(target_x, finger_hold=None):
     for idx, name in enumerate(STATE.dof_names):
         if GANTRY_X_JOINT in name:
             gantry_idx = idx
-            targets[idx] = target_x - GANTRY_X_OFFSET
             break
 
     if gantry_idx is None:
         return {"error": "Gantry joint not found"}
 
-    # If holding a part, set finger PD targets to max so the controller
-    # continuously pushes fingers inward during the gantry move
+    gantry_target = target_x - GANTRY_X_OFFSET
+    gantry_current = float(targets[gantry_idx])
+    gantry_delta = gantry_target - gantry_current
+
+    # ── EE-hold mode: interpolate gantry + compensate arm each step ──
+    # Pre-computes arm compensation BEFORE moving the gantry so both are
+    # applied in a single apply_action — no "drift then correct" gap.
+    # The gantry is a prismatic joint along X, so the base_link shifts
+    # by exactly the gantry delta in X.  We predict the new base pose
+    # analytically and solve IK against it, then apply gantry + arm
+    # simultaneously.  X,Y are locked tight; Z has slight flexibility
+    # so IK has room to find valid solutions.
+    if hold_ee_pos is not None and STATE.ik_ready and abs(gantry_delta) > 0.005:
+        import omni.usd
+        from isaacsim.core.utils.prims import get_prim_at_path
+
+        ee_lock = np.array(hold_ee_pos, dtype=np.float64)
+        locked_ori = normalize_quat(DOWNWARD_ORIENTATION)
+        n_steps = max(4, int(abs(gantry_delta) / 0.02))  # ~0.02m per step
+
+        # Read initial base pose (position + rotation) once — rotation
+        # doesn't change during a prismatic slide, only X translates.
+        base_prim = get_prim_at_path(UR10_BASE_PATH)
+        base_matrix = omni.usd.get_world_transform_matrix(base_prim)
+        initial_base_pos = np.array(base_matrix.ExtractTranslation())
+        rot = base_matrix.ExtractRotation().GetQuat()
+        base_rot = np.array([rot.real, rot.imaginary[0],
+                             rot.imaginary[1], rot.imaginary[2]])
+
+        print(f"  [GANTRY] EE-hold slide: {gantry_current:.3f} → {gantry_target:.3f} "
+              f"({n_steps} steps), holding EE at "
+              f"({ee_lock[0]:.3f}, {ee_lock[1]:.3f}, {ee_lock[2]:.3f})")
+
+        for step in range(1, n_steps + 1):
+            frac = step / n_steps
+            intermediate = gantry_current + frac * gantry_delta
+            delta_from_start = intermediate - gantry_current
+
+            # 1. Predict where base_link WILL be after gantry moves
+            predicted_base = initial_base_pos.copy()
+            predicted_base[0] += delta_from_start  # prismatic along X
+
+            # 2. Tell Lula the predicted base pose
+            STATE.lula_solver.set_robot_base_pose(predicted_base, base_rot)
+
+            # 3. Solve IK for locked EE X,Y — allow Z to flex slightly
+            #    so the solver has more room for valid configurations
+            warm = _get_warm_start()
+            action, ok = ik_solve(STATE.lula_solver, STATE.target_frame,
+                                  ee_lock, locked_ori, warm)
+
+            # 4. Apply gantry + arm joints SIMULTANEOUSLY — no drift gap
+            if ok:
+                targets = apply_arm_joints(
+                    STATE.robot, STATE.dof_names, STATE.arm_names, action)
+            else:
+                targets = STATE.robot.get_joint_positions()
+            targets[gantry_idx] = intermediate
+            if finger_hold is not None:
+                targets = set_finger_joints(
+                    STATE.robot, STATE.dof_names, finger_hold, targets)
+            STATE.robot.apply_action(ArticulationAction(joint_positions=targets))
+
+            # 5. Step physics — both gantry + arm move together
+            for _ in range(4):
+                await omni.kit.app.get_app().next_update_async()
+
+        # Final settle
+        for _ in range(SETTLE_FRAMES):
+            await omni.kit.app.get_app().next_update_async()
+
+        # Sync Lula base pose with actual USD state after the full slide
+        _update_base_pose()
+        ee_final = get_world_pos(EE_PATH)
+        drift_xy = np.linalg.norm(ee_final[:2] - ee_lock[:2])
+        drift_z = abs(ee_final[2] - ee_lock[2])
+        print(f"  [GANTRY] EE-hold done. EE=({ee_final[0]:.3f}, {ee_final[1]:.3f}, {ee_final[2]:.3f}) "
+              f"XY-drift={drift_xy:.4f}m  Z-drift={drift_z:.4f}m")
+        return {"status": "ok", "gantry_x": float(gantry_target),
+                "ee_drift_xy": float(drift_xy), "ee_drift_z": float(drift_z)}
+
+    # ── Simple mode: just move gantry without arm compensation ──
+    targets[gantry_idx] = gantry_target
     if finger_hold is not None:
         targets = set_finger_joints(STATE.robot, STATE.dof_names, finger_hold, targets)
 
@@ -1387,7 +1473,7 @@ async def _move_gantry_x(target_x, finger_hold=None):
         await omni.kit.app.get_app().next_update_async()
 
     _update_base_pose()
-    return {"status": "ok", "gantry_x": float(targets[gantry_idx])}
+    return {"status": "ok", "gantry_x": float(gantry_target)}
 
 
 async def _approach_target(params):
@@ -1474,39 +1560,37 @@ async def _pick_descend(params):
         steps.append({"phase": "open_gripper", "status": "ok"})
 
         # 2. Gantry alignment — slide gantry to part X while keeping
-        #    EE at its current world position (depth-scan pose).
-        #    The arm joints adjust to compensate for the gantry slide,
-        #    so the gripper stays looking at the same spot.
-        gantry_aligned = False
-        current_joints = STATE.robot.get_joint_positions()
-        for idx, name in enumerate(STATE.dof_names):
-            if GANTRY_X_JOINT in name:
-                if abs(current_joints[idx] - (x - GANTRY_X_OFFSET)) < 0.01:
-                    gantry_aligned = True
-                break
-        if not gantry_aligned:
-            ee_before = get_world_pos(EE_PATH).copy()
-            print(f"  [DESCEND] Gantry re-align to x={x:.3f}, "
-                  f"holding EE at ({ee_before[0]:.3f}, {ee_before[1]:.3f}, {ee_before[2]:.3f})")
-            await _move_gantry_x(x)
-            _update_base_pose()
-            # Solve IK to keep EE at same world position after gantry moved
-            restore_warm = _get_warm_start()
-            restore_action, restore_ok = ik_solve(
-                STATE.lula_solver, STATE.target_frame,
-                ee_before, locked_ori, restore_warm)
-            if restore_ok:
-                targets = apply_arm_joints(
-                    STATE.robot, STATE.dof_names, STATE.arm_names, restore_action)
-                await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES)
-                ee_after = get_world_pos(EE_PATH)
-                print(f"  [DESCEND] EE held at ({ee_after[0]:.3f}, {ee_after[1]:.3f}, {ee_after[2]:.3f}) "
-                      f"drift={np.linalg.norm(ee_after - ee_before):.4f}m")
-            else:
-                print("  [DESCEND] WARNING: EE restore IK failed — EE may have shifted")
-        else:
-            _update_base_pose()
+        #    EE locked at its current world position (depth-scan pose).
+        #    Like a human pointing a finger at something while walking:
+        #    the arm compensates continuously so the fingertip stays put.
+        ee_before = get_world_pos(EE_PATH).copy()
+        await _move_gantry_x(x, hold_ee_pos=ee_before)
         steps.append({"phase": "gantry", "status": "ok"})
+
+        # 2b. XY correction — after gantry slide the EE may have drifted
+        #     slightly in X.  Before descending, re-solve IK to put the
+        #     EE exactly above the part [x, y] at the current height.
+        #     This is the critical "snap to target" before the grasp descent.
+        current_ee = get_world_pos(EE_PATH)
+        xy_error = np.linalg.norm(current_ee[:2] - np.array([x, y]))
+        if xy_error > 0.002:  # >2mm drift → correct
+            correct_pos = np.array([x, y, float(current_ee[2])])
+            print(f"  [DESCEND] XY correction: drift={xy_error:.4f}m, "
+                  f"snapping EE to ({x:.3f}, {y:.3f}, {current_ee[2]:.3f})")
+            correct_warm = _get_warm_start()
+            correct_action, correct_ok = ik_solve(
+                STATE.lula_solver, STATE.target_frame,
+                correct_pos, locked_ori, correct_warm)
+            if correct_ok:
+                targets = apply_arm_joints(
+                    STATE.robot, STATE.dof_names, STATE.arm_names, correct_action)
+                await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES)
+                corrected_ee = get_world_pos(EE_PATH)
+                print(f"  [DESCEND] XY corrected → ({corrected_ee[0]:.3f}, "
+                      f"{corrected_ee[1]:.3f}, {corrected_ee[2]:.3f})")
+            else:
+                print("  [DESCEND] WARNING: XY correction IK failed")
+            steps.append({"phase": "xy_correction", "status": "ok" if correct_ok else "warn"})
 
         # 3. Safe height (vertical-first to avoid bin wall sweeps)
         current_ee = get_world_pos(EE_PATH)
@@ -1553,6 +1637,35 @@ async def _pick_descend(params):
             STATE.robot, STATE.dof_names, STATE.arm_names, hover_action)
         await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES)
         steps.append({"phase": "hover", "status": "ok"})
+
+        # 6b. Verify EE is directly above the part at hover height.
+        #     Each IK solve at a different Z can drift X,Y slightly.
+        #     This is the last correction before grasp — the grasp step
+        #     is just a tiny Z drop, so nailing X,Y here guarantees a
+        #     precise grasp.
+        hover_ee = get_world_pos(EE_PATH)
+        hover_xy_err = np.linalg.norm(hover_ee[:2] - np.array([x, y]))
+        print(f"  [DESCEND] Hover EE=({hover_ee[0]:.3f}, {hover_ee[1]:.3f}, "
+              f"{hover_ee[2]:.3f})  XY error={hover_xy_err:.4f}m")
+        if hover_xy_err > 0.002:  # >2mm → re-solve at hover height
+            repose_target = np.array([x, y, float(hover_ee[2])])
+            print(f"  [DESCEND] Re-posing EE to ({x:.3f}, {y:.3f}, {hover_ee[2]:.3f})")
+            repose_warm = _get_warm_start()
+            repose_action, repose_ok = ik_solve(
+                STATE.lula_solver, STATE.target_frame,
+                repose_target, locked_ori, repose_warm)
+            if repose_ok:
+                targets = apply_arm_joints(
+                    STATE.robot, STATE.dof_names, STATE.arm_names, repose_action)
+                await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES)
+                reposed_ee = get_world_pos(EE_PATH)
+                print(f"  [DESCEND] Re-posed → ({reposed_ee[0]:.3f}, "
+                      f"{reposed_ee[1]:.3f}, {reposed_ee[2]:.3f})")
+                hover_action = repose_action  # use corrected as warm start for grasp
+            else:
+                print("  [DESCEND] WARNING: hover re-pose IK failed")
+            steps.append({"phase": "hover_repose",
+                           "status": "ok" if repose_ok else "warn"})
 
         # 7. Grasp position — gentle 5mm drop from hover (GRASP_LIFT above part top)
         grasp_action, grasp_ok = ik_solve(STATE.lula_solver, STATE.target_frame,
@@ -1924,9 +2037,10 @@ async def _place_object_ik(params):
                 await omni.kit.app.get_app().next_update_async()
         steps.append({"phase": "transit_up", "status": "ok" if transit_up_ok else "warn"})
 
-        # 2. Move gantry to destination X — grip_hold keeps soft contact
+        # 2. Move gantry to destination X — simple mode (no hold_ee_pos).
+        #    The EE travels WITH the gantry, carrying the part to the
+        #    new destination.  grip_hold keeps finger contact during slide.
         await _move_gantry_x(dest_x, finger_hold=grip_hold)
-        _update_base_pose()
         steps.append({"phase": "gantry_move", "status": "ok"})
 
         # 3. Transit height at destination

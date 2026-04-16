@@ -463,8 +463,16 @@ class RobotController:
         self.lula_solver.set_robot_base_pose(base_pos, base_rot)
         return base_pos
 
-    async def _move_gantry_to(self, target_x):
-        """Move gantry X to align with a target X position."""
+    async def _move_gantry_to(self, target_x, hold_ee_pos=None):
+        """Move gantry X to align with a target X position.
+
+        Args:
+            target_x: world X coordinate the gantry should reach.
+            hold_ee_pos: if not None, a 3-element world position [x,y,z] that
+                         the EE should stay locked onto during the gantry slide.
+                         The arm joints compensate each step so the EE stays
+                         stationary — like pointing a finger while walking.
+        """
         import omni.kit.app
         from isaacsim.core.utils.types import ArticulationAction
 
@@ -474,6 +482,65 @@ class RobotController:
 
         gantry_target = target_x - self.gantry_offset
         targets = self.robot.get_joint_positions()
+        gantry_current = float(targets[self.gantry_x_idx])
+        gantry_delta = gantry_target - gantry_current
+
+        # ── EE-hold mode: pre-compute arm compensation, apply simultaneously ──
+        # The gantry is a prismatic joint along X — the base_link shifts
+        # by exactly the gantry delta in X.  We predict the new base pose
+        # analytically and solve IK against it, then apply gantry + arm
+        # in one action so the EE never drifts.
+        if hold_ee_pos is not None and self.lula_solver and abs(gantry_delta) > 0.005:
+            import omni.usd
+            from isaacsim.core.utils.prims import get_prim_at_path
+
+            ee_lock = np.array(hold_ee_pos, dtype=np.float64)
+            n_steps = max(4, int(abs(gantry_delta) / 0.02))
+
+            # Read initial base pose once — rotation is constant for prismatic
+            base_prim = get_prim_at_path(self.ur10_base_path)
+            base_matrix = omni.usd.get_world_transform_matrix(base_prim)
+            initial_base_pos = np.array(base_matrix.ExtractTranslation())
+            rot = base_matrix.ExtractRotation().GetQuat()
+            base_rot = np.array([rot.real, rot.imaginary[0],
+                                 rot.imaginary[1], rot.imaginary[2]])
+
+            log.info(f"Gantry EE-hold slide: {gantry_current:.3f} → {gantry_target:.3f} "
+                     f"({n_steps} steps)")
+
+            for step in range(1, n_steps + 1):
+                frac = step / n_steps
+                intermediate = gantry_current + frac * gantry_delta
+                delta_from_start = intermediate - gantry_current
+
+                # 1. Predict base_link position after gantry moves
+                predicted_base = initial_base_pos.copy()
+                predicted_base[0] += delta_from_start
+
+                # 2. Tell Lula the predicted base pose
+                self.lula_solver.set_robot_base_pose(predicted_base, base_rot)
+
+                # 3. Solve IK for locked EE position
+                action, ok = self._ik_solve(ee_lock)
+
+                # 4. Apply gantry + arm SIMULTANEOUSLY
+                if ok:
+                    targets = self._apply_arm_joints(action)
+                else:
+                    targets = self.robot.get_joint_positions()
+                targets[self.gantry_x_idx] = intermediate
+                self.robot.apply_action(ArticulationAction(joint_positions=targets))
+
+                for _ in range(4):
+                    await omni.kit.app.get_app().next_update_async()
+
+            # Final settle + sync Lula with actual USD state
+            for _ in range(30):
+                await omni.kit.app.get_app().next_update_async()
+            await self._update_base_pose()
+            return
+
+        # ── Simple mode: just move gantry without arm compensation ──
         targets[self.gantry_x_idx] = gantry_target
         self.robot.apply_action(ArticulationAction(joint_positions=targets))
         log.info(f"Moving gantry X → {gantry_target:.4f}m")
