@@ -243,10 +243,9 @@ class BridgeCameraInterface:
         import json
 
         try:
-            # Use plain /api/camera for RGB (works with old + new bridge)
-            # Only add ?type= for depth camera
-            if cam_type == "depth":
-                url = f"{self.bridge_url}/api/camera?type=depth"
+            # Use plain /api/camera for RGB, add ?type= for depth/wrist
+            if cam_type in ("depth", "wrist"):
+                url = f"{self.bridge_url}/api/camera?type={cam_type}"
             else:
                 url = f"{self.bridge_url}/api/camera"
 
@@ -290,7 +289,10 @@ class BridgeCameraInterface:
         """Fetch an RGB frame from the wrist-mounted RealSense."""
         return self.capture_workspace_image(cam_type="wrist")
 
-    def project_to_world(self, points: list, camera: str = "rgb") -> dict:
+    def project_to_world(self, points: list, camera: str = "rgb",
+                         method: str = None,
+                         image_x_sign: int = 1,
+                         image_y_sign: int = 1) -> dict:
         """Project normalised image coordinates to world XYZ via depth.
 
         Parameters
@@ -299,15 +301,28 @@ class BridgeCameraInterface:
             Each dict has ``x`` and ``y`` in [0, 1] (normalised image coords).
         camera : str
             Camera alias: "rgb", "depth", or "wrist".
+        method : str, optional
+            Force projection method: "geometric" skips the depth buffer
+            and uses ray-plane intersection (useful for overhead landmark
+            detection where depth buffer hits bin walls instead of floor).
+        image_x_sign, image_y_sign : int
+            Sign overrides for the image axes — set to ``-1`` to mirror
+            an axis when the camera was placed in USD with a non-standard
+            rotation. Default is +1 (OpenGL convention).
 
         Returns
         -------
         dict
             ``world_points`` list with ``x``, ``y``, ``z``, ``depth_m`` per point.
         """
+        payload = {"points": points, "camera": camera,
+                   "image_x_sign": int(image_x_sign),
+                   "image_y_sign": int(image_y_sign)}
+        if method:
+            payload["method"] = method
         return self.send_command(
             "/api/project_to_world",
-            {"points": points, "camera": camera},
+            payload,
             timeout=15,
         )
 
@@ -356,6 +371,51 @@ class BridgeCameraInterface:
                 return json.loads(resp.read().decode())
         except Exception as e:
             return {"parts": [], "error": str(e)}
+
+    def get_prim_center(self, prim_path: str) -> dict:
+        """Fetch USD bbox centre + top_z for a given prim path.
+
+        Used by the wrist-scan workflow to look up the blue parts bin
+        and the kitting tray without an overhead VLM landmark step.
+
+        Returns ``{ok, center_xy, top_z, bot_z, height}`` on success
+        or ``{ok: False, error: ...}`` if the bridge is unreachable
+        or the prim doesn't exist.
+        """
+        import urllib.request
+        import urllib.parse
+        import json
+
+        try:
+            q = urllib.parse.urlencode({"prim": prim_path})
+            url = f"{self.bridge_url}/api/prim_center?{q}"
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return json.loads(resp.read().decode())
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def get_scene_annotations(self, camera: str = "rgb") -> dict:
+        """Fetch GT per-part annotations as seen from the given camera.
+
+        Each annotation contains world XYZ centre, world bbox, image bbox
+        (px + normalised), centre pixel, projected depth, and visibility/
+        occlusion flags. Coordinates are ground-truth from the USD stage
+        — the workflow uses these to bypass VLM coordinate hallucination.
+
+        Returns ``{"annotations": [], "error": ...}`` if the bridge isn't
+        reachable or the endpoint isn't available (older bridge).
+        """
+        import urllib.request
+        import json
+
+        try:
+            url = f"{self.bridge_url}/api/scene_annotations?camera={camera}"
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                return json.loads(resp.read().decode())
+        except Exception as e:
+            return {"annotations": [], "error": str(e)}
 
     def execute_plan(self, plan: list) -> dict:
         """Send an action plan to Isaac Sim for execution."""
@@ -417,6 +477,18 @@ class BridgeCameraInterface:
     def send_approach(self, params: dict) -> dict:
         """Move robot near a target XYZ position."""
         return self.send_command("/api/approach", params, timeout=30)
+
+    def realign_gantry_hold_ee(self, target_x: float) -> dict:
+        """Slide the gantry to ``target_x`` while keeping ee_link
+        locked at its current world position.
+
+        Used by the depth-verify-and-realign step so the wrist
+        doesn't swing during a small post-depth XY refinement.
+        Returns the bridge response containing ``ee_drift_m`` —
+        useful for confirming the EE actually held still.
+        """
+        return self.send_command(
+            "/api/realign_gantry", {"x": float(target_x)}, timeout=30)
 
     def execute_grasp(self, params: dict) -> dict:
         """Execute a full IK-based pick sequence."""

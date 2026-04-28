@@ -26,4 +26,9 @@ GEMINI.md
 .code-review-graph/
 .claude
 THESIS_FRAMEWORK_SUMMARY.md
+kitting_table/
+diagnose_vlm_perception.py
+diagnose_qwen.py
+kitting_station.usd
+kitting_station_flattened.usd
 .gitignore

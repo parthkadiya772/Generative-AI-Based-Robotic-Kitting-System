@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import pytest
+from PIL import Image
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -101,6 +102,20 @@ class TestVLMParsing:
         result = VLMPerception.parse_vlm_response(f"  \n  {VALID_RAW_JSON}  \n  ")
         assert "detected_objects" in result
 
+    def test_qwen_image_prep_resizes_to_28_multiple(self):
+        """Qwen prep snaps both dims to multiples of 28 within Qwen's
+        pixel budget so smart_resize is a no-op and bbox coords land in
+        the (W, H) we sent."""
+        vlm = VLMPerception({"vlm_provider": "ollama_qwen"})
+        image = Image.new("RGB", (1920, 1080), color="white")
+
+        prepared = vlm._prepare_image_for_qwen(image)
+
+        w, h = prepared.size
+        assert w % 28 == 0 and h % 28 == 0
+        assert max(w, h) <= 1120
+        assert vlm._last_qwen_image_size == (w, h)
+
 
 # ═════════════════════════════════════════════════════════════
 # VLM VALIDATION TESTS
@@ -159,7 +174,45 @@ class TestVLMValidation:
                 {
                     "object_id": "obj_001",
                     "label": "incomplete",
-                    # Missing: semantic_description, affordance, approximate_position, confidence
+                    # Missing: semantic_description, affordance, location, confidence
+                },
+            ],
+            "scene_summary": "test",
+        }
+        result = validate_scene_response(response)
+        assert len(result["detected_objects"]) == 0
+
+    def test_bbox_pixels_satisfies_location(self):
+        """Bin-zoom Qwen schema (bbox_pixels, no approximate_position)
+        must pass validation — downstream depth projection produces
+        world coords from the pixel bbox."""
+        response = {
+            "detected_objects": [
+                {
+                    "object_id": "obj_1",
+                    "label": "large_gear",
+                    "semantic_description": "black flat disc",
+                    "affordance": "graspable",
+                    "bbox_pixels": [100, 500, 200, 600],
+                    "confidence": 0.95,
+                },
+            ],
+            "scene_summary": "test",
+        }
+        result = validate_scene_response(response)
+        assert len(result["detected_objects"]) == 1
+        assert result["detected_objects"][0]["bbox_pixels"] == [100, 500, 200, 600]
+
+    def test_no_location_field_rejected(self):
+        """An object with every other field but no location is rejected."""
+        response = {
+            "detected_objects": [
+                {
+                    "object_id": "obj_1",
+                    "label": "ghost",
+                    "semantic_description": "where is it?",
+                    "affordance": "graspable",
+                    "confidence": 0.95,
                 },
             ],
             "scene_summary": "test",

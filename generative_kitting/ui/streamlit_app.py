@@ -36,6 +36,7 @@ from perception.visualiser import (
 from orchestration.llm_planner import LLMPlanner
 from orchestration.workflow_engine import (
     KittingWorkflowEngine, WorkflowPhase, SCENE_ANALYSIS_PROMPT,
+    _with_catalogue,
 )
 from knowledge.parts_database import PartsDatabase
 from knowledge.seed_data import seed_parts, seed_kits
@@ -709,7 +710,8 @@ with col_left:
             with st.spinner("🧠 Phase 1: Overhead VLM analysis..."):
                 image = st.session_state.camera.capture_workspace_image()
                 scene = st.session_state.vlm.analyze_scene(
-                    image, custom_prompt=SCENE_ANALYSIS_PROMPT)
+                    image,
+                    custom_prompt=_with_catalogue(SCENE_ANALYSIS_PROMPT))
                 st.session_state.scene_description = scene
                 st.session_state.system_status = "ready"
 
@@ -763,8 +765,10 @@ with col_left:
                 "type": "fail",
             })
 
-    # Dual camera tabs
-    cam_tab_rgb, cam_tab_depth = st.tabs(["📹 RGB Overhead", "🔬 Depth (RealSense)"])
+    # Camera + perception tabs
+    cam_tab_rgb, cam_tab_depth, cam_tab_wrist, cam_tab_vlm = st.tabs(
+        ["📹 RGB Overhead", "🔬 Depth (RealSense)",
+         "🤖 Wrist (Live)", "🎯 VLM Detections"])
 
     with cam_tab_rgb:
         try:
@@ -792,6 +796,53 @@ with col_left:
                 st.info(f"No depth feed: {e}")
         else:
             st.info("🔌 Depth camera requires Isaac Sim bridge connection")
+
+    with cam_tab_wrist:
+        # Show the latest wrist camera image captured during workflow
+        wrist_live = st.session_state.get("wrist_live_image")
+        if wrist_live is not None:
+            st.image(
+                wrist_live,
+                width="stretch",
+                caption="Wrist RealSense • Live Scan",
+            )
+        elif st.session_state.get("bridge_connected", False):
+            # No workflow image yet — try to fetch a live frame
+            try:
+                wrist_img = st.session_state.camera.capture_wrist_image()
+                st.session_state["wrist_live_image"] = wrist_img
+                st.image(
+                    wrist_img,
+                    width="stretch",
+                    caption="Wrist RealSense • Live Feed",
+                )
+            except Exception as e:
+                st.info(f"No wrist feed: {e}")
+        else:
+            st.info(
+                "🔌 Wrist camera requires Isaac Sim bridge connection"
+            )
+
+    with cam_tab_vlm:
+        # Overlay image written by the workflow after each VLM analysis.
+        # Red bboxes = VLM-labelled parts (with confidence). Green
+        # bboxes = raw OWL-ViT2 / Qwen-grounding detections. If the
+        # robot moves to the wrong place, comparing the overlay to
+        # the raw RGB tab pinpoints whether the VLM, the bbox, or
+        # the depth projection was at fault.
+        overlay_img = st.session_state.get("vlm_overlay_image")
+        if overlay_img is not None:
+            st.image(
+                overlay_img,
+                width="stretch",
+                caption="VLM detections — red = labelled parts, "
+                        "green = raw detector bboxes",
+            )
+        else:
+            st.info(
+                "Run a workflow to populate this tab with the VLM's "
+                "labelled detections."
+            )
 
     # Stream status indicator
     if st.session_state.auto_stream:

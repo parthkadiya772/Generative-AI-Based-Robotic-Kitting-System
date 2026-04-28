@@ -401,6 +401,10 @@ class RobotController:
                     break
         return warm
 
+    def _get_current_ee_pos(self) -> np.ndarray:
+        """Return the current world-space EE position."""
+        return get_world_pos(self.ee_path)
+
     def _apply_arm_joints(self, ik_result):
         """Apply IK solution to robot joint targets."""
         targets = self.robot.get_joint_positions()
@@ -645,8 +649,18 @@ class RobotController:
         try:
             tcp_z = self._get_tcp_z_offset()
 
+            # Lift to a transit pose before any lateral gantry motion so
+            # the arm clears the rail and nearby bin structures.
+            current_ee = self._get_current_ee_pos()
+            transit_z = max(float(current_ee[2]) + self.transit_safe_height,
+                            z + self.transit_safe_height)
+            lift_ik, lift_ok = self._ik_solve([current_ee[0], current_ee[1], transit_z])
+            if lift_ok:
+                lift_targets = self._apply_arm_joints(lift_ik)
+                await self._move_and_wait(lift_targets)
+
             # Move gantry
-            await self._move_gantry_to(x)
+            await self._move_gantry_to(x, hold_ee_pos=[current_ee[0], current_ee[1], transit_z])
 
             # Safe height above potential box
             safe_z = z + self.box_height + self.box_entry_margin + tcp_z
@@ -712,8 +726,18 @@ class RobotController:
         try:
             tcp_z = self._get_tcp_z_offset()
 
+            # Lift to a transit pose before any lateral gantry motion so
+            # the arm clears the rail and the bin rim during long moves.
+            current_ee = self._get_current_ee_pos()
+            transit_z = max(float(current_ee[2]) + self.transit_safe_height,
+                            z + self.transit_safe_height)
+            lift_ik, lift_ok = self._ik_solve([current_ee[0], current_ee[1], transit_z])
+            if lift_ok:
+                lift_targets = self._apply_arm_joints(lift_ik)
+                await self._move_and_wait(lift_targets)
+
             # Move gantry to destination
-            await self._move_gantry_to(x)
+            await self._move_gantry_to(x, hold_ee_pos=[current_ee[0], current_ee[1], transit_z])
 
             # Safe height above destination
             safe_z = z + self.box_entry_margin + tcp_z

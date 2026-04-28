@@ -15,16 +15,32 @@ from utils.logger import log
 
 
 # ─── Required fields for each detected object ───────────────
+# Note: a "location" field (approximate_position OR image_position OR
+# bbox_pixels OR bbox_norm OR mask_polygon) is also required, but it's
+# checked separately so any one of them satisfies the requirement.
+# The legacy schema asked the VLM for world coords (approximate_position);
+# the bin-zoom schema asks for image-frame fields and projects them to
+# world downstream via /api/project_to_world.
 REQUIRED_OBJECT_FIELDS = {
     "object_id": str,
     "label": str,
     "semantic_description": str,
     "affordance": str,
-    "approximate_position": dict,
     "confidence": (int, float),
 }
 
-VALID_AFFORDANCES = {"graspable", "stackable", "fragile", "fixed", "destination"}
+LOCATION_FIELDS = (
+    "approximate_position",
+    "image_position",
+    "bbox_2d",
+    "bbox_pixels",
+    "bbox_norm",
+    "bbox",
+    "mask_polygon",
+    "segmentation_polygon",
+)
+
+VALID_AFFORDANCES = {"graspable", "stackable", "fragile", "fixed", "destination", "container"}
 
 # Default workspace bounds for position validation (UR10 + gantry reach)
 DEFAULT_WORKSPACE_BOUNDS = {
@@ -168,39 +184,56 @@ def validate_single_object(
         )
         obj["affordance"] = "graspable"
 
-    # ── Spatial position validation ──────────────────────────
-    pos = obj.get("approximate_position", {})
-    if not isinstance(pos, dict):
-        log.warning(f"Object {index}: approximate_position is not a dict — rejected")
+    # ── Location field requirement ───────────────────────────
+    # Any one of approximate_position, image_position, bbox_pixels,
+    # bbox_norm, bbox, mask_polygon, segmentation_polygon is enough.
+    # Without one of these we cannot localise the part downstream.
+    if not any(obj.get(f) for f in LOCATION_FIELDS):
+        log.warning(
+            f"Object {index}: missing all location fields "
+            f"(need one of {LOCATION_FIELDS}) — rejected")
         return None
 
-    bounds = workspace_bounds or DEFAULT_WORKSPACE_BOUNDS
-
-    for axis in ("x", "y", "z"):
-        if axis not in pos:
+    # ── Spatial position validation (legacy world-coord path) ─
+    # Only applies when the VLM emitted approximate_position (world
+    # coords in metres). The bin-zoom path emits image-frame fields
+    # (bbox_pixels / image_position) which are projected to world
+    # downstream by the bridge — bounds-checking those here would be
+    # comparing metres to pixels.
+    if "approximate_position" in obj:
+        pos = obj.get("approximate_position", {})
+        if not isinstance(pos, dict):
             log.warning(
-                f"Object {index}: approximate_position missing '{axis}' — rejected"
-            )
-            return None
-        try:
-            val = float(pos[axis])
-            pos[axis] = val
-        except (ValueError, TypeError):
-            log.warning(
-                f"Object {index}: coordinate '{axis}' = {pos[axis]} is not numeric — rejected"
-            )
+                f"Object {index}: approximate_position is not a dict — rejected")
             return None
 
-        lo = bounds.get(f"{axis}_min", -float("inf"))
-        hi = bounds.get(f"{axis}_max", float("inf"))
-        if val < lo or val > hi:
-            log.warning(
-                f"Object {index} ('{obj['label']}'): {axis}={val:.3f} "
-                f"outside bounds [{lo}, {hi}] — rejected"
-            )
-            return None
+        bounds = workspace_bounds or DEFAULT_WORKSPACE_BOUNDS
 
-    obj["approximate_position"] = pos
+        for axis in ("x", "y", "z"):
+            if axis not in pos:
+                log.warning(
+                    f"Object {index}: approximate_position missing '{axis}' — rejected"
+                )
+                return None
+            try:
+                val = float(pos[axis])
+                pos[axis] = val
+            except (ValueError, TypeError):
+                log.warning(
+                    f"Object {index}: coordinate '{axis}' = {pos[axis]} is not numeric — rejected"
+                )
+                return None
+
+            lo = bounds.get(f"{axis}_min", -float("inf"))
+            hi = bounds.get(f"{axis}_max", float("inf"))
+            if val < lo or val > hi:
+                log.warning(
+                    f"Object {index} ('{obj['label']}'): {axis}={val:.3f} "
+                    f"outside bounds [{lo}, {hi}] — rejected"
+                )
+                return None
+
+        obj["approximate_position"] = pos
 
     # ── Ensure object_id is unique-looking ───────────────────
     if not obj["object_id"]:

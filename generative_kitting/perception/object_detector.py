@@ -39,6 +39,9 @@ KNOWN_PART_LABELS = [
     "silver box",
     "silver gun",
     "tube with clamps",
+    "gear",
+    "large gear",
+    "round gear"
     "white box",
     "kitting tray",
 ]

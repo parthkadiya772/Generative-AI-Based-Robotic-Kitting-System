@@ -10,7 +10,12 @@
       "Bash(find \"c:/KP/AI_and_Automation/Sem_4/Thesis/robot_in_air/generative_kitting\" -name \"__pycache__\" -not -path \"*/.aikido/*\" -not -path \"*/site-packages/*\" -type d -exec rm -rf {} +)",
       "Bash(find /c/KP/AI_and_Automation/Sem_4/Thesis/robot_in_air/generative_kitting -name \"__pycache__\" -not -path \"*/.aikido/*\" -exec rm -rf {} +)",
       "Bash(.aikido/Scripts/pip install:*)",
-      "Bash(.aikido/Scripts/python -c \"from transformers import Owlv2Processor, Owlv2ForObjectDetection; print\\('OWL-ViT2 installed OK'\\)\")"
+      "Bash(.aikido/Scripts/python -c \"from transformers import Owlv2Processor, Owlv2ForObjectDetection; print\\('OWL-ViT2 installed OK'\\)\")",
+      "Bash(python -m pytest tests/)",
+      "Bash(python -m pytest tests/ -q)",
+      "Bash(python -c \"from knowledge.parts_catalogue import format_catalogue_for_prompt; print\\(format_catalogue_for_prompt\\(\\)\\)\")",
+      "Bash(python -c \"from knowledge.parts_catalogue import load_catalogue; import json; print\\(json.dumps\\(load_catalogue\\(\\), indent=2\\)\\)\")",
+      "Bash(python -m pytest generative_kitting/tests/)"
     ]
   }
 }

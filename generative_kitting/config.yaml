@@ -30,14 +30,42 @@ simulation:
     - "/World/gantry_home/ur10_flattened/ur10_instanceable/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/robotiq_base_link"
   box_prim_path: "/World/robot_facade_full"
 
+  # ── Wrist-scan pipeline (current approach) ─────────────────────
+  # The overhead camera is now used for the live UI feed only —
+  # all part-perception happens through the wrist-mounted RealSense.
+  # The robot moves above the bin, faces ee_link downward, and the
+  # wrist RGB image is fed to the VLM. Bin + tray world coordinates
+  # come from these USD prims (no overhead VLM landmark detection).
+  bin_prim_path:  "/World/robot_facade_full"
+  tray_prim_path: "/World/box_840"
+  wrist_rgb_camera_prim_path: "/World/Realsense/RSD455/Camera_OmniVision_OV9782_Color"
+
+  # Scan-pose marker prim — a static USD transform placed at the
+  # location where the robot's ee_link should park to image the bin.
+  # Read via /api/prim_center → pivot. Using a marker prim avoids
+  # computing scan height from bin AABB (which can include tall
+  # rack structures above the actual part surface). Set to "" or
+  # null to disable and fall back to bin_top_z + bin_scan_height.
+  scan_pose_prim_path: "/World/robo_eye"
+
+  # ee_link orientation [w, x, y, z] applied at the scan pose AND at
+  # every realign before a pick. Default rotates the standard downward
+  # pose by -90° yaw about world Z so the wrist camera ends up on the
+  # FRONT side of the gripper (not the back). Tweak the sign of z if
+  # the camera ends up on the wrong side. Keep the quaternion
+  # normalised; null / missing → bridge falls back to DOWNWARD_ORIENTATION.
+  scan_pose_orientation: [0.5, 0.5, 0.5, -0.5]
+
 # ─── Perception (VLM) ───────────────────────────────────────
 perception:
   vlm_provider: "ollama_qwen"         # Active provider (overridden by UI model selection)
   vlm_model: "qwen2.5vl:7b"          # Active model  (overridden by UI model selection)
   vlm_base_url: "http://10.7.0.35:11434"   # Active endpoint (overridden by UI model selection)
   max_retries: 2
-  temperature: 0.1                    # Low temperature for deterministic perception
+  temperature: 0.0                    # Low temperature for deterministic perception
   confidence_threshold: 0.5           # Reject objects below this confidence
+  vlm_num_ctx: 32768                  # Larger context for catalogue + image tokens
+  vlm_num_predict: 8192               # Give Qwen more room to finish JSON instead of truncating at 4096
 
   # ── Available VLM Models (shown as dropdown in Streamlit UI) ──
   # Add your VPN model endpoints here.  "name" is the dropdown label.
@@ -50,14 +78,14 @@ perception:
       model: "gemma4:e4b"
       base_url: "http://10.7.0.35:11434"
 
-    - name: "Qwen3.5 9B (VPN Remote)"
+    - name: "Qwen3-VL 8B (VPN Remote)"
       provider: "ollama_qwen"
-      model: "qwen3.5:9b"
+      model: "qwen3-vl:8b"
       base_url: "http://10.7.0.35:11434"
 
-    - name: "Qwen2.5-VL 7B (VPN Remote)"
+    - name: "Qwen3-VL 30B (VPN Remote)"
       provider: "ollama_qwen"
-      model: "qwen2.5vl:7b"
+      model: "qwen3-vl:30b"
       base_url: "http://10.7.0.35:11434"
 
   # ── Zero-Shot Detector (precise bounding boxes — replaces VLM coord guesses) ──
@@ -66,15 +94,42 @@ perception:
   detector_confidence: 0.15            # minimum detection confidence
   detector_device: "cpu"               # "cpu" or "cuda" (set to cuda if you have a local GPU)
 
+  # When true, drop any VLM-detected object that did NOT get a
+  # matching detector bbox. Without a bbox, depth projection runs
+  # on the VLM's guessed image_position which is unreliable (off
+  # by 5-15%, sometimes hallucinated entirely) and can send the
+  # robot to a divider wall. Bbox-confirmed detections are far
+  # safer because they require BOTH the VLM (correct label) AND
+  # the detector (correct location) to agree.
+  # Set false ONLY if you trust the VLM's image_position alone.
+  require_detector_bbox: true
+
   # ── Depth Estimation (fallback when bridge depth buffer unavailable) ──
+  # NOTE: the bridge's /api/project_to_world reads the camera prim's
+  # actual world transform from USD on every call — these values are
+  # NO LONGER USED for production depth projection. They remain only
+  # as fallback constants for the legacy DepthEstimator class which
+  # the workflow does not currently invoke. To verify the camera
+  # height the bridge actually uses, look for the line
+  #   "[project] Camera world pos: (X, Y, Z)"
+  # in the Isaac Sim console — the Z value is what matters.
   depth_method: "geometric"            # "geometric" (no ML) or "depth_anything" (Depth Anything V2)
-  camera_height_m: 1.8                 # approx camera height above workspace (metres)
-  camera_fov_h_deg: 60.0               # horizontal FOV of overhead camera (degrees)
+  camera_height_m: 5.10                # legacy; bridge uses USD prim transform instead
+  camera_fov_h_deg: 60.0               # legacy; bridge reads focal_length + aperture from USD
   camera_resolution: [1920, 1080]      # overhead camera resolution
+  # Image-axis sign overrides for the bridge's depth projection.
+  # Set to -1 to flip an axis if the camera was placed in USD with a
+  # non-standard rotation that mirrors detected world coords. Default
+  # +1 = OpenGL convention. After running once, check the bridge log
+  # for "Camera basis in world:" — if `up (+Y_cam)` points OPPOSITE
+  # to world +Y when the image-up corresponds to world +Y, set
+  # camera_image_y_sign: -1.
+  camera_image_x_sign: 1               # flip image X axis (-1 to mirror)
+  camera_image_y_sign: 1               # flip image Y axis (-1 to mirror)
   workspace_surface_z: 0.02            # Z height of bin surface where parts sit (metres)
   tray_surface_z: 0.02                 # Z height of kitting tray surface (geometric fallback)
                                        # Adjust if tray sits higher/lower than parts bin
-  camera_world_x: 0.3                  # camera world X position (metres)
+  camera_world_x: 0.0                  # camera world X position (metres)
   camera_world_y: 0.0                  # camera world Y position (metres)
 
 # ─── Orchestration (LLM) ────────────────────────────────────
@@ -111,6 +166,17 @@ execution:
     z_min: -0.1
     z_max: 2.0
 
+  # Effective kinematic reach — tighter than workspace_bounds.
+  # Objects outside these bounds are filtered before LLM planning
+  # to prevent IK failures on unreachable targets.
+  effective_reach:
+    x_min: -2.0
+    x_max: 3.0
+    y_min: -1.3
+    y_max: 1.3
+    z_min: -0.05
+    z_max: 999.0
+
   # Robotiq 2F-140 parameters
   gripper_tcp_offset: 0.170           # metres: ee_link → finger contact pad
   gripper_body_width: 0.160           # metres: widest dimension (fingers open)
@@ -118,6 +184,21 @@ execution:
   gripper_force: 40.0                 # Newtons
   finger_open_rad: 0.0               # radians — fully open
   finger_close_rad: 0.5              # radians — ~50mm part
+
+  # ── Wrist-scan pipeline heights (above bin / tray top, metres) ──
+  # bin_scan_height:       wrist sits this far above bin top to capture
+  #                        a single image that frames the whole bin.
+  # pick_align_height:     after the VLM picks a target, the gantry
+  #                        re-aligns so the wrist is centred over the
+  #                        part at this height before depth analysis.
+  # depth_analysis_height: close-range height for the wrist depth
+  #                        camera to refine the grasp pose.
+  # tray_safe_height:      wrist clearance above the kitting tray
+  #                        rim during placement.
+  bin_scan_height:        0.60
+  pick_align_height:      0.40
+  depth_analysis_height:  0.20
+  tray_safe_height:       0.25
 
   # Motion parameters
   pre_grasp_height_offset: 0.15      # 15cm above object for approach
@@ -127,11 +208,8 @@ execution:
   place_drop_height: 0.0             # metres above destination surface
   place_retract_height: 0.20         # metres above destination after release
   transit_safe_height: 0.30          # metres above safe_z during transit
+  max_pick_retries: 2               # retry scan + pick if grasp fails
   grasp_depth_fraction: 0.5          # 0.0=top, 0.5=mid, 1.0=bottom
-
-  # Kit tray — detected dynamically via camera + perception pipeline.
-  # No fixed position: VLM + OWL-ViT2 + depth projection localize
-  # the tray at runtime so it works even if the tray moves.
 
   # Safety
   action_timeout_seconds: 30         # max seconds per action primitive

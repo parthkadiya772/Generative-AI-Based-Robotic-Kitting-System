@@ -7,11 +7,16 @@ API on port 8600 that the Streamlit dashboard consumes for:
   GET  /api/ping          → health check + capabilities list
   GET  /api/status        → robot joint positions, DOF info, sim state
   GET  /api/camera        → live camera frame (rgb|depth) as base64 JPEG
+  GET  /api/scene_annotations → GT per-part 3D + 2D bbox seen by camera
+  GET  /api/prim_center?prim=<path> → USD bbox centre/top/height for a prim
   POST /api/execute       → execute a list of action primitives
   POST /api/joints        → set joint positions directly
   POST /api/home          → move robot to home position
   POST /api/gripper       → open / close gripper
   POST /api/approach      → move near a world XYZ (Lula IK)
+  POST /api/realign_gantry → slide gantry to target X while the
+                             arm compensates to hold the ee_link at
+                             its current world position (no swing)
   POST /api/pick          → full pick sequence at XYZ
   POST /api/place         → full place sequence at XYZ
 
@@ -434,6 +439,21 @@ class BridgeHandler(BaseHTTPRequestHandler):
             })
         elif path == "/api/scene_parts":
             self._handle_scene_parts()
+        elif path == "/api/scene_annotations":
+            cam_type = "rgb"
+            if "?" in self.path:
+                params = dict(p.split("=") for p in self.path.split("?")[1].split("&") if "=" in p)
+                cam_type = params.get("camera", "rgb")
+            self._handle_scene_annotations(cam_type)
+        elif path == "/api/prim_center":
+            prim_path = ""
+            if "?" in self.path:
+                params = dict(p.split("=", 1) for p in self.path.split("?", 1)[1].split("&") if "=" in p)
+                prim_path = params.get("prim", "")
+                # URL-decode (prim paths contain '/')
+                import urllib.parse as _u
+                prim_path = _u.unquote(prim_path)
+            self._handle_prim_center(prim_path)
         else:
             self._send_json({"error": f"Unknown endpoint: {path}"}, 404)
 
@@ -450,6 +470,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self._handle_gripper(body)
         elif path == "/api/approach":
             self._handle_approach(body)
+        elif path == "/api/realign_gantry":
+            self._handle_realign_gantry(body)
         elif path == "/api/pick":
             self._handle_pick(body)
         elif path == "/api/pick_descend":
@@ -502,6 +524,32 @@ class BridgeHandler(BaseHTTPRequestHandler):
         result = STATE.pop_result(timeout=15)
         self._send_json(result)
 
+    def _handle_scene_annotations(self, cam_type="rgb"):
+        """GT per-part annotations as seen from the requested camera."""
+        if not STATE.is_ready:
+            self._send_json({"error": "Not ready"}, 503)
+            return
+        STATE.push_command({"action": "scene_annotations", "camera": cam_type})
+        result = STATE.pop_result(timeout=20)
+        self._send_json(result)
+
+    def _handle_prim_center(self, prim_path: str):
+        """USD bbox query: returns ``{center_xy, top_z, bot_z, height}``
+        for the requested prim. Used by the wrist-scan workflow to
+        position the robot above the bin and to compute tray placement
+        without relying on overhead VLM landmark detection.
+        """
+        if not STATE.is_ready:
+            self._send_json({"error": "Not ready"}, 503)
+            return
+        if not prim_path:
+            self._send_json({"error": "Missing 'prim' query parameter"}, 400)
+            return
+        STATE.push_command({"action": "compute_prim_center",
+                            "prim_path": prim_path})
+        result = STATE.pop_result(timeout=10)
+        self._send_json(result)
+
     # ── POST handlers ────────────────────────────────────────
 
     def _handle_execute(self, body):
@@ -536,6 +584,21 @@ class BridgeHandler(BaseHTTPRequestHandler):
     def _handle_approach(self, body):
         """Move near a target XYZ using Lula IK."""
         STATE.push_command({"action": "approach", "params": body})
+        self._send_json(STATE.pop_result(timeout=30))
+
+    def _handle_realign_gantry(self, body):
+        """Slide gantry to target X while holding ee_link in place.
+
+        Body: ``{"x": float}`` — world X to slide the gantry to. The
+        arm joints micro-step their IK each frame so the wrist's
+        world (X, Y, Z) stays constant during the slide. Used after
+        depth verification refines the part XY: the gantry shifts
+        underneath the EE, but the wrist itself doesn't drift, so
+        the subsequent Cartesian descent enters the compartment from
+        the same vantage we just confirmed with the depth camera.
+        """
+        STATE.push_command({"action": "realign_gantry_hold_ee",
+                            "params": body})
         self._send_json(STATE.pop_result(timeout=30))
 
     def _handle_pick(self, body):
@@ -604,21 +667,40 @@ async def _capture_camera(cam_type="rgb"):
             cam = STATE.camera_rgb
 
         # ── Black-frame fix ──────────────────────────────────
-        # Request two consecutive frames to avoid stale/black data
-        for attempt in range(3):
+        # The wrist RGB renderer is slower to refresh after the robot
+        # moves than the depth annotator at the same prim hierarchy
+        # (different render paths). Give it more ticks + more retries
+        # to avoid the workflow seeing a stale black frame.
+        if cam_type == "wrist":
+            max_attempts, ticks_per_attempt = 8, 8
+        else:
+            max_attempts, ticks_per_attempt = 3, 3
+
+        rgba = None
+        last_mean = -1.0
+        for attempt in range(max_attempts):
             cam.get_current_frame()
-            for _ in range(3):
+            for _ in range(ticks_per_attempt):
                 await omni.kit.app.get_app().next_update_async()
 
             rgba = cam.get_rgba()
             if rgba is not None and rgba.size > 0:
-                # Check if frame is mostly black (mean < 5 across RGB)
-                if np.mean(rgba[:, :, :3]) > 3:
-                    break  # valid frame
-            # else retry
+                last_mean = float(np.mean(rgba[:, :, :3]))
+                # Frame is "valid" if it has non-trivial brightness
+                if last_mean > 3:
+                    if attempt > 0:
+                        print(f"  [{cam_type}] valid frame on attempt "
+                              f"{attempt + 1}/{max_attempts} "
+                              f"(mean={last_mean:.1f})")
+                    break
 
         if rgba is None or rgba.size == 0:
             return {"error": f"{cam_type} camera returned empty frame"}
+
+        if last_mean <= 3:
+            print(f"  [{cam_type}] WARNING: frame still dark after "
+                  f"{max_attempts} attempts (mean={last_mean:.1f}) — "
+                  f"renderer may not have caught up")
 
         from PIL import Image
         img = Image.fromarray(rgba[:, :, :3])
@@ -648,23 +730,33 @@ async def _capture_camera(cam_type="rgb"):
 # ═════════════════════════════════════════════════════════════
 
 def _get_workspace_surface_z():
-    """Get Z height of workspace surface where parts sit.
+    """Get Z height of workspace surface where parts sit (geometric
+    projection fallback).
 
-    Reads the parts container prim position from USD.  Falls back to
-    a reasonable default if the prim isn't available.
+    Reads the bin AABB and returns ``bot_z + 0.05`` — i.e. just above
+    the rack base, which is approximately where parts rest on the
+    internal compartment floor.
+
+    Earlier the function used the bin prim's PIVOT translation Z,
+    which is often 0 (e.g. when the bin's parent transform places it
+    at the world origin). That made every geometric projection emit
+    ``z = 0`` and the IK targeted points below the floor.
     """
     import omni.usd
     try:
         stage = omni.usd.get_context().get_stage()
         prim = stage.GetPrimAtPath(PARTS_CONTAINER)
         if prim.IsValid():
-            mat = omni.usd.get_world_transform_matrix(prim)
-            z = float(mat.GetRow(3)[2])
-            print(f"  [workspace_z] Parts container Z = {z:.4f}")
-            return z
+            bbox = compute_bbox_geometry(stage, PARTS_CONTAINER,
+                                         label="WORKSPACE_Z")
+            surface_z = float(bbox["bot_z"]) + 0.05
+            print(f"  [workspace_z] Bin AABB bot_z={bbox['bot_z']:.4f}, "
+                  f"top_z={bbox['top_z']:.4f} → using surface_z="
+                  f"{surface_z:.4f}")
+            return surface_z
     except Exception as e:
         print(f"  [workspace_z] USD read failed: {e}")
-    return 0.02  # reasonable default for bin surface
+    return 0.02  # last-resort default (table-level)
 
 
 async def _project_to_world(params):
@@ -694,6 +786,14 @@ async def _project_to_world(params):
 
     points = params.get("points", [])
     cam_alias = params.get("camera", "rgb")
+    force_method = params.get("method", None)  # "geometric" to skip depth buffer
+    # Optional axis-sign overrides — useful when the camera was placed
+    # in USD with a non-standard rotation that mirrors detected coords.
+    img_x_sign = float(params.get("image_x_sign", 1))
+    img_y_sign = float(params.get("image_y_sign", 1))
+    if img_x_sign != 1 or img_y_sign != 1:
+        print(f"  [project] Axis sign overrides: "
+              f"x={img_x_sign:+.0f}, y={img_y_sign:+.0f}")
 
     # Resolve alias → prim path
     if cam_alias == "rgb":
@@ -732,17 +832,57 @@ async def _project_to_world(params):
         pass  # may already be attached or unsupported
 
     # ── Camera intrinsics ──────────────────────────────────────
+    # Pinhole model from USD camera attributes:
+    #     fx = w_res * focal_length / horizontal_aperture
+    #     fy = h_res * focal_length / vertical_aperture
+    #     cx, cy = principal point (image centre for an unshifted lens)
+    # Reading focal_length + aperture directly from the USD prim is
+    # more reliable than `cam.get_intrinsics_matrix()` which can be
+    # stale or unset after camera repositioning. We fall back to the
+    # API method, then to a 60° HFOV estimate.
     w_res, h_res = res
+    fx = fy = cx = cy = None
+    intr_source = "?"
     try:
-        intrinsics = cam.get_intrinsics_matrix()  # 3×3 numpy
-        fx, fy = float(intrinsics[0, 0]), float(intrinsics[1, 1])
-        cx, cy = float(intrinsics[0, 2]), float(intrinsics[1, 2])
-        print(f"  [project] Intrinsics: fx={fx:.1f} fy={fy:.1f} cx={cx:.1f} cy={cy:.1f}")
-    except Exception:
-        hfov_rad = math.radians(60)
-        fx = fy = (w_res / 2.0) / math.tan(hfov_rad / 2.0)
-        cx, cy = w_res / 2.0, h_res / 2.0
-        print(f"  [project] Intrinsics (estimated): fx={fx:.1f} fy={fy:.1f}")
+        from pxr import UsdGeom
+        intrinsics_stage = omni.usd.get_context().get_stage()
+        usd_cam = UsdGeom.Camera(intrinsics_stage.GetPrimAtPath(cam_path))
+        if usd_cam:
+            focal_mm = float(usd_cam.GetFocalLengthAttr().Get() or 0.0)
+            h_aperture = float(
+                usd_cam.GetHorizontalApertureAttr().Get() or 0.0)
+            v_aperture = float(
+                usd_cam.GetVerticalApertureAttr().Get() or 0.0)
+            focus_distance = None
+            try:
+                focus_distance = float(
+                    usd_cam.GetFocusDistanceAttr().Get() or 0.0)
+            except Exception:
+                pass
+            if focal_mm > 0 and h_aperture > 0 and v_aperture > 0:
+                fx = w_res * focal_mm / h_aperture
+                fy = h_res * focal_mm / v_aperture
+                cx, cy = w_res / 2.0, h_res / 2.0
+                intr_source = (
+                    f"USD attrs (focal={focal_mm:.2f}mm, "
+                    f"H={h_aperture:.2f}mm, V={v_aperture:.2f}mm"
+                    f"{', focus=' + format(focus_distance, '.2f') + 'm' if focus_distance else ''})")
+    except Exception as e:
+        print(f"  [project] USD camera attr read failed: {e}")
+
+    if fx is None:
+        try:
+            intrinsics = cam.get_intrinsics_matrix()
+            fx, fy = float(intrinsics[0, 0]), float(intrinsics[1, 1])
+            cx, cy = float(intrinsics[0, 2]), float(intrinsics[1, 2])
+            intr_source = "Camera.get_intrinsics_matrix()"
+        except Exception:
+            hfov_rad = math.radians(60)
+            fx = fy = (w_res / 2.0) / math.tan(hfov_rad / 2.0)
+            cx, cy = w_res / 2.0, h_res / 2.0
+            intr_source = "60° HFOV estimate"
+    print(f"  [project] Intrinsics: fx={fx:.1f} fy={fy:.1f} "
+          f"cx={cx:.1f} cy={cy:.1f}  ← {intr_source}")
 
     # ── Camera extrinsics (world transform) ────────────────────
     stage = omni.usd.get_context().get_stage()
@@ -750,7 +890,28 @@ async def _project_to_world(params):
     cam_world_mat = omni.usd.get_world_transform_matrix(cam_prim)
 
     cam_pos = cam_world_mat.GetRow(3)
-    print(f"  [project] Camera world pos: ({cam_pos[0]:.3f}, {cam_pos[1]:.3f}, {cam_pos[2]:.3f})")
+    # Camera's local axes mapped to world frame — diagnoses sign /
+    # axis-flip issues when projection puts parts on the wrong side.
+    # In OpenGL convention the camera looks down its -Z, +X is image
+    # right, +Y is image up. After applying the camera's USD world
+    # transform we expect:
+    #   right_world  ≈ horizontal (any direction in the world XY plane)
+    #   up_world     ≈ pointing roughly opposite to the look direction's
+    #                  vertical drop (image-up = world-up if camera
+    #                  is roll-free)
+    #   fwd_world    ≈ from camera toward what it's pointed at
+    right_world = cam_world_mat.TransformDir(Gf.Vec3d(1.0, 0.0, 0.0))
+    up_world    = cam_world_mat.TransformDir(Gf.Vec3d(0.0, 1.0, 0.0))
+    fwd_world   = cam_world_mat.TransformDir(Gf.Vec3d(0.0, 0.0, -1.0))
+    print(f"  [project] Camera world pos: ({cam_pos[0]:.3f}, "
+          f"{cam_pos[1]:.3f}, {cam_pos[2]:.3f})")
+    print(f"  [project] Camera basis in world:")
+    print(f"             right (+X_cam) = ({right_world[0]:+.3f}, "
+          f"{right_world[1]:+.3f}, {right_world[2]:+.3f})")
+    print(f"             up    (+Y_cam) = ({up_world[0]:+.3f}, "
+          f"{up_world[1]:+.3f}, {up_world[2]:+.3f})")
+    print(f"             fwd   (-Z_cam) = ({fwd_world[0]:+.3f}, "
+          f"{fwd_world[1]:+.3f}, {fwd_world[2]:+.3f})")
 
     # ── Try depth buffer ───────────────────────────────────────
     has_depth = False
@@ -785,7 +946,10 @@ async def _project_to_world(params):
     # ── Workspace surface Z for geometric fallback ─────────────
     workspace_z = _get_workspace_surface_z()
 
-    method_used = "depth" if has_depth else "geometric"
+    if force_method == "geometric":
+        method_used = "geometric (forced)"
+    else:
+        method_used = "depth" if has_depth else "geometric"
     print(f"  [project] Method: {method_used} | {len(points)} points to project")
 
     # ── Project each point ─────────────────────────────────────
@@ -797,7 +961,7 @@ async def _project_to_world(params):
         point_method = None
 
         # ── Method 1: Depth buffer projection ──────────────────
-        if has_depth:
+        if has_depth and force_method != "geometric":
             px = min(int(nx * (w_depth - 1)), w_depth - 1)
             py = min(int(ny * (h_depth - 1)), h_depth - 1)
 
@@ -812,12 +976,13 @@ async def _project_to_world(params):
                 d = float(np.median(valid))
 
                 # Unproject pixel → camera frame (OpenGL: +X right, +Y up, -Z forward)
-                cam_x =  (px - cx) * d / fx
-                cam_y = -(py - cy) * d / fy
+                cam_x = img_x_sign * (px - cx) * d / fx
+                cam_y = img_y_sign * -(py - cy) * d / fy
                 cam_z = -d
 
-                cam_pt = Gf.Vec4d(cam_x, cam_y, cam_z, 1.0)
-                world_pt = cam_world_mat.GetTranspose() * cam_pt
+                # Transform camera-frame point to world using USD canonical method
+                # (GetTranspose() * Vec4d is ambiguous in pxr bindings — Transform() is correct)
+                world_pt = cam_world_mat.Transform(Gf.Vec3d(cam_x, cam_y, cam_z))
 
                 world_points.append({
                     "x": float(world_pt[0]),
@@ -836,15 +1001,14 @@ async def _project_to_world(params):
             # Per-point surface Z override (e.g. tray on different surface)
             point_z = float(pt.get("surface_z", workspace_z))
 
-            # Ray direction in camera frame
-            ray_cam = Gf.Vec4d(
-                (px - cx) / fx,
-                -(py - cy) / fy,
+            # Ray direction in camera frame → world frame
+            # TransformDir() transforms directions (ignores translation),
+            # unlike Transform() which transforms points.
+            ray_world = cam_world_mat.TransformDir(Gf.Vec3d(
+                img_x_sign * (px - cx) / fx,
+                img_y_sign * -(py - cy) / fy,
                 -1.0,
-                0.0,   # direction vector (w=0)
-            )
-            # Transform ray direction to world frame
-            ray_world = cam_world_mat.GetTranspose() * ray_cam
+            ))
 
             dz = ray_world[2]
             if abs(dz) < 1e-6:
@@ -872,7 +1036,8 @@ async def _project_to_world(params):
         print(f"  [{i}] image({nx:.2f},{ny:.2f}) → world({wp['x']:.3f}, {wp['y']:.3f}, {wp['z']:.3f}) [{point_method}]")
 
     return {"status": "ok", "world_points": world_points,
-            "camera": cam_path, "method": method_used}
+            "camera": cam_path, "method": method_used,
+            "depth_buffer_used": has_depth}
 
 
 # ═════════════════════════════════════════════════════════════
@@ -888,7 +1053,7 @@ PARTS_CONTAINER = "/World/robot_facade_full"
 KNOWN_PART_TYPES = [
     "motor_valve", "black_hose", "black_plate", "black_plug",
     "small_hinge", "small_tube", "silver_box", "silver_gun",
-    "tube_with_clamps",
+    "tube_with_clamps", "gear",
 ]
 
 def _is_pickable_part(prim):
@@ -903,6 +1068,45 @@ def _is_pickable_part(prim):
         if child.HasAPI(UsdPhysics.RigidBodyAPI):
             return True
     return False
+
+
+async def _compute_prim_center(prim_path: str):
+    """Return ``{center_xy, top_z, bot_z, height, pivot, ok}`` for a prim.
+
+    The wrist-scan workflow uses this to fetch the bin / tray geometry
+    AND to read scan-pose marker positions (e.g. ``/World/robo_eye``).
+    For markers, the AABB centre may differ from the prim's actual
+    transform — ``pivot`` is the prim's world translation and is the
+    correct value to use as an IK target.
+    """
+    import omni.usd
+    try:
+        if not prim_path:
+            return {"ok": False, "error": "Empty prim path"}
+        stage = omni.usd.get_context().get_stage()
+        prim = stage.GetPrimAtPath(prim_path)
+        if not prim.IsValid():
+            return {"ok": False, "error": f"Prim not found: {prim_path}"}
+        bbox = compute_bbox_geometry(stage, prim_path, label="QUERY")
+        pivot = bbox["pivot"]
+        min_pt = bbox["min_pt"]
+        max_pt = bbox["max_pt"]
+        return {
+            "ok": True,
+            "prim_path": prim_path,
+            "center_xy": bbox["center_xy"],
+            "top_z":     bbox["top_z"],
+            "bot_z":     bbox["bot_z"],
+            "height":    bbox["height"],
+            "pivot":     [float(pivot[0]), float(pivot[1]),
+                          float(pivot[2])],
+            "min_pt":    [float(min_pt[0]), float(min_pt[1]),
+                          float(min_pt[2])],
+            "max_pt":    [float(max_pt[0]), float(max_pt[1]),
+                          float(max_pt[2])],
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 async def _scan_scene_parts():
@@ -991,6 +1195,205 @@ async def _scan_scene_parts():
 
     except Exception as e:
         return {"error": f"Scene scan failed: {e}", "parts": []}
+
+
+# ═════════════════════════════════════════════════════════════
+# SCENE ANNOTATIONS — ground-truth coords + per-camera 2D bbox
+#
+# Combines USD ground-truth bboxes (_scan_scene_parts) with the
+# inverse projection (world XYZ → image pixel) for the requested
+# camera, so the workflow can match VLM/OWL-ViT2 detections to
+# authoritative world coordinates instead of guessing via depth.
+# ═════════════════════════════════════════════════════════════
+
+async def _get_scene_annotations(camera="rgb"):
+    """Return per-part GT annotations as seen from the given camera.
+
+    For every pickable part under PARTS_CONTAINER:
+      * world bbox + centre (from USD, exact)
+      * 2D pixel bbox in the camera image (projected from 3D corners)
+      * normalised image bbox + centre
+      * visibility flag (depth buffer matches projected Z within 5cm)
+      * occluded flag (centre pixel hidden by other geometry)
+
+    The workflow uses the world coords as ground truth and the 2D
+    bbox to match VLM / OWL-ViT2 detections to the right entry.
+    """
+    import omni.usd
+    from pxr import Gf
+    from omni.isaac.sensor import Camera
+    import omni.kit.app
+
+    # Map camera alias → prim path + resolution (mirror _capture_camera)
+    if camera == "rgb":
+        cam_path, res = CAMERA_RGB_PRIM, (1920, 1080)
+    elif camera == "depth":
+        cam_path, res = CAMERA_DEPTH_PRIM, (1280, 720)
+    elif camera == "wrist":
+        cam_path, res = CAMERA_WRIST_PRIM, (1280, 720)
+    else:
+        cam_path, res = camera, (1280, 720)
+
+    # Reuse cached cameras to avoid re-init + black frame on first call
+    if camera == "rgb" and STATE.camera_rgb is not None:
+        cam = STATE.camera_rgb
+    elif camera == "depth" and STATE.camera_depth is not None:
+        cam = STATE.camera_depth
+    elif camera == "wrist" and STATE.camera_wrist is not None:
+        cam = STATE.camera_wrist
+    else:
+        cam = Camera(prim_path=cam_path, resolution=res)
+        cam.initialize()
+        for _ in range(10):
+            await omni.kit.app.get_app().next_update_async()
+
+    # Make sure the depth annotator is attached for visibility check
+    try:
+        cam.add_distance_to_image_plane_to_frame()
+        for _ in range(5):
+            await omni.kit.app.get_app().next_update_async()
+    except Exception:
+        pass
+
+    # Intrinsics
+    w_res, h_res = res
+    try:
+        K = cam.get_intrinsics_matrix()
+        fx, fy = float(K[0, 0]), float(K[1, 1])
+        cx, cy = float(K[0, 2]), float(K[1, 2])
+    except Exception:
+        import math
+        hfov = math.radians(60)
+        fx = fy = (w_res / 2.0) / math.tan(hfov / 2.0)
+        cx, cy = w_res / 2.0, h_res / 2.0
+
+    # Extrinsics: cam→world matrix and its inverse (world→cam)
+    stage = omni.usd.get_context().get_stage()
+    cam_prim = stage.GetPrimAtPath(cam_path)
+    cam_world_mat = omni.usd.get_world_transform_matrix(cam_prim)
+    world_to_cam = cam_world_mat.GetInverse()
+
+    # Optional depth buffer for visibility check (best-effort)
+    depth_buf = None
+    try:
+        for _ in range(5):
+            cam.get_current_frame()
+            await omni.kit.app.get_app().next_update_async()
+        d = cam.get_depth()
+        if d is not None and d.size > 0:
+            depth_buf = d
+    except Exception:
+        depth_buf = None
+
+    # Pull GT parts from existing scanner
+    scan = await _scan_scene_parts()
+    if "error" in scan:
+        return {"error": scan["error"], "annotations": []}
+    parts = scan.get("parts", [])
+
+    def _project_world_to_pixel(wx, wy, wz):
+        """world XYZ → (px, py, depth_to_cam_plane) or None if behind cam."""
+        cam_pt = world_to_cam.Transform(Gf.Vec3d(float(wx), float(wy), float(wz)))
+        cx_, cy_, cz_ = float(cam_pt[0]), float(cam_pt[1]), float(cam_pt[2])
+        # OpenGL camera: forward = -Z. Point in front of camera ⇒ cz_ < 0.
+        if cz_ >= -1e-3:
+            return None
+        d = -cz_
+        px = cx_ * fx / d + cx
+        py = -cy_ * fy / d + cy
+        return px, py, d
+
+    annotations = []
+    for part in parts:
+        bmin = part["bbox_min"]
+        bmax = part["bbox_max"]
+        center = part["center_xyz"]
+
+        # Project all 8 bbox corners into the image
+        corners = [
+            (bmin[0], bmin[1], bmin[2]), (bmax[0], bmin[1], bmin[2]),
+            (bmin[0], bmax[1], bmin[2]), (bmax[0], bmax[1], bmin[2]),
+            (bmin[0], bmin[1], bmax[2]), (bmax[0], bmin[1], bmax[2]),
+            (bmin[0], bmax[1], bmax[2]), (bmax[0], bmax[1], bmax[2]),
+        ]
+        proj = [_project_world_to_pixel(*c) for c in corners]
+        proj_valid = [p for p in proj if p is not None]
+        if len(proj_valid) < 4:
+            # Mostly behind the camera — skip
+            continue
+
+        xs = [p[0] for p in proj_valid]
+        ys = [p[1] for p in proj_valid]
+        x1 = max(0.0, min(xs))
+        y1 = max(0.0, min(ys))
+        x2 = min(float(w_res - 1), max(xs))
+        y2 = min(float(h_res - 1), max(ys))
+        if x2 - x1 < 2 or y2 - y1 < 2:
+            continue
+
+        # Project centre point separately for accurate centre pixel
+        c_proj = _project_world_to_pixel(*center)
+        if c_proj is not None:
+            cpx, cpy, c_depth = c_proj
+        else:
+            cpx, cpy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+            c_depth = -1.0
+
+        # Visibility: compare depth buffer at centre pixel to projected depth
+        visible = True
+        occlusion_pct = 0.0
+        if depth_buf is not None and c_depth > 0:
+            h_d, w_d = depth_buf.shape[:2]
+            ipx = int(min(max(cpx, 0), w_res - 1) * (w_d - 1) / max(w_res - 1, 1))
+            ipy = int(min(max(cpy, 0), h_res - 1) * (h_d - 1) / max(h_res - 1, 1))
+            r = 2
+            patch = depth_buf[max(0, ipy - r):ipy + r + 1,
+                              max(0, ipx - r):ipx + r + 1]
+            valid = patch[(patch > 0.01) & (patch < 100.0)]
+            if valid.size > 0:
+                measured_d = float(np.median(valid))
+                # If measured depth is much closer than the part's projected
+                # depth, something is in front of it → occluded
+                if measured_d < c_depth - 0.05:
+                    visible = False
+                    occlusion_pct = max(0.0, min(1.0,
+                        (c_depth - measured_d) / c_depth))
+
+        # Identify part type by name match
+        name_lower = part["name"].lower()
+        part_type = next(
+            (pt for pt in KNOWN_PART_TYPES if pt in name_lower), None)
+
+        annotations.append({
+            "name": part["name"],
+            "prim_path": part["prim_path"],
+            "part_type": part_type,
+            "world_center": center,
+            "world_top_z": part["top_z"],
+            "world_bbox_min": bmin,
+            "world_bbox_max": bmax,
+            "image_bbox_px": [float(x1), float(y1), float(x2), float(y2)],
+            "image_bbox_norm": [
+                float(x1) / w_res, float(y1) / h_res,
+                float(x2) / w_res, float(y2) / h_res,
+            ],
+            "image_center_px": [float(cpx), float(cpy)],
+            "image_center_norm": [float(cpx) / w_res, float(cpy) / h_res],
+            "projected_depth_m": float(c_depth),
+            "visible": bool(visible),
+            "occlusion": float(occlusion_pct),
+        })
+
+    print(f"  [annotations] {len(annotations)} parts visible from {camera}")
+    return {
+        "status": "ok",
+        "camera": camera,
+        "camera_path": cam_path,
+        "image_width": w_res,
+        "image_height": h_res,
+        "annotations": annotations,
+        "place_target": scan.get("place_target"),
+    }
 
 
 # ═════════════════════════════════════════════════════════════
@@ -1219,6 +1622,63 @@ async def _ik_move_to(target_xyz, orientation=None, settle_frames=SETTLE_FRAMES)
 
     ee_pos = get_world_pos(EE_PATH)
     return {"status": "ok", "target": list(target_xyz), "ee_position": ee_pos.tolist()}
+
+
+async def _cartesian_pose_move(target_pos, target_ori, step_size=0.04,
+                                stream_frames=None):
+    """Move EE to (x, y, z) target via Cartesian micro-steps in full 3D.
+
+    Generalises ``_retract_cartesian_up`` for arbitrary XYZ moves.
+    Each step is warm-started from the previous IK solution so the
+    solver stays in the same joint-space configuration family —
+    prevents shoulder-flip / elbow-up contortions on long XY hops.
+    Used by /api/approach when ``cartesian: True`` is set in payload
+    (scan-pose move + per-pick realign).
+
+    Returns ``(ok, ee_position)``.
+    """
+    import omni.kit.app
+    from isaacsim.core.utils.types import ArticulationAction
+
+    frames_per_step = stream_frames if stream_frames is not None else STREAM_FRAMES
+    target_pos = np.asarray(target_pos, dtype=np.float64)
+    current_ee = get_world_pos(EE_PATH)
+    delta = target_pos - current_ee
+    dist = float(np.linalg.norm(delta))
+    if dist < 0.005:
+        return True, current_ee.tolist()
+
+    n_steps = max(2, int(np.ceil(dist / step_size)))
+    warm = _get_warm_start()
+    last_action = None
+
+    for step in range(1, n_steps + 1):
+        frac = step / n_steps
+        step_pos = current_ee + delta * frac
+        action, ok = ik_solve(STATE.lula_solver, STATE.target_frame,
+                              step_pos, target_ori, warm)
+        if not ok:
+            print(f"  [CART_POSE] IK failed at step {step}/{n_steps} "
+                  f"pos={step_pos.tolist()} — stopping here")
+            return False, get_world_pos(EE_PATH).tolist()
+        targets = apply_arm_joints(STATE.robot, STATE.dof_names,
+                                    STATE.arm_names, action)
+        STATE.robot.apply_action(ArticulationAction(joint_positions=targets))
+        for _ in range(frames_per_step):
+            await omni.kit.app.get_app().next_update_async()
+        warm = action
+        last_action = action
+
+    # Final settle at exact target
+    final_action, final_ok = ik_solve(STATE.lula_solver, STATE.target_frame,
+                                       target_pos, target_ori, warm)
+    if final_ok:
+        targets = apply_arm_joints(STATE.robot, STATE.dof_names,
+                                    STATE.arm_names, final_action)
+        STATE.robot.apply_action(ArticulationAction(joint_positions=targets))
+    for _ in range(SETTLE_FRAMES):
+        await omni.kit.app.get_app().next_update_async()
+    return final_ok, get_world_pos(EE_PATH).tolist()
 
 
 async def _retract_cartesian_up(target_z, x, y, locked_ori,
@@ -1477,30 +1937,111 @@ async def _move_gantry_x(target_x, finger_hold=None, hold_ee_pos=None):
 
 
 async def _approach_target(params):
-    """Move arm near target XYZ at safe height (for depth camera inspection).
+    """Move arm near target XYZ.
 
-    All coordinates come from VLM + depth projection — no USD prim paths.
-    The workflow engine already resolved image coords to world XYZ via
-    the /api/project_to_world endpoint before calling this.
+    Two modes (selected by ``raw_z`` in the payload):
+
+    * ``raw_z=False`` (default, pick-approach): adds a safety buffer
+      ``BOX_ENTRY_MARGIN + BOX_HEIGHT + GRIPPER_TCP_OFFSET + 0.10``
+      to the requested z so the gripper hovers safely above a bin wall
+      before the descent sequence takes over.
+
+    * ``raw_z=True`` (pose move): the requested z is sent to IK
+      verbatim. Used by the wrist-scan pipeline to park the ee_link
+      at an exact world height for camera framing or gantry
+      re-alignment, with no buffering and no restriction.
+
+    All coordinates come from the workflow engine — either USD prim
+    bbox lookups (bin/tray) or VLM + depth projection (parts).
     """
     x = params.get("x", 0.3)
     y = params.get("y", 0.0)
     z = params.get("z", 0.5)
+    raw_z = bool(params.get("raw_z", False))
+    cartesian = bool(params.get("cartesian", False))
+    orientation = params.get("orientation")  # optional [w, x, y, z]
 
-    # Stay high: BOX_ENTRY_MARGIN above bin rim, not inside it
-    safe_z = z + BOX_ENTRY_MARGIN + BOX_HEIGHT + GRIPPER_TCP_OFFSET + 0.10
+    if raw_z:
+        target_z = z
+    else:
+        target_z = z + BOX_ENTRY_MARGIN + BOX_HEIGHT + GRIPPER_TCP_OFFSET + 0.10
 
-    # Move gantry to EXACT part X first, then update base pose
+    # Move gantry to EXACT target X first, then update base pose
     await _move_gantry_x(x)
     _update_base_pose()
 
-    # Move arm to safe height above target XY
-    result = await _ik_move_to([x, y, safe_z])
+    if orientation is not None:
+        try:
+            ori = normalize_quat(orientation)
+        except Exception as e:
+            return {"error": f"Invalid orientation {orientation}: {e}"}
+    else:
+        ori = normalize_quat(DOWNWARD_ORIENTATION)
+
+    if cartesian:
+        # Step-by-step Cartesian motion — keeps the arm in the same
+        # joint-space configuration family across long XY hops, so
+        # the IK solver doesn't flip into a shoulder-up / elbow-back
+        # pose halfway through.
+        ok, ee_pos = await _cartesian_pose_move(
+            [x, y, target_z], ori)
+        if not ok:
+            return {"error": f"Cartesian IK failed for target "
+                             f"[{x}, {y}, {target_z}]"}
+        return {"status": "ok", "action": "approach",
+                "target": [x, y, target_z], "ee_position": ee_pos,
+                "mode": "cartesian"}
+
+    result = await _ik_move_to([x, y, target_z], orientation=ori)
     if "error" in result:
         return result
 
     return {"status": "ok", "action": "approach",
-            "target": [x, y, z], "ee_position": result["ee_position"]}
+            "target": [x, y, target_z], "ee_position": result["ee_position"]}
+
+
+async def _realign_gantry_hold_ee(params):
+    """Slide the gantry to ``params['x']`` while holding the
+    end-effector locked at its current world position.
+
+    Used by the workflow's depth-verify-and-realign step: depth
+    refines the part XY by a few cm, the gantry needs to nudge
+    along X to put the wrist exactly above the corrected target,
+    but we don't want the EE to swing up or sideways during the
+    nudge — the wrist should stay parked on its current vantage
+    so the next Cartesian descent enters the bin compartment from
+    the same pose we just confirmed visually.
+
+    Implements this with `_move_gantry_x(target_x, hold_ee_pos=ee_now)`
+    which interpolates the gantry in micro-steps while solving IK
+    against a base pose that shifts by exactly the gantry delta —
+    arm joints compensate analytically per step.
+    """
+    if not STATE.is_ready:
+        return {"error": "Not ready"}
+    if not STATE.ik_ready:
+        return {"error": "IK solver not initialised"}
+
+    target_x = params.get("x")
+    if target_x is None:
+        return {"error": "Missing 'x' in payload"}
+
+    ee_before = get_world_pos(EE_PATH).copy()
+    await _move_gantry_x(float(target_x), hold_ee_pos=ee_before)
+    _update_base_pose()
+    ee_after = get_world_pos(EE_PATH)
+
+    drift = float(np.linalg.norm(ee_after - ee_before))
+    print(f"  [REALIGN] gantry → x={target_x:.3f}; "
+          f"EE drift = {drift*1000:.1f} mm")
+    return {
+        "status": "ok",
+        "action": "realign_gantry_hold_ee",
+        "target_x": float(target_x),
+        "ee_before": ee_before.tolist(),
+        "ee_after":  ee_after.tolist(),
+        "ee_drift_m": drift,
+    }
 
 
 def _pick_z_positions(z):
@@ -2412,8 +2953,14 @@ async def _process_commands_loop():
                 result = await _execute_plan(cmd["plan"])
             elif action == "scan_scene_parts":
                 result = await _scan_scene_parts()
+            elif action == "scene_annotations":
+                result = await _get_scene_annotations(cmd.get("camera", "rgb"))
+            elif action == "compute_prim_center":
+                result = await _compute_prim_center(cmd.get("prim_path", ""))
             elif action == "approach":
                 result = await _approach_target(cmd.get("params", {}))
+            elif action == "realign_gantry_hold_ee":
+                result = await _realign_gantry_hold_ee(cmd.get("params", {}))
             elif action == "pick_object_ik":
                 result = await _pick_object_ik(cmd.get("params", {}))
             elif action == "pick_descend":
