@@ -32,6 +32,7 @@ from PIL import Image
 
 from knowledge.parts_catalogue import (
     detector_queries,
+    detector_query_list,
     format_catalogue_for_prompt,
 )
 from perception.depth_estimator import DepthEstimator
@@ -195,57 +196,69 @@ RESPOND ONLY WITH VALID JSON:
 #   - exact JSON schema with bbox_norm baked in
 #   - 4 short rules
 def bin_zoom_prompt_qwen_minimal(image_w: int = 0, image_h: int = 0) -> str:
-    """Qwen-minimal bin-zoom prompt using Qwen3-VL's native 0-1000
-    grounding grid.
+    """Qwen3-VL grounding prompt tuned to engage the model's trained
+    grounding pathway (vs. captioning).
 
-    Qwen3-VL emits bbox coordinates in a normalised 0-1000 grid that is
-    INDEPENDENT of input image size — this is the convention the model
-    is trained on for visual grounding tasks. We use ``bbox_2d`` as the
-    JSON field name to match Qwen3-VL's documented JSON-grounding
-    examples, which gives us the highest hit-rate on the model's
-    grounding pathway (vs. asking for a custom field like "bbox_pixels"
-    which the model will fill but with weaker spatial reasoning).
+    Three deliberate choices match Qwen3-VL's RefCOCO/+/g training
+    distribution:
 
-    The (image_w, image_h) parameters are kept for API compatibility but
-    are no longer baked into the prompt — they're irrelevant to the
-    0-1000 grid.
+    1. Opens with **"Locate every"** — the grounding trigger phrase.
+       "Identify" / "describe" engages the captioning pathway and
+       gives loose boxes; "Locate" / "Outline the position of" engages
+       grounding and gives tight boxes.
+    2. **bbox_2d first** in each object dict — Qwen emits fields in
+       order and leading fields get the most attention budget. Putting
+       the bbox first maximises grounding precision; trailing fields
+       (label, affordance, …) cost almost nothing once the box is set.
+    3. **0-1000 grid** — Qwen3-VL's native, image-size-invariant
+       grounding coordinate system.
+
+    The (image_w, image_h) parameters are kept for API compatibility
+    but unused — the 0-1000 grid is dimension-independent.
     """
-    return """You see an overhead image of an industrial parts bin.
-Identify EVERY visible part and locate it with a tight 2D bounding box.
+    return """Locate every mechanical part in this overhead image of an industrial parts bin and output a tight 2D bounding box for each one.
 
-Part types (use the EXACT label string):
-- "large_gear":  flat black circular disc (the only BLACK part)
-- "small_hinge": tiny silver flat plate with TWO small holes
+LABEL VOCABULARY (use the EXACT label string):
+- "large_gear":  flat BLACK circular disc (the only BLACK part type)
+- "small_hinge": TINY silver flat plate with TWO small holes
 - "motor_valve": large silver bulky body with ONE large hole through the middle
 
-Output ONLY this JSON (no markdown, no commentary, no backticks):
+OUTPUT ONLY this JSON (no markdown, no commentary, no backticks):
 {
   "detected_objects": [
     {
-      "object_id": "obj_1",
+      "bbox_2d": [x_min, y_min, x_max, y_max],
       "label": "large_gear",
+      "object_id": "obj_1",
       "semantic_description": "black flat disc",
       "affordance": "graspable",
-      "bbox_2d": [x_min, y_min, x_max, y_max],
       "confidence": 0.95
     }
-  ],
-  "scene_summary": "brief one-line description"
+  ]
 }
 
-Rules:
-- bbox_2d uses your standard normalised grounding coordinates in the
-  range [0, 1000]: (0, 0) = top-left, (1000, 1000) = bottom-right.
-  Format: [x_min, y_min, x_max, y_max] with integer values.
-- Each box must be TIGHT around the visible part silhouette — no padding,
-  no bin walls, no shadows. The robot picks from the box centre.
-- Each visible part gets ITS OWN box — do not merge instances. There are
-  usually 3 of each type, sometimes more.
+GROUNDING RULES (most important — affects whether the robot grasps the part):
+- bbox_2d uses your standard normalised grounding coordinates in [0, 1000]
+  where (0, 0) = top-left, (1000, 1000) = bottom-right. Integer values.
+- Each box must wrap ONLY the visible silhouette of ONE part. The four
+  edges must TOUCH the part — no padding, no bin walls, no shadows,
+  no neighbouring parts.
+- Every visible instance gets ITS OWN box. Two boxes must NEVER share
+  the same x_min OR the same y_min — even when parts are the same type
+  and clustered together, their pixel positions ARE different. Look
+  carefully at each instance's actual centre before writing its bbox.
+- Different instances must NOT overlap heavily — if two parts touch,
+  the boxes share at most a thin edge.
+
+LABELLING RULES:
 - Use ONLY the three labels above. Never invent new labels.
-- If a black round part is visible → it is "large_gear" (no other black parts exist).
-- If a silver part has a hole big enough to see through → "motor_valve".
-- If a silver part is tiny and flat with two small holes → "small_hinge".
-- affordance is always "graspable" for these parts."""
+- BLACK round → always "large_gear" (no other black parts exist).
+- Silver with a large through-hole → "motor_valve".
+- Silver tiny flat plate with two small holes → "small_hinge".
+- affordance is always "graspable" for these parts.
+
+Detect EVERY visible part regardless of type. Do not skip parts to keep
+the response short — the robot needs the complete scene."""
 
 
 # Backwards-compat alias so existing callers (e.g. diagnose_qwen.py)
@@ -658,14 +671,30 @@ class KittingWorkflowEngine:
                 if target_parts:
                     objects = scene.get("detected_objects", [])
                     kept, dropped = [], []
+                    target_cats = [
+                        self._label_category(t) for t in target_parts]
+                    log.info(
+                        f"[Target-filter] target={target_parts} "
+                        f"(category roots={target_cats})")
                     for obj in objects:
+                        raw_label = obj.get("label", "?")
+                        label_cat = self._label_category(raw_label)
                         if obj.get("affordance") == "destination":
                             kept.append(obj)
                             continue
-                        if self._labels_match_target([obj], target_parts):
+                        matched = self._labels_match_target(
+                            [obj], target_parts)
+                        if matched:
                             kept.append(obj)
+                            log.info(
+                                f"  [Target-filter] KEEP '{raw_label}' "
+                                f"(category='{label_cat}')")
                         else:
-                            dropped.append(obj.get("label", "?"))
+                            dropped.append(raw_label)
+                            log.info(
+                                f"  [Target-filter] DROP '{raw_label}' "
+                                f"(category='{label_cat}') — no match "
+                                f"vs {target_cats}")
                     scene["detected_objects"] = kept
                     if dropped:
                         log.info(
@@ -1092,15 +1121,21 @@ class KittingWorkflowEngine:
             prompt = bin_zoom_prompt_qwen_minimal()
             log.info(f"[Bin-zoom] Qwen target image size: {qw}x{qh} "
                      f"(crop {cw}x{ch}); bbox grid = 0-1000")
+            # Deliberately DO NOT append "operator is looking for X" for
+            # the Qwen path. That hint biases Qwen toward emitting only
+            # that label and stopping early — we observed it returning
+            # 3 gears and skipping the visible hinges + motor_valves.
+            # The downstream [Target-filter] step filters by label after
+            # detection, so the biasing isn't needed.
         else:
             prompt = _with_catalogue(BIN_ZOOM_PROMPT)
-        if target_parts:
-            prompt = (
-                prompt
-                + "\n\nIMPORTANT: The operator is looking for: "
-                + ", ".join(target_parts).replace("_", " ")
-                + ". Use the matching label string from above."
-            )
+            if target_parts:
+                prompt = (
+                    prompt
+                    + "\n\nIMPORTANT: The operator is looking for: "
+                    + ", ".join(target_parts).replace("_", " ")
+                    + ". Use the matching label string from above."
+                )
 
         try:
             # Full-frame overhead → default 1024 max_size is plenty
@@ -1136,14 +1171,44 @@ class KittingWorkflowEngine:
                 f"[Bin-zoom] Qwen self-grounding: {len(detector_dets)} "
                 f"bboxes from {len(objects)} objects "
                 f"(qwen_size={qwen_size}, crop={cw}x{ch})")
-        elif self._detector.is_available and vlm_labels:
+        elif self._detector.is_available:
+            # Build OWL queries from the FULL catalogue (always) plus any
+            # extra labels Gemma4 reported that aren't catalogued. The
+            # full-catalogue sweep is the safety net for when Gemma4 misses
+            # parts entirely — OWL still finds them and we synthesise the
+            # missing scene entries below.
+            #
+            # Each catalogue entry can declare MULTIPLE alternative
+            # detector_queries — OWL batches them all in one forward
+            # pass, so multiple phrasings per part is essentially free
+            # and dramatically improves recall (OWL responds inconsistently
+            # to phrasing).
             try:
-                simplified = self._simplify_detector_labels(vlm_labels)
+                cat_q_list = detector_query_list()  # {canonical: [q1, q2, ...]}
+                queries = []
+                seen = set()
+                for canonical, qs in cat_q_list.items():
+                    for q in qs:
+                        k = q.lower().strip()
+                        if k and k not in seen:
+                            seen.add(k)
+                            queries.append(q)
+                cat_query_count = len(queries)
+                # Add any Gemma4 labels that aren't in the catalogue
+                # (legacy behaviour for "unknown"-style labels).
+                if vlm_labels:
+                    extra = self._simplify_detector_labels(vlm_labels)
+                    for q in extra:
+                        if q and q.lower().strip() not in seen:
+                            queries.append(q)
+                            seen.add(q.lower().strip())
                 detector_dets = self._detector.detect_with_labels(
-                    cropped, simplified)
+                    cropped, queries)
                 log.info(
                     f"[Bin-zoom] OWL-ViT2: {len(detector_dets)} "
-                    f"bboxes from {len(simplified)} queries")
+                    f"bboxes from {len(queries)} queries "
+                    f"(catalogue={cat_query_count}, "
+                    f"extra={len(queries) - cat_query_count})")
             except Exception as e:
                 log.warning(f"[Bin-zoom] Detector failed: {e}")
                 detector_dets = []
@@ -1156,11 +1221,106 @@ class KittingWorkflowEngine:
         # ── Greedy 1-to-1 assignment of bboxes to VLM objects ──
         # Each bbox is used by AT MOST ONE object. Stops every
         # `large_gear_1/2/3` from collapsing to the same "best" bbox.
-        bbox_assignment = self._assign_detector_bboxes(
+        bbox_assignment, used_det_idxs = self._assign_detector_bboxes(
             objects, detector_dets, cw, ch, bin_crop_box)
         log.info(
             f"[Bin-zoom] Assigned {len(bbox_assignment)}/{len(objects)} "
             f"VLM objects to unique bboxes ({detector_mode})")
+
+        # ── Detector safety net: synthesise objects for OWL hits that
+        # NO VLM detection claimed.  When Gemma4 misses parts entirely
+        # (e.g. returns 2 small_hinges and skips the gears), OWL still
+        # finds the gears via the catalogue queries — we recover those
+        # by inferring the canonical label from the query → catalogue
+        # reverse map and adding a synthetic scene object.
+        # Only runs on the OWL path (not Qwen self-grounding) and is
+        # gated by perception.detector_finds_missed_parts (default true).
+        synth_enabled = (
+            (not use_vlm_grounding)
+            and self._detector.is_available
+            and self.config.get("perception", {})
+                .get("detector_finds_missed_parts", True))
+        if synth_enabled and detector_dets:
+            # Normalise both query keys and OWL det labels to a common
+            # form (lowercase, underscores → spaces). OWL-ViT2 emits
+            # ``flat_black_circular_disc`` while the catalogue stores
+            # ``flat black circular disc`` — without this the lookup
+            # would always miss and synthesis wouldn't fire.
+            import re as _re_synth
+            def _norm_q_synth(s):
+                return _re_synth.sub(
+                    r"\s+", " ",
+                    (s or "").replace("_", " ").lower()).strip()
+            try:
+                cat_q_list_synth = detector_query_list()
+                query_to_canonical = {}
+                for canonical, qs in cat_q_list_synth.items():
+                    for q in qs:
+                        query_to_canonical[_norm_q_synth(q)] = canonical
+            except Exception:
+                query_to_canonical = {}
+
+            cx_min, cy_min, cx_max, cy_max = bin_crop_box
+            cw_norm_ = cx_max - cx_min
+            ch_norm_ = cy_max - cy_min
+            synth_count = 0
+            for di, det in enumerate(detector_dets):
+                if di in used_det_idxs:
+                    continue
+                det_label = _norm_q_synth(det.get("label") or "")
+                bbox = det.get("bbox")
+                if not (isinstance(bbox, (list, tuple)) and len(bbox) == 4):
+                    continue
+                # Only synthesise from queries that map to a known
+                # catalogue part type. OWL hits on Gemma4-only "extra"
+                # queries are skipped — they don't have a canonical label.
+                canonical = query_to_canonical.get(det_label)
+                if not canonical:
+                    continue
+                try:
+                    x1, y1, x2, y2 = [float(v) for v in bbox]
+                except (TypeError, ValueError):
+                    continue
+                if x2 <= x1 or y2 <= y1:
+                    continue
+
+                # Crop pixels → full-image normalised
+                nx1 = cx_min + (x1 / cw) * cw_norm_
+                ny1 = cy_min + (y1 / ch) * ch_norm_
+                nx2 = cx_min + (x2 / cw) * cw_norm_
+                ny2 = cy_min + (y2 / ch) * ch_norm_
+                # Crop-relative normalised bbox centre for image_position
+                cx_norm = ((x1 + x2) / 2.0) / max(cw, 1)
+                cy_norm = ((y1 + y2) / 2.0) / max(ch, 1)
+
+                synth_count += 1
+                conf = float(det.get("confidence", 0.0))
+                # 0.9 weight to mark this as detector-only (slightly less
+                # trustworthy than VLM+detector agreement).
+                obj = {
+                    "object_id": f"obj_synth_{synth_count}",
+                    "label": canonical,
+                    "semantic_description":
+                        f"{canonical} (detector-only synthesis)",
+                    "affordance": "graspable",
+                    "image_position": {"x": cx_norm, "y": cy_norm},
+                    "confidence": min(1.0, conf * 0.9),
+                    "_synth_from_detector": True,
+                }
+                obj_idx = len(objects)
+                objects.append(obj)
+                bbox_assignment[obj_idx] = (nx1, ny1, nx2, ny2)
+                log.info(
+                    f"  [Synth] {canonical} from OWL '{det_label}' "
+                    f"(conf={conf:.2f}) → bbox_full=("
+                    f"{nx1:.3f},{ny1:.3f},{nx2:.3f},{ny2:.3f})")
+            if synth_count:
+                log.info(
+                    f"[Bin-zoom] Detector safety net synthesised "
+                    f"{synth_count} parts from unclaimed OWL hits")
+                # Keep scene["detected_objects"] in sync so downstream
+                # code (overlay rendering, target filter) sees them.
+                scene["detected_objects"] = objects
 
         # Drop VLM detections that didn't get a detector bbox match.
         # Without a bbox, depth projection runs on the VLM's guessed
@@ -1235,6 +1395,36 @@ class KittingWorkflowEngine:
                     f"  [GT-label] '{obj.get('label', '?')}' ↔ "
                     f"{gt_match.get('name', '?')} "
                     f"(part_type={gt_match.get('part_type', '?')})")
+
+        # ── Optional: per-instance crop-and-zoom refinement with Qwen ──
+        # First-pass grounding can be loose when N similar parts cluster
+        # in one region (Qwen's vision tokens span 28x28 patches; a few
+        # gears within ~150 px collapse to the same patch coords). The
+        # refinement step crops a 2x area around each rough bbox and
+        # re-queries Qwen with a single-instance grounding prompt
+        # ("Outline the position of the {label}"). Qwen's RefCOCO-trained
+        # pathway is far more precise when there's exactly one target
+        # in view. Costs N extra Qwen calls per scan, so it's gated by
+        # ``perception.refine_with_crop_zoom`` (default false).
+        refine_cfg = (self.config.get("perception", {})
+                      .get("refine_with_crop_zoom", False))
+        if refine_cfg and use_vlm_grounding:
+            n_to_refine = sum(1 for o in objects
+                              if o.get("_detector_bbox_full"))
+            log.info(
+                f"[Refine] Per-instance crop-and-zoom ON; "
+                f"re-querying Qwen on {n_to_refine} parts")
+            for obj in objects:
+                bbox_full = obj.get("_detector_bbox_full")
+                if not bbox_full:
+                    continue
+                refined = self._refine_bbox_with_qwen(
+                    overhead_image, obj.get("label", ""), bbox_full)
+                if refined is not None:
+                    obj["_detector_bbox_full"] = refined
+                    cx = (refined[0] + refined[2]) / 2.0
+                    cy = (refined[1] + refined[3]) / 2.0
+                    obj["image_position"] = {"x": cx, "y": cy}
 
         # Per-part surface_z hint passed to the bridge's geometric
         # ray-plane fallback. The depth buffer is the primary path —
@@ -1489,6 +1679,124 @@ class KittingWorkflowEngine:
                 return top
         return None
 
+    def _refine_bbox_with_qwen(self, overhead_image, label: str,
+                               bbox_full: tuple,
+                               crop_margin_frac: float = 0.5):
+        """Re-query Qwen on a tightly cropped region around an existing
+        detection to get a more precise bbox.
+
+        Qwen3-VL is significantly more accurate at single-instance
+        grounding (RefCOCO-trained "outline the position of X" pathway)
+        than at multi-instance scene grounding. By cropping to a 2x
+        region around the rough bbox and asking for just one part, we
+        engage that pathway and get a tight box.
+
+        Parameters
+        ----------
+        overhead_image : PIL.Image
+            The full overhead RGB image.
+        label : str
+            The part label (e.g. ``"large_gear"``).
+        bbox_full : tuple
+            ``(nx1, ny1, nx2, ny2)`` normalised to [0, 1] in the full
+            image — the rough first-pass bbox.
+        crop_margin_frac : float
+            Margin to add on each side of the rough bbox, as a fraction
+            of the rough bbox width/height. ``0.5`` doubles the bbox
+            area, giving Qwen room to find the true edges.
+
+        Returns
+        -------
+        tuple or None
+            Refined ``(nx1, ny1, nx2, ny2)`` normalised to [0, 1] in
+            the full image, or ``None`` if refinement failed (Qwen
+            error, malformed bbox, degenerate geometry, etc.). On None
+            the caller keeps the rough bbox.
+        """
+        from PIL import Image as _PILImage
+
+        W, H = overhead_image.size
+        nx1, ny1, nx2, ny2 = bbox_full
+        rx1, ry1 = nx1 * W, ny1 * H
+        rx2, ry2 = nx2 * W, ny2 * H
+        bw, bh = rx2 - rx1, ry2 - ry1
+        if bw <= 0 or bh <= 0:
+            return None
+        cx1 = max(0, int(round(rx1 - bw * crop_margin_frac)))
+        cy1 = max(0, int(round(ry1 - bh * crop_margin_frac)))
+        cx2 = min(W, int(round(rx2 + bw * crop_margin_frac)))
+        cy2 = min(H, int(round(ry2 + bh * crop_margin_frac)))
+        crop_w_px = cx2 - cx1
+        crop_h_px = cy2 - cy1
+        if crop_w_px < 28 or crop_h_px < 28:
+            # Too small for Qwen's 28x28 vision-patch grid.
+            return None
+        crop_img = overhead_image.crop((cx1, cy1, cx2, cy2))
+
+        prompt = (
+            f"Outline the position of the {label} in this image.\n"
+            "Output ONLY this JSON (no markdown, no commentary):\n"
+            "{\"bbox_2d\": [x_min, y_min, x_max, y_max]}\n"
+            "Use your standard normalised grounding coordinates in "
+            "[0, 1000]: (0,0)=top-left, (1000,1000)=bottom-right. "
+            "Make the box TIGHT around the visible silhouette of the "
+            f"{label} only — no padding, no surrounding bin walls."
+        )
+        try:
+            result = self.vlm.analyze_raw(crop_img, prompt)
+        except Exception as e:
+            log.warning(f"[Refine] {label}: Qwen call failed: {e}")
+            return None
+
+        bb = (result.get("bbox_2d")
+              or result.get("bbox_pixels")
+              or result.get("bbox"))
+        if not (isinstance(bb, (list, tuple)) and len(bb) == 4):
+            log.warning(
+                f"[Refine] {label}: no bbox_2d in response keys="
+                f"{list(result.keys()) if isinstance(result, dict) else type(result).__name__}")
+            return None
+        try:
+            x1, y1, x2, y2 = [float(v) for v in bb]
+        except (ValueError, TypeError):
+            log.warning(f"[Refine] {label}: invalid bbox values: {bb}")
+            return None
+
+        # Decode coord frame using the same rules as _extract_vlm_bboxes.
+        mx = max(abs(x1), abs(x2), abs(y1), abs(y2))
+        if mx <= 1.5:
+            f1, g1, f2, g2 = x1, y1, x2, y2  # already 0-1 fractional
+            frame = "norm"
+        elif mx <= 1005:
+            f1, g1 = x1 / 1000.0, y1 / 1000.0
+            f2, g2 = x2 / 1000.0, y2 / 1000.0
+            frame = "qwen_1000"
+        else:
+            f1, g1 = x1 / max(crop_w_px, 1), y1 / max(crop_h_px, 1)
+            f2, g2 = x2 / max(crop_w_px, 1), y2 / max(crop_h_px, 1)
+            frame = "crop_px"
+
+        if f2 <= f1 or g2 <= g1:
+            return None
+
+        # crop-fractional → crop pixels → full-image pixels → full-image normalised
+        new_rx1 = cx1 + f1 * crop_w_px
+        new_ry1 = cy1 + g1 * crop_h_px
+        new_rx2 = cx1 + f2 * crop_w_px
+        new_ry2 = cy1 + g2 * crop_h_px
+        refined = (new_rx1 / W, new_ry1 / H,
+                   new_rx2 / W, new_ry2 / H)
+
+        log.info(
+            f"[Refine] {label}: rough_full=("
+            f"{nx1:.3f},{ny1:.3f},{nx2:.3f},{ny2:.3f}) → "
+            f"crop=({cx1},{cy1},{cx2},{cy2}) bbox_2d=("
+            f"{x1:.0f},{y1:.0f},{x2:.0f},{y2:.0f}) frame={frame} → "
+            f"refined_full=("
+            f"{refined[0]:.3f},{refined[1]:.3f},"
+            f"{refined[2]:.3f},{refined[3]:.3f})")
+        return refined
+
     @staticmethod
     def _is_self_grounding_vlm(provider: str) -> bool:
         """Return True for VLMs that can emit tight bboxes natively
@@ -1624,13 +1932,32 @@ class KittingWorkflowEngine:
             label = (obj.get("label") or "").lower()
             base = _re.sub(r"_\d+$", "", label).strip()
 
+            # Sanity flags: a box that covers more than ~30% of the
+            # image area is almost always Qwen falling back to "I'm
+            # not sure, here's the whole region". A box outside [0,
+            # 1000] in the raw values means Qwen ignored the grid
+            # contract. Both are kept (the assignment may still pick
+            # them) but logged so unexpected drift is visible.
+            crop_area = max(crop_w * crop_h, 1)
+            box_area = max((px2 - px1) * (py2 - py1), 1.0)
+            area_frac = box_area / crop_area
+            warn_flags = []
+            if area_frac > 0.30:
+                warn_flags.append(f"LARGE({area_frac*100:.0f}% of image)")
+            mx_raw = max(abs(x1), abs(x2), abs(y1), abs(y2))
+            mn_raw = min(x1, x2, y1, y2)
+            if frame == "qwen_1000" and (mx_raw > 1005 or mn_raw < -5):
+                warn_flags.append(f"OUT_OF_GRID(raw_min={mn_raw:.0f}, "
+                                  f"raw_max={mx_raw:.0f})")
+
             # Diagnostic: one line per object so a coord-frame mismatch
             # is obvious in the logs.
+            tag = (" ⚠ " + " ".join(warn_flags)) if warn_flags else ""
             log.info(
                 f"[Qwen-bbox] {label}: raw={source}=({x1:.1f},"
                 f"{y1:.1f},{x2:.1f},{y2:.1f}) frame={frame} "
                 f"qwen=({qw}x{qh}) crop=({crop_w}x{crop_h}) → "
-                f"crop_px=({px1:.0f},{py1:.0f},{px2:.0f},{py2:.0f})")
+                f"crop_px=({px1:.0f},{py1:.0f},{px2:.0f},{py2:.0f}){tag}")
 
             # Overwrite image_position with crop-normalised bbox centre
             # so the downstream loop has a clean target. Qwen's own
@@ -1673,21 +2000,35 @@ class KittingWorkflowEngine:
 
         Returns
         -------
-        dict
+        tuple
+            ``(assignment, used_det_indices)`` where ``assignment`` is
             ``{obj_index: (nx1, ny1, nx2, ny2)}`` with bbox in full-image
-            normalised coordinates. Objects without a viable bbox match
-            are absent from the dict (caller falls back to VLM position).
+            normalised coordinates (objects without a viable bbox match
+            are absent), and ``used_det_indices`` is the set of indices
+            into ``detector_dets`` that were claimed. The caller can use
+            ``set(range(len(detector_dets))) - used`` to find OWL hits
+            that no VLM object claimed — those are candidates for being
+            synthesised into the scene as detector-only detections.
         """
         if not objects or not detector_dets:
-            return {}
+            return {}, set()
 
         import re as _re
-        # Reverse-map: "flat black circular disc" → "large_gear"
-        cat_queries = detector_queries()
-        query_to_canonical = {
-            q.lower().strip(): canonical
-            for canonical, q in cat_queries.items()
-        }
+        # Reverse-map: every detector query variant → canonical part type.
+        # Normalise both sides (underscores ↔ spaces) — OWL-ViT2 returns
+        # labels like ``flat_black_circular_disc`` while the catalogue
+        # stores queries like ``flat black circular disc``. Without this
+        # normalisation the canonical match never fires. Each canonical
+        # part may declare MULTIPLE alternative queries; all variants
+        # map to the same canonical here.
+        def _norm_q(s):
+            return _re.sub(r"\s+", " ",
+                           (s or "").replace("_", " ").lower()).strip()
+        cat_queries_list = detector_query_list()
+        query_to_canonical = {}
+        for canonical, qs in cat_queries_list.items():
+            for q in qs:
+                query_to_canonical[_norm_q(q)] = canonical
 
         candidates = []  # (score, obj_idx, det_idx)
         for oi, obj in enumerate(objects):
@@ -1703,9 +2044,12 @@ class KittingWorkflowEngine:
             except (TypeError, ValueError):
                 obj_px = obj_py = None
             for di, det in enumerate(detector_dets):
-                det_label = (det.get("label") or "").lower().strip()
-                if not det_label:
+                det_label_raw = (det.get("label") or "").lower().strip()
+                if not det_label_raw:
                     continue
+                # Normalised form for catalogue lookup (handles
+                # OWL's underscore vs catalogue's space convention).
+                det_label = _norm_q(det_label_raw)
                 conf = float(det.get("confidence", 0.0))
                 det_cx = det_cy = None
                 bbox = det.get("bbox")
@@ -1718,7 +2062,7 @@ class KittingWorkflowEngine:
                         det_cx = det_cy = None
                 # Direct canonical match (self-grounding VLM path):
                 # det["label"] is already the canonical part type.
-                if det_label == vlm_base and det_label:
+                if det_label_raw == vlm_base and det_label_raw:
                     score = 10.0 + conf
                     if obj_px is not None and det_cx is not None:
                         dist = ((obj_px - det_cx) ** 2 + (obj_py - det_cy) ** 2) ** 0.5
@@ -1764,7 +2108,7 @@ class KittingWorkflowEngine:
             nx2 = cx_min + (x2 / crop_w) * cw_norm
             ny2 = cy_min + (y2 / crop_h) * ch_norm
             out[oi] = (nx1, ny1, nx2, ny2)
-        return out
+        return out, set(assignment.values())
 
     def _zoomed_bin_analysis(self, full_image, scene: dict):
         """Stage 2: Re-analyze just the bin area at higher resolution.
@@ -2206,33 +2550,71 @@ class KittingWorkflowEngine:
         return matches
 
     @staticmethod
+    def _label_category(text: str) -> str:
+        """Reduce a label or target string to its category root.
+
+        Catalogue entries are ``<adjective>_<noun>`` form where the noun
+        is the part category (``gear``, ``valve``, ``hinge``, ``box``,
+        ``plate``, ``hose``, ``plug``, ``tube``, ...). We take the last
+        underscore-separated word as the category, after stripping the
+        trailing instance number (``_1``, ``_2``).
+
+        ``"large_gear"``  → ``"gear"``
+        ``"motor_valve_2"`` → ``"valve"``
+        ``"small_hinge"`` → ``"hinge"``
+        ``"gear"``        → ``"gear"``
+        ``"gears"``       → ``"gears"`` (caller plural-strips if needed)
+        """
+        if not text:
+            return ""
+        norm = text.lower().replace(" ", "_").strip()
+        norm = re.sub(r"_\d+$", "", norm)
+        parts = [p for p in norm.split("_") if p]
+        if not parts:
+            return ""
+        cat = parts[-1]
+        # Singular fold so "gears" matches "gear", "valves" → "valve".
+        if len(cat) > 3 and cat.endswith("s") and not cat.endswith("ss"):
+            cat = cat[:-1]
+        return cat
+
+    @staticmethod
     def _labels_match_target(detected_objects: list,
                              target_parts: list) -> bool:
         """Check if any detected label fuzzy-matches the target.
 
-        Uses word-overlap matching so VLM labels like
-        ``silver_housing`` can still match ``silver_box``.
+        Match in priority order:
+          1. **Category match** — last-word root of label vs target,
+             with singular fold. ``"gear"`` matches ``"large_gear"``;
+             ``"valves"`` matches ``"motor_valve_2"``;
+             ``"hinge"`` matches ``"small_hinge"``.
+          2. Substring match — ``"box"`` matches ``"silver_box"``.
+          3. Word overlap — ``"silver_housing"`` matches ``"silver_box"``.
         """
         if not target_parts:
             return True  # no specific target — any detection is OK
 
-        def _canon(text: str) -> str:
-            norm = (text or "").lower().replace(" ", "_")
-            norm = re.sub(r"_\d+$", "", norm)
-            if norm in {"gear", "large_gear", "round_gear"}:
-                return "gear"
-            return norm
-
         for obj in detected_objects:
-            label = _canon(obj.get("label", ""))
-            label_words = set(label.replace("_", " ").split())
+            raw_label = (obj.get("label") or "").strip()
+            label_norm = raw_label.lower().replace(" ", "_")
+            label_norm = re.sub(r"_\d+$", "", label_norm)
+            label_cat = KittingWorkflowEngine._label_category(raw_label)
+            label_words = set(label_norm.replace("_", " ").split())
+
             for target in target_parts:
-                t_lower = _canon(target)
-                # Exact or substring match
-                if t_lower in label or label in t_lower:
+                t_norm = (target or "").lower().strip().replace(" ", "_")
+                t_norm = re.sub(r"_\d+$", "", t_norm)
+                t_cat = KittingWorkflowEngine._label_category(target)
+                t_words = set(t_norm.replace("_", " ").split())
+
+                # 1. Category root match (gear↔large_gear, valve↔motor_valve)
+                if t_cat and label_cat and t_cat == label_cat:
                     return True
-                # Word overlap (e.g. "valve" in "motor_valve")
-                t_words = set(t_lower.replace("_", " ").split())
+                # 2. Substring match (either direction)
+                if t_norm and label_norm and (
+                        t_norm in label_norm or label_norm in t_norm):
+                    return True
+                # 3. Word overlap (legacy fuzzy)
                 if t_words & label_words:
                     return True
         return False

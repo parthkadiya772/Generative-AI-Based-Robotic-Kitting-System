@@ -12,7 +12,13 @@ parts:
 
   # ── BLACK PARTS ───────────────────────────────────────────────
   large_gear:
-    detector_query: "flat black circular disc"
+    # OWL-ViT2 query alternatives. All run in one batch; the detector
+    # picks whichever phrasing matches each instance best. Different
+    # phrasings can catch different lighting / angle / clutter cases.
+    detector_queries:
+      - "flat black circular disc"
+      - "small black washer"
+      - "black rubber grommet"
     color: "solid BLACK, uniform, non-reflective"
     shape: "flat circular disc with uniform thickness — looks like a
       simple washer, rubber grommet, or small mounting plate viewed
@@ -30,7 +36,15 @@ parts:
 
   # ── SILVER PARTS — distinguished by SIZE + BORE ──────────────
   small_hinge:
-    detector_query: "small silver L-bracket"
+    # Multiple short, concrete queries — OWL responds best to natural
+    # noun phrases. ``small silver L-bracket`` tends to also match
+    # motor_valves (which look bracket-like from above), so we add
+    # alternatives that emphasise the hinge / door-hinge nature.
+    detector_queries:
+      - "small silver hinge"
+      - "small metal door hinge"
+      - "tiny silver bracket"
+      - "small silver L-bracket"
     color: "metallic SILVER, polished sheet metal"
     shape: "TINY flat sheet-metal plate, dramatically smaller than
       the motor valves. Roughly peanut / figure-8 outline with TWO
@@ -51,13 +65,20 @@ parts:
         cast bodies with a HUGE central hole you can see through"
 
   motor_valve:
-    detector_query: "silver round metal valve with central hole"
+    # ``silver round metal valve with central hole`` is too long /
+    # abstract for OWL — it returns 0 hits. Concrete real-world object
+    # names (these parts ARE engine throttle bodies) match much better.
+    detector_queries:
+      - "metal throttle body"
+      - "silver engine throttle"
+      - "silver metal valve"
+      - "silver pipe fitting with flange"
     color: "metallic SILVER cast metal, matte cast finish"
     shape: "BULKY 3D silver cast housing — the LARGEST part type in
       the bin by far. Has a HUGE round opening straight through the
       middle (the throttle bore) which you can see THROUGH. Inside
       that hole a thin horizontal SHAFT or BUTTERFLY PLATE bisects
-      the bore. Around the perimeter, several flange tabs with bolt
+      the bore. Around the perimeter, several flange tabs with FOUR bolt
       holes stick out. Looks like an engine throttle body."
     size: "LARGE — by far the biggest part type, 3-4× the footprint
       of a small_hinge"

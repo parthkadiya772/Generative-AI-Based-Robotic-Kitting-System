@@ -45,17 +45,58 @@ def known_part_types() -> List[str]:
 
 
 def detector_queries() -> Dict[str, str]:
-    """Return a ``{label: detector_query}`` map for OWL-ViT2 / Grounding-DINO.
+    """Return ``{label: first_detector_query}`` — legacy single-query API.
 
-    Each part may declare a ``detector_query`` field with a natural-language
-    phrase that the zero-shot detector understands better than the canonical
-    label key. Falls back to the label itself (with ``_`` → space) if the
-    field is missing.
+    Kept for callers that only need one query phrase per part. New code
+    should prefer :func:`detector_query_list` which returns the full
+    list. The YAML may store the queries under either:
+      - ``detector_query: "single phrase"``
+      - ``detector_queries: ["phrase one", "phrase two", ...]``
+    Falls back to the label itself (with ``_`` → space) if neither is
+    present.
     """
     out: Dict[str, str] = {}
     for label, info in load_catalogue()["parts"].items():
-        q = (info or {}).get("detector_query")
-        out[label] = q if q else label.replace("_", " ")
+        info = info or {}
+        qs = info.get("detector_queries") or info.get("detector_query")
+        if isinstance(qs, list):
+            first = next((q for q in qs if isinstance(q, str) and q), None)
+        elif isinstance(qs, str):
+            first = qs
+        else:
+            first = None
+        out[label] = first if first else label.replace("_", " ")
+    return out
+
+
+def detector_query_list() -> Dict[str, List[str]]:
+    """Return ``{label: [query1, query2, ...]}`` for OWL-ViT2 / Grounding-DINO.
+
+    Each part may declare multiple alternative detector queries — OWL
+    likes short concrete object names, but different phrasings catch
+    different scenes (``"metal throttle body"`` vs ``"silver engine
+    throttle"``). The zero-shot detector batches all queries in one
+    forward pass, so adding alternatives is essentially free.
+
+    Both YAML field names are accepted:
+      - ``detector_query: "phrase"`` — single query (legacy)
+      - ``detector_queries: ["one", "two", ...]`` — list of alternatives
+      - ``detector_queries: "single phrase"`` — also accepted as 1-elem list
+    Returns an empty list rather than raising if the part has no queries.
+    """
+    out: Dict[str, List[str]] = {}
+    for label, info in load_catalogue()["parts"].items():
+        info = info or {}
+        qs = info.get("detector_queries") or info.get("detector_query")
+        if isinstance(qs, str):
+            queries = [qs]
+        elif isinstance(qs, list):
+            queries = [q for q in qs if isinstance(q, str) and q.strip()]
+        else:
+            queries = []
+        if not queries:
+            queries = [label.replace("_", " ")]
+        out[label] = queries
     return out
 
 

@@ -237,33 +237,57 @@ def ik_solve(lula_solver, frame, pos, ori, warm):
     return action, ok
 
 
-# ── Shoulder-Pan Safety Clamp ──────────────────────────────
-# The robot is ceiling-mounted on a gantry rail (along X).
-# Lula IK has no collision awareness of the gantry structure,
-# so it can find solutions where the arm swings THROUGH the
-# red gantry rail.  We constrain shoulder_pan (joint 0) to a
-# safe range that keeps the arm reaching downward into the
-# workspace, never backward through the gantry.
+# ── Shoulder-Pan Safety Clamp (asymmetric) ─────────────────
+# The robot is ceiling-mounted on a gantry rail (along X). Lula
+# IK has no collision awareness of the gantry structure, so it
+# can find solutions where the arm swings THROUGH the red gantry
+# rail. We constrain shoulder_pan (joint 0) with an ASYMMETRIC
+# range: tight on the gantry-rail side, loose on the open side.
+# This preserves enough workspace for far-corner picks (which
+# need ~1.9 rad on the open side) while preventing rotation past
+# the rail on the gantry side.
 #
-# shoulder_pan = 0 rad → arm hangs straight down (home)
-# ±π/2 was too restrictive — IK needs ~1.9 rad for some targets.
-# ±3π/4 (135°) gives enough workspace while still preventing
-# the arm from swinging backward through the gantry (π = 180°).
+#   shoulder_pan = 0 rad → arm hangs straight down (home)
+#   shoulder_pan > 0    → arm rotates one way
+#   shoulder_pan < 0    → arm rotates the other way
+#
+# >>> WHICH SIGN IS THE GANTRY SIDE? <<<
+# If the arm collides with the rail when reaching some target:
+#   1. Look at the [IK SAFETY] log line on the run that collided.
+#      If shoulder_pan was POSITIVE near +2.3562, the gantry is on
+#      the + side → swap the signs of the two constants below.
+#      If shoulder_pan was NEGATIVE near -2.3562, the gantry is on
+#      the - side → leave as-is.
+#   2. Re-run; the clamp now fires on the gantry side.
+# A wrong guess locks IK on the safe side instead — easy to spot
+# (every approach fails IK), trivial to flip.
+#
+# Initial guess: gantry on the NEGATIVE side. Tight = -π/2 (1.57 rad);
+# loose = +3π/4 (2.36 rad). Last week's working config was symmetric
+# ±π/2; the symmetric +3π/4 broke the guard. Asymmetric splits the
+# difference: full reach on the open side, original guard on the
+# gantry side.
 
-SHOULDER_PAN_MIN = -2.3562   # -3π/4: arm reaches to one side
-SHOULDER_PAN_MAX =  2.3562   # +3π/4: arm reaches to other side
+SHOULDER_PAN_MIN = -1.5708   # tight: -π/2 (assumed gantry-side limit)
+SHOULDER_PAN_MAX =  2.3562   # loose: +3π/4 (open-side limit)
 
 
 def _clamp_shoulder_pan(ik_result):
-    """Clamp shoulder_pan joint in IK result to prevent gantry collision."""
+    """Clamp shoulder_pan joint in IK result to prevent gantry collision.
+
+    Logs whenever the clamp fires and records which side hit the limit
+    so the operator can confirm which sign is the gantry side.
+    """
     clamped = np.array(ik_result, dtype=np.float64)
     # Joint 0 in Lula's 6-joint result is shoulder_pan
     if len(clamped) > 0:
         original = clamped[0]
         clamped[0] = np.clip(clamped[0], SHOULDER_PAN_MIN, SHOULDER_PAN_MAX)
         if abs(original - clamped[0]) > 0.01:
-            print(f"  [IK SAFETY] shoulder_pan clamped: {original:.3f} → {clamped[0]:.3f} rad "
-                  f"(preventing gantry collision)")
+            side = "MIN(gantry?)" if original < SHOULDER_PAN_MIN else "MAX(open?)"
+            print(f"  [IK SAFETY] shoulder_pan clamped: {original:.3f} → "
+                  f"{clamped[0]:.3f} rad  hit={side}  "
+                  f"limits=[{SHOULDER_PAN_MIN:+.3f}, {SHOULDER_PAN_MAX:+.3f}]")
     return clamped
 
 

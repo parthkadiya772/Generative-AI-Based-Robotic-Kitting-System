@@ -105,7 +105,7 @@ class TestVLMParsing:
     def test_qwen_image_prep_resizes_to_28_multiple(self):
         """Qwen prep snaps both dims to multiples of 28 within Qwen's
         pixel budget so smart_resize is a no-op and bbox coords land in
-        the (W, H) we sent."""
+        the (W, H) we sent. Long edge cap is 1260 (45 * 28)."""
         vlm = VLMPerception({"vlm_provider": "ollama_qwen"})
         image = Image.new("RGB", (1920, 1080), color="white")
 
@@ -113,7 +113,9 @@ class TestVLMParsing:
 
         w, h = prepared.size
         assert w % 28 == 0 and h % 28 == 0
-        assert max(w, h) <= 1120
+        assert max(w, h) <= 1260
+        # Pixel budget should stay below ~1 MP for typical 16:9.
+        assert w * h <= 1_000_000
         assert vlm._last_qwen_image_size == (w, h)
 
 

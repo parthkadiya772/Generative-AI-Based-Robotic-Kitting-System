@@ -104,6 +104,25 @@ perception:
   # Set false ONLY if you trust the VLM's image_position alone.
   require_detector_bbox: true
 
+  # ── Detector safety net (OWL-ViT2 / Grounding DINO path only) ──
+  # Run OWL-ViT2 with the FULL parts_catalogue.yaml detector_queries on
+  # every scan, not just the labels Gemma4 reported. For every OWL hit
+  # that no VLM detection claimed, synthesise a scene object using the
+  # query → canonical label map. This recovers parts when the VLM (e.g.
+  # Gemma4 4B) inconsistently misses some — OWL still finds them.
+  # Disable for strict VLM-led behaviour.
+  detector_finds_missed_parts: true
+
+  # ── Per-instance Qwen crop-and-zoom refinement (Qwen-only path) ──
+  # After the first-pass scene grounding returns rough bboxes, crop a
+  # 2x area around each detection and re-query Qwen with a single-
+  # instance grounding prompt ("Outline the position of the {label}").
+  # Qwen3-VL's RefCOCO-trained pathway is far more precise when there
+  # is exactly one target in view. Costs N extra Qwen calls per scan
+  # (~30-60 s each on Ollama for 8B), so default is OFF. Enable when
+  # multi-instance grounding is loose / boxes drift / instances cluster.
+  refine_with_crop_zoom: true
+
   # ── Depth Estimation (fallback when bridge depth buffer unavailable) ──
   # NOTE: the bridge's /api/project_to_world reads the camera prim's
   # actual world transform from USD on every call — these values are

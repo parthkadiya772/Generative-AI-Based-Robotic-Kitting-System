@@ -84,13 +84,15 @@ def _default_prompt_with_catalogue() -> str:
 # Pre-resizing here makes smart_resize a no-op so the bbox lives in the
 # exact (W, H) we sent.
 def qwen_target_size(width: int, height: int,
-                     long_edge_cap: int = 1120,
+                     long_edge_cap: int = 1260,
                      patch: int = 28) -> tuple:
     """Compute the (W, H) Qwen-VL will see for an image of size (width, height).
 
-    long_edge_cap=1120 (40 * patch) keeps the pixel budget under ~1 MP
-    for typical aspect ratios — well below Qwen's ~12 MP ceiling — so
-    image tokens don't crowd out the JSON response budget.
+    long_edge_cap=1260 (45 * patch) keeps the pixel budget under
+    ~1 MP for typical 16:9 aspect ratios (1260×700 = 882k px), staying
+    within Qwen's default token budget while giving ~28% more pixels
+    than the conservative 1120 cap. More pixels = finer patch density
+    over each part = tighter grounded bboxes.
     """
     w, h = int(width), int(height)
     long_edge = max(w, h)
