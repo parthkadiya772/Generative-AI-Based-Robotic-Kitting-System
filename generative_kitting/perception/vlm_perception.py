@@ -216,7 +216,21 @@ class VLMPerception:
 
             except Exception as e:
                 last_error = e
-                log.warning(f"VLM attempt {attempt} failed: {e}")
+                # The OpenAI SDK wraps httpx errors as APIConnectionError
+                # with a generic "Connection error." string. The actual
+                # network cause lives in __cause__; surface it so the
+                # operator can tell connection-refused from DNS-error
+                # from TLS-error etc.
+                cause_chain = []
+                cur = e
+                seen = set()
+                while cur is not None and id(cur) not in seen:
+                    seen.add(id(cur))
+                    cause_chain.append(
+                        f"{type(cur).__name__}: {cur}".strip())
+                    cur = getattr(cur, "__cause__", None)
+                detail = " ← ".join(cause_chain) if len(cause_chain) > 1 else str(e)
+                log.warning(f"VLM attempt {attempt} failed: {detail}")
                 if attempt <= self.max_retries:
                     # Retry keeps the original prompt (so catalogue +
                     # any custom guidance survive) and only appends

@@ -17,7 +17,8 @@
       "Bash(python -c \"from knowledge.parts_catalogue import load_catalogue; import json; print\\(json.dumps\\(load_catalogue\\(\\), indent=2\\)\\)\")",
       "Bash(python -m pytest generative_kitting/tests/)",
       "Bash(python -c ' *)",
-      "Bash(git log *)"
+      "Bash(git log *)",
+      "Bash(python -m pytest generative_kitting/tests/ -v)"
     ]
   }
 }

@@ -100,6 +100,37 @@ def detector_query_list() -> Dict[str, List[str]]:
     return out
 
 
+def format_label_choices_for_prompt() -> str:
+    """Render a CONCISE list of ``label: short description`` lines for
+    single-instance classification prompts.
+
+    Used by the VLM-as-arbiter step where the VLM looks at a cropped
+    image of ONE part and picks the matching catalogue label. Unlike
+    :func:`format_catalogue_for_prompt` (full descriptions for scene
+    grounding), this returns one short line per part — enough for a
+    classification decision but compact enough to fit alongside the
+    image without overwhelming the model.
+    """
+    cat = load_catalogue()
+    if not cat["parts"]:
+        return ""
+    lines: List[str] = []
+    for label, info in cat["parts"].items():
+        info = info or {}
+        # Pick the most distinctive snippet: prefer the FIRST
+        # distinguishing_feature (most discriminating), else a
+        # color+shape composite.
+        feats = info.get("distinguishing_features", []) or []
+        if feats:
+            desc = str(feats[0]).split(".")[0].strip()
+        else:
+            color = info.get("color", "").split(",")[0].strip()
+            shape = info.get("shape", "").split(",")[0].split(".")[0].strip()
+            desc = " ".join(s for s in (color, shape) if s)[:100]
+        lines.append(f'- "{label}": {desc}')
+    return "\n".join(lines)
+
+
 def format_catalogue_for_prompt(include_rules: bool = True) -> str:
     """Render the catalogue as a text block for prepending to a VLM prompt.
 

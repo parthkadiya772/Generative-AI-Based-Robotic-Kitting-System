@@ -40,20 +40,21 @@ simulation:
   tray_prim_path: "/World/box_840"
   wrist_rgb_camera_prim_path: "/World/Realsense/RSD455/Camera_OmniVision_OV9782_Color"
 
-  # Scan-pose marker prim — a static USD transform placed at the
-  # location where the robot's ee_link should park to image the bin.
-  # Read via /api/prim_center → pivot. Using a marker prim avoids
-  # computing scan height from bin AABB (which can include tall
-  # rack structures above the actual part surface). Set to "" or
-  # null to disable and fall back to bin_top_z + bin_scan_height.
-  scan_pose_prim_path: "/World/robo_eye"
+  # Scan-pose marker prim REMOVED from the scene — the workflow now
+  # derives the safe ee_link Z geometrically from
+  #   bin_top_z + execution.gripper_tcp_offset
+  #              + execution.bin_wall_finger_clearance
+  # See KittingWorkflowEngine._safe_floor_z(). Re-add a marker prim
+  # path here only if you want to override the geometric formula with
+  # a static USD transform.
+  # scan_pose_prim_path: "/World/robo_eye"
 
-  # ee_link orientation [w, x, y, z] applied at the scan pose AND at
-  # every realign before a pick. Default rotates the standard downward
-  # pose by -90° yaw about world Z so the wrist camera ends up on the
-  # FRONT side of the gripper (not the back). Tweak the sign of z if
-  # the camera ends up on the wrong side. Keep the quaternion
-  # normalised; null / missing → bridge falls back to DOWNWARD_ORIENTATION.
+  # ee_link orientation [w, x, y, z] applied at every realign before
+  # a pick. Default rotates the standard downward pose by -90° yaw
+  # about world Z so the wrist camera ends up on the FRONT side of
+  # the gripper (not the back). Tweak the sign of z if the camera
+  # ends up on the wrong side. Keep the quaternion normalised; null
+  # / missing → bridge falls back to DOWNWARD_ORIENTATION.
   scan_pose_orientation: [0.5, 0.5, 0.5, -0.5]
 
 # ─── Perception (VLM) ───────────────────────────────────────
@@ -112,6 +113,20 @@ perception:
   # Gemma4 4B) inconsistently misses some — OWL still finds them.
   # Disable for strict VLM-led behaviour.
   detector_finds_missed_parts: true
+
+  # ── Per-instance VLM label verification (open-vocabulary) ──
+  # After the scene is populated, crop each detection and ask the VLM
+  # "what is this?" with the catalogue as the choice set. Re-labels
+  # mistakes from the first-pass VLM and from OWL query mislabelling
+  # (e.g. motor_valves grabbed by the "silver hinge" query). Catalogue
+  # is the single source of truth — adding a new part means a YAML
+  # edit, no code changes, and no per-camera tuning. Costs N extra VLM
+  # calls per scan (~3-10s each on a small crop), so default is OFF.
+  # Enable when first-pass labels are unreliable.
+  verify_labels_with_vlm: false
+  # Minimum VLM confidence to override an existing label. Lower values
+  # are more aggressive (more re-labels), higher values are conservative.
+  verify_labels_min_confidence: 0.5
 
   # ── Per-instance Qwen crop-and-zoom refinement (Qwen-only path) ──
   # After the first-pass scene grounding returns rough bboxes, crop a
@@ -204,6 +219,127 @@ execution:
   finger_open_rad: 0.0               # radians — fully open
   finger_close_rad: 0.5              # radians — ~50mm part
 
+  # ── Approach safe-height floor (compartment-wall finger clearance) ──
+  # During the approach + realign phases the IK target Z is clamped
+  # so the gripper FINGER TIPS sit at least this many metres above
+  # the COMPARTMENT wall top of the part being picked. Per-part
+  # formula:
+  #     safe_floor = part_z + box_height + gripper_tcp_offset + this_value
+  # ``box_height`` (compartment wall height ABOVE the part — defined
+  # below) is the right reference here; the whole-rack ``bin_top_z``
+  # would push ee_link past the arm's vertical reach. Tune up (e.g.
+  # 0.04) if fingers still clip the compartment lip, down (e.g. 0.01)
+  # if the approach is unnecessarily high. 0.0 = no extra buffer
+  # (finger TCP exactly at compartment wall top).
+  bin_wall_finger_clearance: 0.04
+
+  # ── Place transit clearance (kitting tray) ──
+  # During the place phase the workflow pulls the kitting tray (X, Y, Z)
+  # directly from the USD prim ``simulation.tray_prim_path`` (Phase 0
+  # lookup) and sends the RAW tray top_z to the bridge — so the actual
+  # drop point stays ~2 cm above the tray surface (clean release, not
+  # a long fall). This value is sent as a SEPARATE ``transit_clearance``
+  # parameter that only the bridge's transit phase consumes — it adds
+  # extra altitude during the lateral-move steps so Lula IK has more
+  # headroom to find a non-folded arm pose (avoids the elbow/forearm
+  # clipping the tray rim or base). Does NOT affect the place / drop
+  # height.
+  # Tune up (e.g. 0.45) if the arm still folds awkwardly during transit,
+  # down (e.g. 0.20) if transit is unnecessarily high. 0.0 disables the
+  # extra clearance (transit uses the bridge's default 14 cm).
+  place_transit_clearance: 0.20
+
+  # Gap (metres) between gripper finger TCP and the tray surface at
+  # the release point. Higher = part dropped from further above (small
+  # bounce on landing); lower = part placed more gently but risks rim
+  # catch if the tray geometry varies. Default 0.03 m (3 cm). Sent to
+  # the bridge as ``place_z_buffer`` and overrides the bridge's default
+  # PLACE_DROP_HEIGHT (2 cm).
+  place_drop_z_buffer: 0.03
+
+  # ── Pick descent contact-stop ──
+  # Minimum contact-sensor force (Newtons) to declare "in contact"
+  # during the Cartesian descent in ``/api/pick_descend``. When a
+  # finger touches ANYTHING (part / floor / divider) at or above this
+  # force, the descent stops immediately — preventing the gripper from
+  # being pushed into the bin floor when the planned grasp_z is below
+  # the part's actual top.
+  # Default 0.2 N — light enough to catch the first touch on small/
+  # low-mass parts (gears, hinges) before the gripper deflects them.
+  # The bridge logs the sensor reading EVERY step of the descent, so
+  # you can verify in the Isaac Sim console whether the sensor is
+  # actually responding. If it reads 0.000 N the whole way, the
+  # sensor isn't working (check the [OK] Contact sensor ready line on
+  # bridge startup). Tune up (e.g. 0.5–1.0) only if false stops are
+  # triggered by noise on heavier parts.
+  descent_contact_min_force: 0.2
+
+  # When the contact sensor stops the descent, lift the gripper back
+  # up by this many metres before the close phase begins. The
+  # contact-stop pin the finger pads against whatever was touched
+  # (bin floor, part top, divider) — fingers can't close around the
+  # part because they're already pressed against the surface. A 1-2 mm
+  # lift gives the fingers clearance to close cleanly. Set to 0.0 to
+  # disable the lift-back (fingers stop exactly at contact).
+  descent_contact_lift_back: 0.002
+
+  # ── Wrist rescan before grasp ──
+  # After the approach + verify_and_realign at the depth-analysis pose,
+  # re-run the FULL perception pipeline (VLM scene scan + OWL-ViT2 +
+  # depth projection) on the wrist camera image to refine the grasp
+  # XY. The wrist camera at ~30-50 cm range gives ~10x the angular
+  # resolution of the overhead camera, so the OWL-ViT2 bbox lands on
+  # the part silhouette tightly enough that depth projection nails
+  # world XY to within a few millimetres — much tighter than the
+  # focused wrist-VLM check inside _verify_and_realign.
+  # Costs one extra VLM call per pick (~30-90 s on Gemma4). Set false
+  # to disable when the rough verify_and_realign offset is good
+  # enough and you want faster picks.
+  wrist_rescan_before_grasp: true
+
+  # Reject wrist-rescan corrections whose XY offset from the planned
+  # coords exceeds this many metres. The rescan is meant to be a
+  # millimetre-to-centimetre refinement; large shifts usually indicate
+  # the wrist VLM detected a NEIGHBOUR part or had a partial /
+  # occluded view — applying such a correction would force a big
+  # lateral move at depth-analysis altitude and the IK can swing the
+  # arm into the bin's back wall. Default 0.04 m (4 cm). Tune up
+  # (e.g. 0.06) only if you're confident the wrist always sees the
+  # right part. Tune down (e.g. 0.02) for stricter rejection.
+  max_wrist_rescan_offset_xy: 0.04
+
+  # Empirical XY-offset compensation applied to the wrist-rescan
+  # refined coordinates before targeting the gripper. The wrist RGB
+  # camera, depth sensor, and ee_link may all be slightly offset from
+  # each other in USD; the projection chain SHOULD account for this
+  # via the camera prim's transform, but if you observe a residual
+  # systematic offset between the detected part centre (X mark on
+  # the wrist overlay) and the gripper's actual landing point, sweep
+  # these knobs experimentally:
+  #   0.000  → no compensation (default)
+  #   0.013  → shift +13 mm
+  #  -0.005  → shift -5 mm
+  # The bridge logs the end-of-descent EE drift after each pick:
+  #   [DESCEND] drift (dx, dy, dz) = (+xx.x, +yy.y, +zz.z) mm
+  # If the drift is consistent across picks, set the negative of
+  # those values here as the compensation.
+  wrist_target_x_offset: 0.0
+  wrist_target_y_offset: 0.0
+
+  # ── Place flow: arm config reset after gantry move ──
+  # After the pick retract + gantry slide, the arm joints are in
+  # whatever configuration Lula picked for the retract IK — sometimes
+  # an "elbow-forward" pose with the forearm projecting into the
+  # workspace. The lateral move + descent are Cartesian (chained
+  # warm-starts), so they PRESERVE that configuration all the way to
+  # the tray. The result: the arm body folds over the tray rim while
+  # the gripper descends. Enable this to re-IK at the same Cartesian
+  # position with HOME_JOINTS as warm start, biasing the solver
+  # toward an elbow-up pose before the descent starts.
+  # Set false to disable (e.g., if the home-bias reset itself causes
+  # an awkward joint flip and you want the previous behaviour).
+  place_reset_arm_config: true
+
   # ── Wrist-scan pipeline heights (above bin / tray top, metres) ──
   # bin_scan_height:       wrist sits this far above bin top to capture
   #                        a single image that frames the whole bin.
@@ -222,12 +358,12 @@ execution:
   # Motion parameters
   pre_grasp_height_offset: 0.15      # 15cm above object for approach
   hover_clearance: 0.015             # gap above part top before plunge
-  box_height: 0.05                   # metres — box wall height above part
-  box_entry_margin: 0.15             # metres — clearance above rim
+  box_height: 0.20                   # metres — box wall height above part
+  box_entry_margin: 0.20             # metres — clearance above rim
   place_drop_height: 0.0             # metres above destination surface
   place_retract_height: 0.20         # metres above destination after release
   transit_safe_height: 0.30          # metres above safe_z during transit
-  max_pick_retries: 2               # retry scan + pick if grasp fails
+  max_pick_retries: 3               # retry scan + pick if grasp fails
   grasp_depth_fraction: 0.5          # 0.0=top, 0.5=mid, 1.0=bottom
 
   # Safety

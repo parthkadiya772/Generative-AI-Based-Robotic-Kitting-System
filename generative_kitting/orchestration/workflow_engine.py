@@ -420,6 +420,8 @@ class KittingWorkflowEngine:
         self._phase_callback = None
         self._cancelled = False
         self._bin_top_z = None  # set by Phase 0-1 landmark detection
+        self._bin_bot_z = None
+        self._tray_position = None  # set by Phase 0 USD lookup
         self._depth_estimator = DepthEstimator(
             self.config.get("perception", {})
         )
@@ -498,13 +500,42 @@ class KittingWorkflowEngine:
             bin_bot_z  = float(bin_info["bot_z"])
             self._bin_top_z = bin_top_z
             self._bin_bot_z = bin_bot_z
-            tray_xy    = tray_info["center_xy"]
+            # ``pivot`` is the prim's transform translation (xformOp:translate)
+            # — the AUTHORITATIVE position the prim was placed at in USD.
+            # ``center_xy`` is the bbox geometric centre, which can drift
+            # from the placed position when the prim has child meshes.
+            # For the tray we prefer pivot because the user has set it up
+            # at the actual tray centre; if pivot ≠ center_xy we log both
+            # so any divergence is visible.
+            tray_pivot = tray_info.get("pivot")
+            tray_bbox_xy = tray_info["center_xy"]
+            if tray_pivot and len(tray_pivot) >= 2:
+                tray_xy = (float(tray_pivot[0]), float(tray_pivot[1]))
+                bbox_dx = abs(tray_xy[0] - float(tray_bbox_xy[0]))
+                bbox_dy = abs(tray_xy[1] - float(tray_bbox_xy[1]))
+                if max(bbox_dx, bbox_dy) > 0.005:  # >5mm divergence
+                    log.info(
+                        f"[USD] Tray pivot vs bbox centre divergence: "
+                        f"pivot=({tray_xy[0]:.3f}, {tray_xy[1]:.3f}) "
+                        f"bbox=({tray_bbox_xy[0]:.3f}, "
+                        f"{tray_bbox_xy[1]:.3f}) — using pivot.")
+            else:
+                tray_xy = (float(tray_bbox_xy[0]), float(tray_bbox_xy[1]))
             tray_top_z = float(tray_info["top_z"])
             tray_position = {
                 "center_xy": tray_xy,
+                # Raw USD value — used by ``_execute_place_sequence``
+                # to bypass the LLM and target the tray directly.
+                "top_z_raw": tray_top_z,
                 # Drop point includes the safe clearance above the rim.
+                # This is what the LLM sees in the scene.
                 "top_z": tray_top_z + tray_safe_h,
             }
+            # Stash on self so phases beyond the scope of `tray_position`
+            # local var (e.g. _execute_place_sequence) can read the
+            # USD-derived coords directly without round-tripping through
+            # the LLM's plan params.
+            self._tray_position = tray_position
             log.info(
                 f"[USD] Bin top_z={bin_top_z:.3f}; "
                 f"Tray centre=({tray_xy[0]:.3f}, {tray_xy[1]:.3f}), "
@@ -1426,6 +1457,79 @@ class KittingWorkflowEngine:
                     cy = (refined[1] + refined[3]) / 2.0
                     obj["image_position"] = {"x": cx, "y": cy}
 
+        # ── Optional: per-instance VLM label verification ────────────
+        # Crop each detected part to a 2x region and ask the VLM "what
+        # is this?" with the catalogue list as the choice set. Single-
+        # instance classification on a small crop is dramatically more
+        # accurate than multi-instance scene grounding — especially
+        # for visually-similar parts (motor_valve vs small_hinge).
+        # Open-vocabulary: the catalogue is the only source of truth,
+        # so adding a new part means a YAML edit, no code change. Costs
+        # N extra VLM calls per scan, gated by
+        # ``perception.verify_labels_with_vlm`` (default false).
+        verify_cfg = (self.config.get("perception", {})
+                      .get("verify_labels_with_vlm", False))
+        if verify_cfg:
+            n_to_verify = sum(1 for o in objects
+                              if o.get("_detector_bbox_full"))
+            log.info(
+                f"[Verify] Per-instance VLM label verification ON; "
+                f"re-classifying {n_to_verify} parts")
+            min_override_conf = float(
+                self.config.get("perception", {})
+                    .get("verify_labels_min_confidence", 0.5))
+            overrides = 0
+            for obj in objects:
+                bbox_full = obj.get("_detector_bbox_full")
+                if not bbox_full:
+                    continue
+                current = (obj.get("label") or "").strip()
+                current_base = re.sub(r"_\d+$", "", current).strip()
+                result = self._verify_label_with_vlm(
+                    overhead_image, current, bbox_full)
+                if result is None:
+                    log.info(
+                        f"  [Verify] '{current}': VLM gave no answer; "
+                        f"keeping current label")
+                    continue
+                new_label, conf = result
+                new_base = re.sub(
+                    r"_\d+$", "", new_label.strip().lower()).strip()
+
+                if new_base in {"", "unknown"}:
+                    log.info(
+                        f"  [Verify] '{current}': VLM said 'unknown' "
+                        f"(conf={conf:.2f}); keeping current label")
+                    obj["_label_verified"] = False
+                    continue
+                if new_base == current_base.lower():
+                    log.info(
+                        f"  [Verify] '{current}': VLM AGREES "
+                        f"(conf={conf:.2f})")
+                    obj["_label_verified"] = True
+                    continue
+                if conf < min_override_conf:
+                    log.info(
+                        f"  [Verify] '{current}' → '{new_label}'? "
+                        f"VLM disagrees but conf={conf:.2f} < "
+                        f"{min_override_conf:.2f}; keeping current")
+                    obj["_label_verified"] = False
+                    continue
+                # High-confidence override
+                log.info(
+                    f"  [Verify] OVERRIDE '{current}' → '{new_base}' "
+                    f"(VLM conf={conf:.2f})")
+                obj["label"] = new_base
+                obj["confidence"] = max(float(obj.get("confidence", 0.0)),
+                                        conf * 0.95)
+                obj["_label_verified"] = True
+                obj["_label_pre_verify"] = current
+                overrides += 1
+            if overrides:
+                log.info(
+                    f"[Verify] Re-labelled {overrides} parts based on "
+                    f"single-instance VLM classification")
+
         # Per-part surface_z hint passed to the bridge's geometric
         # ray-plane fallback. The depth buffer is the primary path —
         # but when it fails (e.g. depth annotator off after a camera
@@ -1796,6 +1900,78 @@ class KittingWorkflowEngine:
             f"{refined[0]:.3f},{refined[1]:.3f},"
             f"{refined[2]:.3f},{refined[3]:.3f})")
         return refined
+
+    def _verify_label_with_vlm(self, overhead_image, current_label: str,
+                               bbox_full: tuple,
+                               crop_margin_frac: float = 0.5):
+        """Re-classify a single part by cropping its bbox and asking the
+        VLM "what is this?" with a focused, single-instance prompt.
+
+        Uses the catalogue (parts_catalogue.yaml) as the open-vocabulary
+        list of valid labels. Adding a new part type means editing the
+        YAML — no code changes — and this verifier picks it up.
+
+        The VLM tends to be MUCH more accurate at single-instance
+        classification than at multi-instance scene grounding (Gemma4
+        4B in particular). Cropping to one part also lets a small VLM
+        see fine details (silver_brass distinction, hole geometry, etc.)
+        that get lost in a 1920x1080 cluttered scene.
+
+        Returns
+        -------
+        tuple or None
+            ``(label, confidence)`` from the VLM, or ``None`` if the
+            verification failed (VLM error, malformed JSON, empty
+            response). On ``None`` the caller keeps the current label.
+        """
+        from PIL import Image as _PILImage
+        from knowledge.parts_catalogue import format_label_choices_for_prompt
+
+        W, H = overhead_image.size
+        nx1, ny1, nx2, ny2 = bbox_full
+        rx1, ry1 = nx1 * W, ny1 * H
+        rx2, ry2 = nx2 * W, ny2 * H
+        bw, bh = rx2 - rx1, ry2 - ry1
+        if bw <= 0 or bh <= 0:
+            return None
+        cx1 = max(0, int(round(rx1 - bw * crop_margin_frac)))
+        cy1 = max(0, int(round(ry1 - bh * crop_margin_frac)))
+        cx2 = min(W, int(round(rx2 + bw * crop_margin_frac)))
+        cy2 = min(H, int(round(ry2 + bh * crop_margin_frac)))
+        crop_w_px = cx2 - cx1
+        crop_h_px = cy2 - cy1
+        if crop_w_px < 28 or crop_h_px < 28:
+            return None
+        crop_img = overhead_image.crop((cx1, cy1, cx2, cy2))
+
+        choices_block = format_label_choices_for_prompt()
+        prompt = (
+            "This is a close-up image of ONE mechanical part from an "
+            "industrial parts bin.\n\n"
+            "Identify what part type is shown at the centre.\n\n"
+            "Choose EXACTLY ONE label from this catalogue:\n"
+            f"{choices_block}\n"
+            '- "unknown": does not clearly match any of the above\n\n'
+            "Output ONLY this JSON (no markdown, no commentary):\n"
+            '{"label": "<one of the labels above>", "confidence": 0.0-1.0}'
+        )
+        try:
+            result = self.vlm.analyze_raw(crop_img, prompt)
+        except Exception as e:
+            log.warning(
+                f"[Verify] '{current_label}': VLM call failed: {e}")
+            return None
+
+        if not isinstance(result, dict):
+            return None
+        new_label = (result.get("label") or "").strip()
+        if not new_label:
+            return None
+        try:
+            conf = float(result.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            conf = 0.0
+        return (new_label, conf)
 
     @staticmethod
     def _is_self_grounding_vlm(provider: str) -> bool:
@@ -2448,6 +2624,19 @@ class KittingWorkflowEngine:
         except Exception:
             font = ImageFont.load_default()
 
+        # Bbox-centre marker. The bridge's depth projection samples a
+        # 5×5 patch around the BBOX CENTRE — drawing an X here lets you
+        # verify by eye whether the projection anchored on the actual
+        # part (centre lands on the part silhouette) or on a divider /
+        # gap (centre lands on a wall — projection will return wrong
+        # XYZ → robot moves to wrong place).
+        def _draw_centre_x(px, py, color, arm=10, w=2):
+            px, py = float(px), float(py)
+            draw.line([(px - arm, py - arm), (px + arm, py + arm)],
+                      fill=color, width=w)
+            draw.line([(px - arm, py + arm), (px + arm, py - arm)],
+                      fill=color, width=w)
+
         # Layer 1: detector raw bboxes (green) — these are pixels in
         # the crop frame, which equals the image we're drawing on.
         for det in (detector_dets or []):
@@ -2457,6 +2646,8 @@ class KittingWorkflowEngine:
             x1, y1, x2, y2 = [float(v) for v in bbox]
             draw.rectangle([x1, y1, x2, y2],
                            outline=(0, 220, 0), width=2)
+            _draw_centre_x((x1 + x2) / 2.0, (y1 + y2) / 2.0,
+                           (0, 220, 0), arm=8, w=2)
             label = det.get("label", "")
             if label:
                 draw.text((x1 + 3, max(0, y1 - 18)),
@@ -2477,6 +2668,8 @@ class KittingWorkflowEngine:
                 ly2 = (ny2 - cy_min) / ch_norm * H
                 draw.rectangle([lx1, ly1, lx2, ly2],
                                outline=(220, 30, 30), width=3)
+                _draw_centre_x((lx1 + lx2) / 2.0, (ly1 + ly2) / 2.0,
+                               (255, 255, 0), arm=10, w=2)
                 draw.text((lx1 + 3, max(0, ly1 - 36)),
                           f"{label} ({conf:.2f})",
                           fill=(220, 30, 30), font=font)
@@ -2939,6 +3132,162 @@ class KittingWorkflowEngine:
         # Reasonable range — trust close-range projection
         return projected_z
 
+    def _rescan_part_with_wrist(self, target_label: str,
+                                 planned_coords: dict) -> dict:
+        """At the depth-analysis pose, re-detect the target part with
+        the FULL perception pipeline on the wrist camera.
+
+        The wrist camera at ~30–50 cm range gives ~10× the angular
+        resolution of the overhead camera. Running the same detection
+        path (VLM scene scan + OWL-ViT2 with the catalogue + depth
+        projection) on the wrist image lands the bbox on the part
+        silhouette tightly enough that depth projection nails world XY
+        to a few millimetres. Replaces the rough wrist-VLM check from
+        ``_verify_and_realign`` with a re-grounded measurement.
+
+        Cost: one extra full VLM call per pick (~30–90 s on Gemma4).
+        Gated by ``execution.wrist_rescan_before_grasp`` (default true).
+
+        Returns
+        -------
+        dict
+            ``{x, y, z}`` refined world coords if a matching detection
+            was found, otherwise ``planned_coords`` unchanged. Always
+            valid — caller uses the result directly.
+        """
+        log.info(
+            f"[Wrist-rescan] Re-detecting '{target_label}' "
+            f"from wrist camera...")
+        self._notify(WorkflowPhase.GRASP_REFINEMENT, "running",
+                     f"Wrist rescan for {target_label}...")
+
+        try:
+            wrist_image = self.camera.capture_wrist_image()
+        except Exception as e:
+            log.warning(
+                f"[Wrist-rescan] Capture failed: {e}; "
+                f"keeping planned coords")
+            return planned_coords
+
+        if wrist_image is None:
+            log.warning(
+                "[Wrist-rescan] Empty wrist capture; "
+                "keeping planned coords")
+            return planned_coords
+
+        # Reuse the overhead-detection pipeline on the wrist image.
+        # camera_alias="wrist" tells the bridge's project_to_world to
+        # use the wrist camera's USD transform + intrinsics.
+        try:
+            scene, source = self._detect_parts_from_bin_crop(
+                wrist_image,
+                bin_crop_box=(0.0, 0.0, 1.0, 1.0),
+                target_parts=[target_label],
+                bin_top_z=None,
+                camera_alias="wrist",
+            )
+        except Exception as e:
+            log.warning(
+                f"[Wrist-rescan] Detection failed: {e}; "
+                f"keeping planned coords")
+            return planned_coords
+
+        objects = scene.get("detected_objects", [])
+        if not objects:
+            log.info(
+                f"[Wrist-rescan] No '{target_label}' detected in "
+                f"wrist view; keeping planned coords")
+            return planned_coords
+
+        # Pick the detection NEAREST to the current planned XY (in case
+        # multiple parts are visible in the wrist FOV — we want the one
+        # we approached, not a neighbour).
+        px = float(planned_coords.get("x", 0.0))
+        py = float(planned_coords.get("y", 0.0))
+
+        def _dist_xy(obj):
+            pos = obj.get("approximate_position", {})
+            ox = pos.get("x")
+            oy = pos.get("y")
+            if ox is None or oy is None:
+                return float("inf")
+            return ((float(ox) - px) ** 2 + (float(oy) - py) ** 2) ** 0.5
+
+        best = min(objects, key=_dist_xy)
+        pos = best.get("approximate_position", {})
+        if not (pos and "x" in pos and "y" in pos):
+            log.warning(
+                "[Wrist-rescan] Best detection lacks world coords; "
+                "keeping planned coords")
+            return planned_coords
+
+        refined = {
+            "x": float(pos["x"]),
+            "y": float(pos["y"]),
+            "z": float(pos.get("z", planned_coords.get("z", 0.0))),
+        }
+
+        # Empirical XY-offset compensation. The wrist RGB camera and
+        # the wrist depth-sensor (or ee_link) may be offset from each
+        # other by a few mm to a few cm depending on USD prim
+        # placement. If you observe a systematic residual offset
+        # between the detected part centre (X mark on the wrist
+        # overlay) and the gripper's actual landing point, sweep
+        # these knobs to find the correct compensation. 0.0 = no
+        # compensation (default). Positive X = shift target to
+        # camera's right; positive Y = shift target forward (along
+        # camera's down-axis, which is world-Y for a downward-
+        # mounted wrist camera).
+        x_offset = float(
+            self.config.get("execution", {})
+                .get("wrist_target_x_offset", 0.0))
+        y_offset = float(
+            self.config.get("execution", {})
+                .get("wrist_target_y_offset", 0.0))
+        if abs(x_offset) > 1e-6 or abs(y_offset) > 1e-6:
+            refined["x"] += x_offset
+            refined["y"] += y_offset
+            log.info(
+                f"[Wrist-rescan] Applied empirical offsets: "
+                f"x={x_offset:+.4f}, y={y_offset:+.4f} m → "
+                f"final ({refined['x']:.3f}, {refined['y']:.3f})")
+
+        offset = ((refined["x"] - px) ** 2
+                  + (refined["y"] - py) ** 2) ** 0.5
+        log.info(
+            f"[Wrist-rescan] '{target_label}': planned=("
+            f"{px:.3f}, {py:.3f}) → refined=("
+            f"{refined['x']:.3f}, {refined['y']:.3f}, "
+            f"{refined['z']:.3f})  Δxy={offset*100:.1f} cm")
+        return refined
+
+    def _safe_floor_z(self, part_z: float) -> float:
+        """Return the minimum ee_link Z for a part-specific compartment
+        approach that keeps the gripper finger tips clear of the bin
+        compartment wall top.
+
+        Geometry (per-part, NOT per-rack):
+            compartment_wall_top_z = part_z + box_height
+            finger_TCP_z          = ee_link_z − gripper_tcp_offset
+            require finger_TCP_z ≥ compartment_wall_top_z
+                                 + bin_wall_finger_clearance
+        ⇒   ee_link_z ≥ part_z + box_height + gripper_tcp_offset
+                       + bin_wall_finger_clearance
+
+        ``box_height`` (compartment wall height above the part) is a
+        local, per-part value — much smaller than the rack's overall
+        ``bin_top_z`` (which is the top of the entire rack structure
+        and would push ee_link past the arm's vertical reach).
+
+        Pass ``part_z`` from the caller — the world Z of the part top
+        / grasp point as projected by ``/api/project_to_world``.
+        """
+        exec_cfg = self.config.get("execution", {})
+        box_h = float(exec_cfg.get("box_height", 0.05))
+        tcp_off = float(exec_cfg.get("gripper_tcp_offset", 0.170))
+        clearance = float(exec_cfg.get("bin_wall_finger_clearance", 0.02))
+        return float(part_z) + box_h + tcp_off + clearance
+
     def _realign_over_part(self, params: dict, step_num,
                            align_height: float,
                            bin_top_z: float) -> bool:
@@ -2955,8 +3304,9 @@ class KittingWorkflowEngine:
         The realign target is the LARGER of:
           - ``part_z + align_height`` (the "preferred" close-range
             descent for depth analysis), and
-          - ``self._scan_pose_z`` (the proven-reachable, collision-
-            free scan vantage from Phase 1).
+          - the geometric "fingers-clear-walls" floor (``bin_top_z +
+            gripper_tcp_offset + bin_wall_finger_clearance``) — see
+            :meth:`_safe_floor_z`.
 
         The scan-pose floor is critical for multi-compartment bins
         whose dividers extend above the parts: a single IK jump from
@@ -2976,13 +3326,14 @@ class KittingWorkflowEngine:
         part_y = params.get("y", 0.0)
         part_z = float(params.get("z", 0.0))
         preferred_z = part_z + align_height
-        scan_floor = float(getattr(self, "_scan_pose_z", 0.0) or 0.0)
-        target_z = max(preferred_z, scan_floor)
-        if target_z > preferred_z:
+        safe_floor = self._safe_floor_z(part_z)
+        target_z = max(preferred_z, safe_floor)
+        if target_z > preferred_z + 1e-3:
             log.info(
                 f"[Realign {step_num}] Clamping z {preferred_z:.3f} → "
-                f"{target_z:.3f} (scan_pose_z floor) to avoid "
-                f"colliding with bin dividers above the part.")
+                f"{target_z:.3f} (part_z={part_z:.3f} + box_height + "
+                f"tcp_offset + clearance) to keep fingers above "
+                f"compartment walls.")
         target = {
             "x": part_x, "y": part_y, "z": target_z,
             # No safety buffer — ee_link lands at the requested
@@ -3059,10 +3410,29 @@ class KittingWorkflowEngine:
         # jump (no Cartesian micro-stepping) — Cartesian doesn't
         # actually avoid arm-body collisions because IK only
         # constrains the EE endpoint, not what the elbow/forearm do.
+        #
+        # SAFE-HEIGHT FLOOR: Every approach candidate is clamped to a
+        # per-part geometric floor that keeps the gripper FINGER TIPS
+        # above the COMPARTMENT wall top by
+        # ``bin_wall_finger_clearance`` metres. The compartment wall
+        # is part-local (``part_z + box_height``) — NOT the whole-rack
+        # ``bin_top_z`` which would push ee_link past the arm's reach.
+        # See :meth:`_safe_floor_z` for the formula.
+        safe_floor = self._safe_floor_z(pick_coords["z"])
         approach_z_candidates = [
-            pick_coords["z"] + dz
+            max(pick_coords["z"] + dz, safe_floor)
             for dz in (0.30, 0.25, 0.20, 0.15, 0.10, 0.05)
         ]
+        # Log when the floor actually engages so the operator can see
+        # the safety clamp working (otherwise it's silent).
+        raw_preferred = pick_coords["z"] + 0.30
+        if safe_floor > raw_preferred + 1e-3:
+            log.info(
+                f"[Pick {step_num}] Approach z clamped: "
+                f"{raw_preferred:.3f} → {safe_floor:.3f} "
+                f"(part_z={pick_coords['z']:.3f} + box_height + "
+                f"tcp_offset + clearance; keeps fingers above "
+                f"compartment walls)")
         approach_result = None
         approach_ok = False
         used_approach_z = None
@@ -3223,12 +3593,94 @@ class KittingWorkflowEngine:
                 "[Pick] Descent path may have obstacles — "
                 "proceeding with caution")
 
+        # ── Optional: full wrist rescan to refine grasp XY ──
+        # The verify_and_realign step above uses a focused wrist VLM
+        # prompt that gives a rough centre. Running the FULL perception
+        # pipeline (VLM scene scan + OWL-ViT2 + depth projection) on
+        # the wrist image at depth-analysis range produces a much
+        # tighter bbox → projection → world XY (within a few mm).
+        # Costs one extra VLM call per pick. Gated by config flag.
+        if self.config.get("execution", {}).get(
+                "wrist_rescan_before_grasp", True):
+            target_label = (params.get("label")
+                            or params.get("target_label")
+                            or scene.get("_last_target_label", "")
+                            or "")
+            if not target_label:
+                # Fall back: look up the obj_id in the scene.
+                for o in scene.get("detected_objects", []):
+                    if o.get("object_id") == obj_id:
+                        target_label = o.get("label", "")
+                        break
+            if target_label:
+                refined = self._rescan_part_with_wrist(
+                    target_label, pick_coords)
+                if (refined is not pick_coords
+                        and (abs(refined.get("x", 0)
+                                 - pick_coords.get("x", 0)) > 1e-6
+                             or abs(refined.get("y", 0)
+                                    - pick_coords.get("y", 0)) > 1e-6)):
+                    # Reject the rescan correction if the XY shift is
+                    # larger than ``max_wrist_rescan_offset_xy``. Big
+                    # shifts usually mean the wrist VLM saw a NEIGHBOUR
+                    # part (not the planned target) or a partial /
+                    # occluded view — applying that correction would
+                    # force a large lateral move at depth-analysis
+                    # altitude where the IK can swing the arm into the
+                    # bin's back wall. The original verify_and_realign
+                    # coords were already a reasonable refinement; we
+                    # fall back to those and skip the rescan.
+                    max_offset = float(
+                        self.config.get("execution", {})
+                            .get("max_wrist_rescan_offset_xy", 0.04))
+                    dx = refined["x"] - pick_coords["x"]
+                    dy = refined["y"] - pick_coords["y"]
+                    offset = (dx * dx + dy * dy) ** 0.5
+                    if offset > max_offset:
+                        log.warning(
+                            f"[Pick] Wrist rescan offset {offset*100:.1f} cm"
+                            f" exceeds cap "
+                            f"{max_offset*100:.1f} cm — rejecting "
+                            f"correction. Using verify_and_realign "
+                            f"coords ({pick_coords['x']:.3f}, "
+                            f"{pick_coords['y']:.3f}, "
+                            f"{pick_coords['z']:.3f}) instead. "
+                            f"Likely a wrong-part or occluded wrist "
+                            f"detection.")
+                    else:
+                        log.info(
+                            f"[Pick] Wrist rescan refined coords: "
+                            f"({pick_coords['x']:.3f}, "
+                            f"{pick_coords['y']:.3f}, "
+                            f"{pick_coords['z']:.3f}) → "
+                            f"({refined['x']:.3f}, "
+                            f"{refined['y']:.3f}, "
+                            f"{refined['z']:.3f}) "
+                            f"(offset {offset*100:.1f} cm)")
+                        pick_coords = refined
+            else:
+                log.info(
+                    "[Pick] Skipping wrist rescan — no target label "
+                    "available for the active object")
+
         # ── Phase B: Descend to grasp position (fingers open) ──
+        # Inject the contact-sensor force threshold so the bridge's
+        # Cartesian descent stops the moment a finger touches anything,
+        # rather than blindly driving down to the planned grasp_z (which
+        # can push the gripper into the bin floor when depth projection
+        # underestimates the part top).
         self._notify(WorkflowPhase.PICK_EXECUTE, "running",
                      "Descending to grasp position...")
+        descend_payload = dict(pick_coords)
+        descend_payload["descent_contact_min_force"] = float(
+            self.config.get("execution", {})
+                .get("descent_contact_min_force", 0.5))
+        descend_payload["descent_contact_lift_back"] = float(
+            self.config.get("execution", {})
+                .get("descent_contact_lift_back", 0.002))
 
         descend_result = self.camera.send_command(
-            "/api/pick_descend", pick_coords)
+            "/api/pick_descend", descend_payload)
         descend_ok = descend_result.get("status") == "ok"
         result["sub_phases"].append({
             "phase": "pick_descend",
@@ -3363,17 +3815,79 @@ class KittingWorkflowEngine:
     # ─── Place Sequence ─────────────────────────────────────
 
     def _execute_place_sequence(self, step, params, scene, step_num):
-        """Phase 7: Place object using real destination coordinates."""
+        """Phase 7: Place object using real destination coordinates.
+
+        Coordinates come DIRECTLY from the USD tray prim (cached on
+        ``self._tray_position`` during Phase 0) — bypassing the LLM's
+        plan params for X/Y/Z. The LLM's role for the tray is only to
+        decide *whether* to place; the *where* is anchored to USD.
+
+        Two values are sent to the bridge:
+          - ``z = tray_top_z`` — the **raw** USD tray top, no buffer.
+            This is what the bridge uses to compute ``place_z`` (the
+            actual drop point), so the part lands ~2 cm above the tray
+            surface — a clean release, not a long fall.
+          - ``transit_clearance`` — extra metres added ONLY to the
+            transit phase (the lateral-move altitude before descent).
+            Gives Lula IK headroom to find a non-folded arm pose
+            without affecting the place height. Tunable via
+            ``execution.place_transit_clearance``.
+        """
         result = {"step": step_num, "action": "place_object"}
 
         self._notify(WorkflowPhase.PLACE_EXECUTE, "running",
                      f"Step {step_num}: Placing object at destination...")
 
-        place_payload = {
-            "x": params.get("x", 0.5),
-            "y": params.get("y", 0.0),
-            "z": params.get("z", 0.02),
-        }
+        # USD tray coords (preferred) — fall back to LLM params only if
+        # the Phase 0 lookup didn't run.
+        tray = getattr(self, "_tray_position", None)
+        exec_cfg = self.config.get("execution", {})
+        transit_clearance = float(
+            exec_cfg.get("place_transit_clearance", 0.35))
+        # Gap between finger TCP and tray top at the release point.
+        # Defaults to 0.03 m (3 cm) so the part is released just above
+        # the tray surface — clean drop, no rim catch.
+        place_z_buffer = float(
+            exec_cfg.get("place_drop_z_buffer", 0.03))
+
+        # Optional: bias arm to home config after gantry slide so the
+        # descent doesn't inherit an "elbow-forward" pose from the
+        # pick retract.
+        reset_arm_cfg = bool(
+            exec_cfg.get("place_reset_arm_config", True))
+
+        if tray and "center_xy" in tray and "top_z_raw" in tray:
+            tx, ty = tray["center_xy"][0], tray["center_xy"][1]
+            tz_raw = float(tray["top_z_raw"])
+            log.info(
+                f"[Place {step_num}] Using USD tray coords: "
+                f"({tx:.3f}, {ty:.3f}, tray_top_z={tz_raw:.3f}) + "
+                f"transit_clearance={transit_clearance:.3f} m, "
+                f"place_z_buffer={place_z_buffer:.3f} m, "
+                f"reset_arm_config={reset_arm_cfg}. "
+                f"LLM-emitted was "
+                f"({params.get('x', '?')}, {params.get('y', '?')}, "
+                f"{params.get('z', '?')}) — overridden.")
+            place_payload = {
+                "x": tx, "y": ty, "z": tz_raw,
+                "transit_clearance": transit_clearance,
+                "place_z_buffer": place_z_buffer,
+                "place_reset_arm_config": reset_arm_cfg,
+            }
+        else:
+            log.warning(
+                f"[Place {step_num}] No cached USD tray_position; "
+                f"falling back to LLM coords. (Phase 0 may not have "
+                f"run, or tray prim lookup failed.)")
+            place_payload = {
+                "x": params.get("x", 0.5),
+                "y": params.get("y", 0.0),
+                "z": params.get("z", 0.02),
+                "transit_clearance": transit_clearance,
+                "place_z_buffer": place_z_buffer,
+                "place_reset_arm_config": reset_arm_cfg,
+            }
+
         if "finger_close" in params:
             place_payload["finger_close"] = params["finger_close"]
         if "grip_hold" in params:
