@@ -1,8 +1,14 @@
 # Parts Visual Catalogue — fed to the VLM (Gemma4) alongside each scene image.
 #
-# Decision flow: COLOUR first, then SHAPE/SIZE. Black parts are
-# unambiguously gears; silver parts split by SIZE (tiny flat plate
-# → hinge, bulky 3D body with central bore → motor_valve).
+# Decision flow: COLOUR alone is enough.
+#   BLACK round  → large_gear
+#   SILVER bulky → motor_valve
+#
+# small_hinge has been removed from the active scene — operators
+# have physically taken those parts out of the bin, so eliminating
+# its catalogue entry stops the VLM and OWL-ViT2 from conflating
+# motor_valves with silver hinges (every silver part is now
+# unambiguously a motor_valve).
 #
 # Edit this file as the scene contents change — no code changes
 # needed. Loaded by knowledge/parts_catalogue.py and injected into
@@ -31,39 +37,13 @@ parts:
       - "solid BLACK colour across the entire face"
       - "flat, uniform thickness, no visible 3D structure"
     not_to_confuse_with:
-      - "all other parts in the bin are SILVER — if the part is
-        BLACK and round, it is ALWAYS a large_gear"
+      - "all other parts in the bin are SILVER motor_valves — if
+        the part is BLACK and round, it is ALWAYS a large_gear"
 
-  # ── SILVER PARTS — distinguished by SIZE + BORE ──────────────
-  small_hinge:
-    # Multiple short, concrete queries — OWL responds best to natural
-    # noun phrases. ``small silver L-bracket`` tends to also match
-    # motor_valves (which look bracket-like from above), so we add
-    # alternatives that emphasise the hinge / door-hinge nature.
-    detector_queries:
-      - "small silver hinge"
-      - "small metal door hinge"
-      - "tiny silver bracket"
-      - "small silver L-bracket"
-    color: "metallic SILVER, polished sheet metal"
-    shape: "TINY flat sheet-metal plate, dramatically smaller than
-      the motor valves. Roughly peanut / figure-8 outline with TWO
-      small round holes side-by-side at one end and a small flat
-      tail at the other end. Lies flush with the bin floor."
-    size: "TINY — about the size of a coin. The SMALLEST silver
-      part. Roughly 1/4 the footprint of a motor_valve."
-    distinguishing_features:
-      - "TINY size — much smaller than motor_valves (this is the
-        primary distinguishing cue from motor_valve)"
-      - "FLAT sheet-metal, lies flush with bin floor"
-      - "TWO small holes side-by-side at one end"
-      - "polished silver, smooth"
-      - "NO central bore (the holes are small mounting holes, not
-        a single large opening)"
-    not_to_confuse_with:
-      - "NOT a motor_valve — motor_valves are 3-4× LARGER, BULKY 3D
-        cast bodies with a HUGE central hole you can see through"
-
+  # ── SILVER PARTS ──────────────────────────────────────────────
+  # small_hinge intentionally REMOVED — the operator has taken hinges
+  # out of the scene. Every silver part is now a motor_valve, no
+  # disambiguation needed.
   motor_valve:
     # ``silver round metal valve with central hole`` is too long /
     # abstract for OWL — it returns 0 hits. Concrete real-world object
@@ -74,17 +54,17 @@ parts:
       - "silver metal valve"
       - "silver pipe fitting with flange"
     color: "metallic SILVER cast metal, matte cast finish"
-    shape: "BULKY 3D silver cast housing — the LARGEST part type in
-      the bin by far. Has a HUGE round opening straight through the
-      middle (the throttle bore) which you can see THROUGH. Inside
-      that hole a thin horizontal SHAFT or BUTTERFLY PLATE bisects
-      the bore. Around the perimeter, several flange tabs with FOUR bolt
-      holes stick out. Looks like an engine throttle body."
-    size: "LARGE — by far the biggest part type, 3-4× the footprint
-      of a small_hinge"
+    shape: "BULKY 3D silver cast housing with a HUGE round opening
+      straight through the middle (the throttle bore) which you can
+      see THROUGH. Inside that hole a thin horizontal SHAFT or
+      BUTTERFLY PLATE bisects the bore. Around the perimeter,
+      several flange tabs with FOUR bolt holes stick out. Looks like
+      an engine throttle body."
+    size: "the only SILVER part type in the scene — every silver
+      object visible in the bin is a motor_valve"
     distinguishing_features:
-      - "LARGE size — 3-4× bigger than small_hinges (this is the
-        primary distinguishing cue from small_hinge)"
+      - "the ONLY SILVER part type — colour alone is enough to
+        identify it"
       - "ONE LARGE round hole through the middle that you can see
         STRAIGHT THROUGH (the throttle bore)"
       - "thin horizontal shaft / butterfly plate visible inside the
@@ -92,26 +72,22 @@ parts:
       - "BULKY 3D cast body — casts a clear shadow inside the bin"
       - "rough cast-metal finish (not polished sheet metal)"
     not_to_confuse_with:
-      - "NOT a small_hinge — hinges are TINY flat plates 1/4 the
-        size, with NO central bore (just two tiny mounting holes)"
+      - "all other parts in the bin are BLACK large_gears — if the
+        part is SILVER, it is ALWAYS a motor_valve"
 
 # ─── Labelling rules applied across all parts ────────────────────
 labelling_rules:
-  - "Use the EXACT label keys (large_gear, small_hinge,
-    motor_valve). Do NOT invent descriptive labels."
+  - "Use the EXACT label keys (large_gear, motor_valve). Do NOT
+    invent descriptive labels."
   - "Step 1: SCAN the entire bin and COUNT every visible part. The
-    bin typically holds parts of MULTIPLE types — do not stop after
-    finding only one type. There can be 3+ of each type."
-  - "Step 2 — COLOUR is the primary disambiguator:
+    bin holds parts of TWO types — do not stop after finding only
+    one type. There can be 3+ of each type."
+  - "Step 2 — COLOUR alone is the disambiguator:
       BLACK and round → large_gear (every black round part)
-      SILVER → continue to Step 3"
-  - "Step 3 — for SILVER parts, SIZE is the disambiguator:
-      LARGE bulky 3D body with a hole you can see THROUGH it
-        → motor_valve
-      TINY flat plate, lies flush with the floor, has TWO small
-      mounting holes side-by-side → small_hinge"
+      SILVER         → motor_valve (every silver part)"
   - "If multiple parts of the same type, suffix _1, _2, _3
-    (e.g. large_gear_1, large_gear_2, large_gear_3)."
+    (e.g. large_gear_1, large_gear_2, large_gear_3,
+    motor_valve_1, motor_valve_2, motor_valve_3)."
   - "If a part doesn't clearly match any entry above, label it
     'unknown' rather than guessing."
   - "Label the white kitting tray as 'kitting_tray' with affordance

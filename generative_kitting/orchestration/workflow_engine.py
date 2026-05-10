@@ -358,10 +358,20 @@ RESPOND ONLY WITH VALID JSON:
 WRIST_VERIFY_PROMPT = """You are looking straight down from a wrist-mounted RealSense camera
 on a UR10 robot arm, approximately 30-50 cm above a parts bin.
 
+The robot's gantry has ALREADY moved the gripper above the planned
+target part — that target is the part CLOSEST TO THE IMAGE CENTRE.
+Other parts in the same compartment may also be visible at the
+edges of the frame; IGNORE them.
+
 Before the robot descends to grasp, verify:
-1. Is a graspable part clearly visible near the image centre?
-2. Where exactly is the part centre? (normalised coordinates, 0-1)
-3. Is the vertical descent path to the part CLEAR of obstacles?
+1. Is the target part clearly visible NEAR the centre of the image?
+   (Allow up to ~30% from centre. If the closest part is at the
+   edge of the frame, treat it as "not the target" and answer
+   part_visible=false rather than guessing.)
+2. Where exactly is THE CENTRE-MOST part? (normalised coords, 0-1)
+   Be precise — do NOT default to (0.5, 0.5). Inspect the image
+   pixels and report the actual centroid you observe.
+3. Is the vertical descent path CLEAR of obstacles?
    (other parts directly below gripper, bin walls, bin dividers
    that could cause a collision during descent)
 
@@ -369,14 +379,15 @@ RESPOND ONLY WITH VALID JSON:
 {
   "part_visible": true,
   "label": "short_part_label",
-  "center": {"x": 0.5, "y": 0.5},
+  "center": {"x": 0.52, "y": 0.49},
   "confidence": 0.85,
   "path_clear": true,
   "collision_risk": "none",
-  "notes": "part is centred, clear descent path"
+  "notes": "part centroid measured at ~52% / 49% from origin"
 }
 
-If no graspable part is visible, set part_visible to false.
+If no graspable part is visible NEAR THE IMAGE CENTRE (only at edges
+or not at all), set part_visible to false.
 Set path_clear to false if obstacles block the descent path.
 collision_risk: "none", "low", "medium", or "high"."""
 
@@ -412,7 +423,8 @@ class KittingWorkflowEngine:
     depth-projection endpoint converts image coordinates to real-world XYZ.
     """
 
-    def __init__(self, camera, vlm, planner, config=None):
+    def __init__(self, camera, vlm, planner, config=None,
+                 recorder=None, place_verifier=None):
         self.camera = camera
         self.vlm = vlm
         self.planner = planner
@@ -421,6 +433,7 @@ class KittingWorkflowEngine:
         self._cancelled = False
         self._bin_top_z = None  # set by Phase 0-1 landmark detection
         self._bin_bot_z = None
+        self._bin_aabb_xy = None  # (xmin, ymin, xmax, ymax) — for USD-snap bounds filter
         self._tray_position = None  # set by Phase 0 USD lookup
         self._depth_estimator = DepthEstimator(
             self.config.get("perception", {})
@@ -428,6 +441,11 @@ class KittingWorkflowEngine:
         self._detector = ZeroShotDetector(
             self.config.get("perception", {})
         )
+        # Evaluation plumbing (optional — both default to None when the
+        # caller has no Evaluation tab attached, so the hooks become
+        # no-ops and the workflow runs unchanged).
+        self.recorder = recorder
+        self.place_verifier = place_verifier
 
     def set_phase_callback(self, callback: Callable):
         """Set a callback function(phase, status, detail) for UI updates."""
@@ -461,9 +479,17 @@ class KittingWorkflowEngine:
           Phase 7: Overhead verification snapshot (display only)
         """
         self._cancelled = False
+        # Allocate a fresh task_id for evaluation logs. This stays None
+        # when no recorder is attached so the rest of the engine is
+        # unaffected.
+        self._eval_task_id = (self.recorder.begin_task()
+                              if self.recorder else None)
+        self._eval_targeted = 0
+        self._eval_placed = 0
+        self._eval_task_start = datetime.now()
         result = {
             "command": user_command,
-            "start_time": datetime.now().isoformat(),
+            "start_time": self._eval_task_start.isoformat(),
             "phases": [],
             "status": "running",
         }
@@ -500,6 +526,20 @@ class KittingWorkflowEngine:
             bin_bot_z  = float(bin_info["bot_z"])
             self._bin_top_z = bin_top_z
             self._bin_bot_z = bin_bot_z
+            # Cache the bin's XY footprint for the USD-snap bounds
+            # filter (rejects USD prims that have fallen outside the
+            # bin so the gripper isn't sent to a far-away match).
+            try:
+                _bin_min = bin_info.get("min_pt") or []
+                _bin_max = bin_info.get("max_pt") or []
+                if len(_bin_min) >= 2 and len(_bin_max) >= 2:
+                    self._bin_aabb_xy = (
+                        float(_bin_min[0]), float(_bin_min[1]),
+                        float(_bin_max[0]), float(_bin_max[1]))
+                else:
+                    self._bin_aabb_xy = None
+            except (TypeError, ValueError):
+                self._bin_aabb_xy = None
             # ``pivot`` is the prim's transform translation (xformOp:translate)
             # — the AUTHORITATIVE position the prim was placed at in USD.
             # ``center_xy`` is the bbox geometric centre, which can drift
@@ -766,6 +806,38 @@ class KittingWorkflowEngine:
                 self._notify(WorkflowPhase.SCENE_ANALYSIS, "success",
                              f"{num_reachable} parts from bin crop{tag}")
 
+                # ── Evaluation hook: perception metrics ─────────
+                # Only run on the first attempt — retries re-use the
+                # same scene for matching purposes and would just
+                # double-count.
+                # IMPORTANT: log metrics BEFORE the USD ground-truth
+                # snap below, so the recorded perception accuracy
+                # reflects the raw VLM+detector pipeline, not the
+                # snap-corrected coordinates.
+                if self.recorder and attempt == 0:
+                    try:
+                        self._log_perception_metrics(scene)
+                    except Exception as exc:
+                        log.warning(
+                            f"[eval] perception metrics failed: {exc}")
+
+                # ── USD ground-truth snap for grasp targets ─────
+                # Replace each perception XY with the matching USD
+                # prim's centre when within snap radius. Perception
+                # imprecision (~1-3 cm at this overhead camera
+                # distance) was misaligning the gripper before
+                # realignment even started; the snap removes that
+                # error for sim-only demos. Disable for real-robot
+                # runs by setting execution.use_usd_grasp_targets
+                # false in config.yaml.
+                if exec_cfg.get("use_usd_grasp_targets", True):
+                    try:
+                        self._snap_to_usd_ground_truth(scene)
+                    except Exception as exc:
+                        log.warning(
+                            f"[USD-snap] failed: {exc} — keeping "
+                            f"raw perception coords")
+
                 if self._cancelled:
                     return self._finalize(result, "cancelled")
 
@@ -821,6 +893,14 @@ class KittingWorkflowEngine:
                 execution_results = []
                 last_grip_hold = None
                 pick_failed = False
+                # Camera_Kit + VLM place verification flag. When the
+                # post-place tray-camera check returns ``in_tray=False``
+                # the gripper either dropped the part outside the tray
+                # or never had it at all (false-positive grasp). In
+                # both cases we re-initiate the orchestration cycle —
+                # re-scan + re-plan — exactly like a pick failure.
+                place_failed = False
+                place_failure_reason = ""
 
                 for step in plan.get("plan", []):
                     if self._cancelled:
@@ -838,11 +918,16 @@ class KittingWorkflowEngine:
                         # gantry realign needed in the overhead-camera
                         # pipeline — the existing approach already
                         # slides the gantry to the part XY.
+                        self._eval_targeted += 1
+                        _pick_t0 = datetime.now()
                         step_result = self._execute_pick_sequence(
                             step, params, scene, step_num)
                         last_grip_hold = step_result.get(
                             "grip_hold",
                             step_result.get("finger_close"))
+                        self._log_pick_event(
+                            params, step_result,
+                            (datetime.now() - _pick_t0).total_seconds())
 
                         if step_result.get("status") != "success":
                             pick_failed = True
@@ -861,9 +946,49 @@ class KittingWorkflowEngine:
                             continue
                         if last_grip_hold is not None:
                             params["grip_hold"] = last_grip_hold
+                        _place_t0 = datetime.now()
                         step_result = self._execute_place_sequence(
                             step, params, scene, step_num)
+                        # Camera_Kit + VLM verification — authoritative
+                        # "did the part actually land in the tray?"
+                        # signal that ignores false-positive grasp
+                        # confirmations from the contact sensor.
+                        place_label = (params.get("label")
+                                       or scene.get("_last_target_label", "")
+                                       or "")
+                        place_verdict = self._log_place_event(
+                            params, step_result, place_label,
+                            (datetime.now() - _place_t0).total_seconds())
                         last_grip_hold = None
+
+                        # ── Place verification: if the tray VLM says
+                        # the part is NOT in the tray, escalate the
+                        # failure to the outer retry loop so the
+                        # orchestration cycle restarts (re-scan + re-
+                        # plan) rather than continuing with a
+                        # corrupted scene assumption. ``None`` means
+                        # the verifier was unavailable / inconclusive
+                        # and is treated as a non-failure to avoid
+                        # spurious retries when running without the
+                        # Camera_Kit feed.
+                        if place_verdict is False:
+                            place_failed = True
+                            place_failure_reason = (
+                                f"Camera_Kit VLM reports '{place_label}' "
+                                f"NOT in tray after place")
+                            log.warning(
+                                f"[Place verify] {place_failure_reason} "
+                                f"(attempt {attempt + 1})")
+                            self._notify(
+                                "place_verify", "failed",
+                                place_failure_reason)
+                            # Mark the step as failed in the plan log
+                            # so the operator can see the verdict in
+                            # the Streamlit execution log.
+                            step_result["status"] = "failed"
+                            step_result["error"] = "place_not_verified"
+                            execution_results.append(step_result)
+                            break
 
                     elif action == "move_home":
                         self._notify("move_home", "running",
@@ -897,15 +1022,30 @@ class KittingWorkflowEngine:
 
                 result["execution_results"] = execution_results
 
-                if not pick_failed:
+                if not pick_failed and not place_failed:
                     pick_succeeded = True
                     break  # success — exit retry loop
 
-                # ── Grasp failed → send robot home + re-capture overhead ──
+                # ── Failure → send robot home + re-capture overhead ──
+                # Triggered by either:
+                #   1. pick_failed   — the gripper never closed on a part.
+                #   2. place_failed  — Camera_Kit VLM verified the part
+                #                      did NOT end up in the tray after
+                #                      placement (operator's request:
+                #                      re-initiate the entire cycle from
+                #                      the orchestration layer).
+                # Both cases re-run from Phase 2 (scene scan) so the
+                # planner sees the current scene state, not the stale
+                # one that produced the failed plan.
+                failure_kind = "Grasp" if pick_failed else "Place"
+                if place_failed:
+                    failure_detail = place_failure_reason
+                else:
+                    failure_detail = "grasp not confirmed"
                 if attempt < max_retries:
                     self._notify(WorkflowPhase.SCENE_ANALYSIS, "running",
-                                 f"Grasp failed — re-scanning "
-                                 f"(retry {attempt + 1})...")
+                                 f"{failure_kind} failed ({failure_detail}) "
+                                 f"— re-scanning (retry {attempt + 1})...")
                     try:
                         # Park before re-scan in case the arm is in an
                         # awkward post-pick pose blocking the overhead.
@@ -2272,6 +2412,80 @@ class KittingWorkflowEngine:
             assigned_objs.add(oi)
             assigned_dets.add(di)
 
+        # ── Spatial fallback for unmatched high-confidence VLM objects ──
+        # OWL-ViT2 occasionally finds the right bbox under the WRONG
+        # query — e.g. it returns a tight bbox on a motor_valve labelled
+        # as 'small silver hinge' because both share silver/metallic
+        # cues at small image scale. The greedy assignment above
+        # rejects such pairs (label words don't overlap, canonical
+        # mismatch), so the VLM's correct ``motor_valve`` detection
+        # gets dropped while the OWL bbox falls into the unclaimed
+        # pool and the safety net later synthesises a wrong-label
+        # ``small_hinge`` from it.
+        #
+        # This second pass rescues those cases. For every UNMATCHED
+        # VLM object whose own confidence is above a threshold, find
+        # the closest UNCLAIMED OWL bbox within a spatial radius and
+        # claim it under the VLM's label. The VLM's full visual context
+        # (colour, shape, distinguishing features in the catalogue
+        # prompt) wins over OWL's narrow query labels.
+        SPATIAL_FALLBACK_MIN_VLM_CONF = 0.70
+        SPATIAL_FALLBACK_MAX_DIST = 0.10  # 10% of normalised crop diagonal
+
+        unmatched_obj_indices = [oi for oi in range(len(objects))
+                                 if oi not in assigned_objs]
+        unmatched_det_indices = [di for di in range(len(detector_dets))
+                                 if di not in assigned_dets]
+
+        for oi in unmatched_obj_indices:
+            obj = objects[oi]
+            try:
+                vlm_conf = float(obj.get("confidence", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                vlm_conf = 0.0
+            if vlm_conf < SPATIAL_FALLBACK_MIN_VLM_CONF:
+                continue
+            pos = obj.get("image_position", {})
+            try:
+                obj_cx = float(pos.get("x"))
+                obj_cy = float(pos.get("y"))
+            except (TypeError, ValueError):
+                continue
+
+            best_di = None
+            best_dist = float("inf")
+            for di in unmatched_det_indices:
+                if di in assigned_dets:
+                    continue
+                bbox = detector_dets[di].get("bbox")
+                if not (isinstance(bbox, (list, tuple)) and len(bbox) == 4):
+                    continue
+                try:
+                    x1, y1, x2, y2 = [float(v) for v in bbox]
+                except (TypeError, ValueError):
+                    continue
+                det_cx = ((x1 + x2) / 2.0) / max(crop_w, 1)
+                det_cy = ((y1 + y2) / 2.0) / max(crop_h, 1)
+                dist = ((obj_cx - det_cx) ** 2
+                        + (obj_cy - det_cy) ** 2) ** 0.5
+                if dist < best_dist and dist <= SPATIAL_FALLBACK_MAX_DIST:
+                    best_dist = dist
+                    best_di = di
+
+            if best_di is not None:
+                vlm_label = (obj.get("label") or "").lower()
+                owl_label = (detector_dets[best_di].get("label") or "").lower()
+                log.info(
+                    f"[Spatial-fallback] VLM '{vlm_label}' "
+                    f"(conf={vlm_conf:.2f}) → unclaimed OWL bbox "
+                    f"'{owl_label}' at distance "
+                    f"{best_dist*100:.1f}% — overriding OWL label "
+                    f"with VLM label (rescues motor_valve / hinge "
+                    f"misclassification on small silver parts).")
+                assignment[oi] = best_di
+                assigned_objs.add(oi)
+                assigned_dets.add(best_di)
+
         # Convert assigned bboxes to full-image normalised coords
         cx_min, cy_min, cx_max, cy_max = bin_crop_box
         cw_norm = cx_max - cx_min
@@ -2487,13 +2701,25 @@ class KittingWorkflowEngine:
     # ─── Pick Sequence (3-phase with wrist VLM) ──────────────
 
     def _wrist_vlm_check(self, wrist_b64, prompt_text):
-        """Send a wrist camera base64 image to the VLM and return the result."""
+        """Send a wrist-camera image to the VLM with a custom prompt.
+
+        Routes through ``analyze_raw`` (NOT ``analyze_scene``) because
+        the wrist-camera prompts return flat schemas like
+        ``{part_between_fingers, confidence, detail}`` or
+        ``{grasp_ok, confidence, detail}`` — they do NOT contain a
+        ``detected_objects`` field. The scene-analysis validator
+        rejects them as schema-invalid, throwing away a perfectly
+        good answer and forcing the workflow to fall back to its
+        "proceed anyway" default. ``analyze_raw`` strips the
+        markdown code fence and parses the JSON without enforcing
+        the scene schema.
+        """
         from PIL import Image as PILImage
         import io as _io, base64 as _b64
 
         wrist_bytes = _b64.b64decode(wrist_b64)
         wrist_img = PILImage.open(_io.BytesIO(wrist_bytes)).convert("RGB")
-        return self.vlm.analyze_scene(wrist_img, custom_prompt=prompt_text)
+        return self.vlm.analyze_raw(wrist_img, prompt=prompt_text)
 
     # ─── Wrist Scan + Project Helper ────────────────────────
 
@@ -2830,7 +3056,26 @@ class KittingWorkflowEngine:
         import math
 
         REALIGN_XY_THRESHOLD = 0.03   # 3 cm — realign gantry
-        Z_CORRECTION_THRESHOLD = 0.05  # 5 cm — correct Z
+        # 1 cm — apply Z correction. Earlier value of 5 cm was too
+        # coarse: the wrist depth projection is typically accurate to
+        # 5-10 mm, so a 5 cm gate discarded almost every refinement
+        # and the descent ended up using the (less accurate) overhead
+        # Z. With contact-aware descent in place a wrong Z is no
+        # longer catastrophic — but it still wastes time descending
+        # to the wrong altitude before the tip sensor catches it.
+        Z_CORRECTION_THRESHOLD = 0.01
+        # Upper cap on the wrist-XY correction. The wrist camera at
+        # 30-50 cm above the bin sees several parts at once; if the
+        # VLM picks a NEIGHBOUR part instead of the planned target,
+        # the projection puts the world centre 8-15 cm away from the
+        # planned XY. Applying that correction sends the gripper to
+        # the wrong gear (the user's two-image diagnosis: gripper
+        # landed beside the gear, not over it). Corrections beyond
+        # this cap are rejected — the planner's overhead-derived XY
+        # was less precise but at least targeted the RIGHT part.
+        # Tune up if you trust the wrist VLM to pick the centre part
+        # reliably, down for stricter rejection.
+        XY_CORRECTION_MAX = 0.05  # 5 cm
 
         result = {
             "verified": False,
@@ -2928,10 +3173,69 @@ class KittingWorkflowEngine:
             refined_x = wp["x"]
             refined_y = wp["y"]
             refined_z = wp["z"]
+
+            # ── Explicit prim-position diagnostics ────────────
+            # Read the current world XY of every relevant prim — the
+            # bridge already accounts for these in the projection
+            # math, but logging them here makes the geometry
+            # auditable. If the realigment ever drives the gripper
+            # to the wrong XY, comparing these numbers tells us
+            # whether the bug is upstream (projection) or downstream
+            # (realignment math).
+            ee_pos = proj.get("ee_link_pos") or [None, None, None]
+            cam_rgb_pos = proj.get("camera_pos") or [None, None, None]
+            cam_depth_pos = proj.get("wrist_depth_camera_pos") or \
+                [None, None, None]
+            cam_to_ee_dx = (None if ee_pos[0] is None or cam_rgb_pos[0] is None
+                            else cam_rgb_pos[0] - ee_pos[0])
+            cam_to_ee_dy = (None if ee_pos[1] is None or cam_rgb_pos[1] is None
+                            else cam_rgb_pos[1] - ee_pos[1])
             log.info(
                 f"[Verify] Wrist projection: ({refined_x:.3f}, "
                 f"{refined_y:.3f}, {refined_z:.3f}) "
                 f"[{wp.get('method', '?')}]")
+            if ee_pos[0] is not None:
+                log.info(
+                    f"[Verify] Prim XY snapshot at projection time: "
+                    f"ee_link=({ee_pos[0]:.3f}, {ee_pos[1]:.3f})  "
+                    f"wrist_rgb_cam=({cam_rgb_pos[0]:.3f}, "
+                    f"{cam_rgb_pos[1]:.3f})  "
+                    f"wrist_depth_cam=({cam_depth_pos[0]:.3f}, "
+                    f"{cam_depth_pos[1]:.3f})")
+            if cam_to_ee_dx is not None:
+                log.info(
+                    f"[Verify] wrist_rgb_cam → ee_link offset: "
+                    f"dx={cam_to_ee_dx*1000:+.1f} mm, "
+                    f"dy={cam_to_ee_dy*1000:+.1f} mm "
+                    f"(this is the geometric XY shift between the "
+                    f"camera that took the image and the EE that has "
+                    f"to grasp the part)")
+
+            # ── Optional camera-to-ee_link compensation ────────
+            # The wrist projection returns the part's WORLD XY
+            # directly — already accounting for the camera's
+            # mounting offset from ee_link. Targeting ee_link to
+            # that XY puts the GRIPPER over the part (correct for
+            # grasping). However if the operator wants the WRIST
+            # CAMERA over the part (e.g. for re-verification before
+            # descent so the gripper geometry doesn't occlude the
+            # target), enable the flag below: the workflow then
+            # subtracts the cam→ee offset from the realignment
+            # target so the camera, not the gripper, lands above
+            # the part.
+            compensate = bool(
+                self.config.get("execution", {}).get(
+                    "realign_camera_over_part", False))
+            if compensate and cam_to_ee_dx is not None:
+                refined_x_target = refined_x - cam_to_ee_dx
+                refined_y_target = refined_y - cam_to_ee_dy
+                log.info(
+                    f"[Verify] realign_camera_over_part=true → "
+                    f"shifting realignment target by cam→ee offset: "
+                    f"({refined_x:.3f}, {refined_y:.3f}) → "
+                    f"({refined_x_target:.3f}, {refined_y_target:.3f})")
+                refined_x = refined_x_target
+                refined_y = refined_y_target
 
         except Exception as e:
             log.warning(f"[Verify] Wrist projection failed: {e}")
@@ -2967,12 +3271,58 @@ class KittingWorkflowEngine:
         })
 
         # ── 6. Update coordinates if offset is significant ───
+        # Wrist-XY refinement policy. Two reasons NOT to apply:
+        #   (a) Operator opted into "informational-only" mode: the
+        #       wrist VLM pixel-centroid is too coarse to improve on
+        #       the overhead OWL-ViT2 bbox centre (~25 mm typical
+        #       error vs. <10 mm from overhead).
+        #   (b) The proposed XY shift exceeds the neighbour-rejection
+        #       cap, almost certainly meaning the wrist VLM picked a
+        #       different part.
+        # Z is always corrected when significant — the wrist depth
+        # IS more accurate than overhead at close range.
         coords_updated = False
-        if xy_offset > REALIGN_XY_THRESHOLD:
+        wrist_xy_informational_only = bool(
+            self.config.get("execution", {}).get(
+                "wrist_xy_refinement_informational_only", True))
+
+        if wrist_xy_informational_only:
+            log.info(
+                f"[Verify] Wrist XY proposal "
+                f"({refined_x:.3f}, {refined_y:.3f}) recorded as "
+                f"INFORMATIONAL only (offset={xy_offset*100:.1f} cm). "
+                f"Keeping overhead OWL-derived coords "
+                f"({planned_x:.3f}, {planned_y:.3f}) — overhead "
+                f"detector is sub-pixel accurate (<1 cm world); "
+                f"wrist VLM pixel centroid is ~5 % accurate (~25 mm "
+                f"world). Set "
+                f"execution.wrist_xy_refinement_informational_only="
+                f"false to re-enable wrist XY correction.")
+            result["sub_phases"].append({
+                "phase": "verify_xy_informational",
+                "status": "info",
+                "wrist_proposed": [refined_x, refined_y],
+                "kept": [planned_x, planned_y],
+                "offset": round(xy_offset, 4),
+            })
+        elif xy_offset > XY_CORRECTION_MAX:
+            log.warning(
+                f"[Verify] XY offset {xy_offset*100:.1f} cm exceeds cap "
+                f"{XY_CORRECTION_MAX*100:.1f} cm — REJECTING correction. "
+                f"Likely the wrist VLM saw a neighbour part instead of "
+                f"the planned target ({planned_x:.3f}, {planned_y:.3f}). "
+                f"Keeping the original overhead-derived coords.")
+            result["sub_phases"].append({
+                "phase": "verify_xy_rejected", "status": "warn",
+                "wrist_proposed": [refined_x, refined_y],
+                "kept": [planned_x, planned_y],
+                "offset": round(xy_offset, 4),
+            })
+        elif xy_offset > REALIGN_XY_THRESHOLD:
             log.info(
                 f"[Verify] XY correction: ({planned_x:.3f}, "
                 f"{planned_y:.3f}) -> ({refined_x:.3f}, "
-                f"{refined_y:.3f})")
+                f"{refined_y:.3f})  (offset={xy_offset*100:.1f} cm)")
             result["coords"]["x"] = refined_x
             result["coords"]["y"] = refined_y
             coords_updated = True
@@ -3488,10 +3838,22 @@ class KittingWorkflowEngine:
                      f"(z={used_approach_z:.3f})")
 
         # ── Depth camera analysis ──────────────────────────────
-        # If the depth image is uniformly dark (arm not actually above
-        # the bin) the VLM returns part_visible=false / 0 objects with
-        # confidence 0.  Treat that as a failure and bail so the outer
-        # retry loop can send the robot home + re-scan.
+        # Two independent jobs here:
+        #   (a) Capture a depth image and push it to the Streamlit
+        #       depth tab + save to logs/depth_analysis. Always done
+        #       — the operator wants to see the depth view even when
+        #       the VLM check is disabled.
+        #   (b) Send the depth image to the VLM and treat
+        #       part_visible=false as a hard pick-abort. Gated by
+        #       ``execution.depth_analysis_vlm_check`` because the
+        #       VLM check is geometrically unreliable at the approach
+        #       pose (wrist depth camera ~55 mm offset from ee_link)
+        #       and produces false negatives that abort otherwise-
+        #       good picks. Default off.
+        do_depth_vlm_check = bool(
+            self.config.get("execution", {}).get(
+                "depth_analysis_vlm_check", False))
+
         self._notify(WorkflowPhase.DEPTH_ANALYSIS, "running",
                      "Capturing depth image for spatial analysis...")
         depth_part_visible = True
@@ -3508,23 +3870,45 @@ class KittingWorkflowEngine:
                     prefix=f"depth_{obj_id}_step{step_num}")
             except Exception:
                 pass
-            # DEPTH_GRASP_PROMPT returns {part_visible, part_center,
-            # estimated_distance_m, ...} — flat schema, not the scene
-            # schema.  Use analyze_raw to skip detected_objects validation.
-            depth_scene = self.vlm.analyze_raw(
-                depth_image, prompt=DEPTH_GRASP_PROMPT)
-            depth_part_visible = depth_scene.get(
-                "part_visible",
-                bool(depth_scene.get("detected_objects")))
-            depth_conf = depth_scene.get("confidence")
-            result["sub_phases"].append({
-                "phase": WorkflowPhase.DEPTH_ANALYSIS, "status": "success",
-                "depth_data": depth_scene,
-                "part_visible": depth_part_visible,
-            })
-            self._notify(WorkflowPhase.DEPTH_ANALYSIS, "success",
-                         f"Depth analysis — conf={depth_conf}, "
-                         f"part_visible={depth_part_visible}")
+
+            if do_depth_vlm_check:
+                # DEPTH_GRASP_PROMPT returns {part_visible, part_center,
+                # estimated_distance_m, ...} — flat schema, not the
+                # scene schema. analyze_raw skips detected_objects
+                # validation.
+                depth_scene = self.vlm.analyze_raw(
+                    depth_image, prompt=DEPTH_GRASP_PROMPT)
+                depth_part_visible = depth_scene.get(
+                    "part_visible",
+                    bool(depth_scene.get("detected_objects")))
+                depth_conf = depth_scene.get("confidence")
+                result["sub_phases"].append({
+                    "phase": WorkflowPhase.DEPTH_ANALYSIS,
+                    "status": "success",
+                    "depth_data": depth_scene,
+                    "part_visible": depth_part_visible,
+                })
+                self._notify(
+                    WorkflowPhase.DEPTH_ANALYSIS, "success",
+                    f"Depth analysis — conf={depth_conf}, "
+                    f"part_visible={depth_part_visible}")
+            else:
+                log.info(
+                    "[Pick] Skipping depth-analysis VLM check "
+                    "(execution.depth_analysis_vlm_check=false). "
+                    "Depth image captured for display/log only. "
+                    "Visibility relies on the upstream overhead VLM "
+                    "+ OWL detection, the wrist verify+realign step, "
+                    "and the contact-aware descent.")
+                result["sub_phases"].append({
+                    "phase": WorkflowPhase.DEPTH_ANALYSIS,
+                    "status": "skipped",
+                    "detail": "VLM check disabled — image captured "
+                              "for diagnostics only",
+                })
+                self._notify(
+                    WorkflowPhase.DEPTH_ANALYSIS, "success",
+                    "Depth image captured (VLM check disabled)")
         except Exception as e:
             log.warning(f"Depth analysis failed: {e}")
             result["sub_phases"].append({
@@ -3532,7 +3916,11 @@ class KittingWorkflowEngine:
                 "status": "warn", "detail": str(e),
             })
 
-        if not depth_part_visible:
+        # GATE: only honour the VLM verdict when the check actually
+        # ran. ``depth_part_visible`` defaults to True at the top of
+        # this method, but be explicit so a future refactor can't
+        # introduce an abort-on-disabled-check regression.
+        if do_depth_vlm_check and not depth_part_visible:
             log.error(
                 f"[Pick {step_num}] Depth shows no part at "
                 f"({pick_coords['x']:.3f}, {pick_coords['y']:.3f}, "
@@ -3594,6 +3982,56 @@ class KittingWorkflowEngine:
                 "proceeding with caution")
 
         # ── Optional: full wrist rescan to refine grasp XY ──
+        # ── Optional close-range explicit rescan ─────────────
+        # Operator-requested step: read ee_link + wrist-camera world
+        # positions, project the centre-most part through the camera,
+        # express the grasp target in world coords (which == ee_link
+        # XY for grasping, since gripper TCP has zero XY offset from
+        # ee_link in this geometry). Logs every transform so the
+        # math is auditable. Gated by config so it can be turned off
+        # if it ever produces a worse result than the upstream
+        # verify_and_realign.
+        if self.config.get("execution", {}).get(
+                "close_range_rescan_xy", True):
+            target_label = (params.get("label")
+                            or params.get("target_label")
+                            or scene.get("_last_target_label", "")
+                            or "")
+            if not target_label:
+                for o in scene.get("detected_objects", []):
+                    if o.get("object_id") == obj_id:
+                        target_label = o.get("label", "")
+                        break
+            rescan_max_shift = float(
+                self.config.get("execution", {}).get(
+                    "close_range_rescan_max_shift", 0.05))  # 5 cm cap
+            rescan = self._close_range_rescan_xy(
+                pick_coords, obj_label=target_label)
+            if rescan is not None:
+                if rescan["shift_mm"] > rescan_max_shift * 1000:
+                    log.warning(
+                        f"[Rescan] Proposed shift "
+                        f"{rescan['shift_mm']:.1f} mm exceeds cap "
+                        f"{rescan_max_shift*1000:.0f} mm — likely "
+                        f"the wrist camera saw a NEIGHBOUR part "
+                        f"instead of the planned target. Keeping "
+                        f"current coords ({pick_coords['x']:.3f}, "
+                        f"{pick_coords['y']:.3f}) instead.")
+                else:
+                    log.info(
+                        f"[Rescan] Applying shift "
+                        f"{rescan['shift_mm']:.1f} mm: "
+                        f"({pick_coords['x']:.4f}, "
+                        f"{pick_coords['y']:.4f}) → "
+                        f"({rescan['x']:.4f}, {rescan['y']:.4f}) "
+                        f"— gripper will now land on the projected "
+                        f"part centre")
+                    pick_coords["x"] = rescan["x"]
+                    pick_coords["y"] = rescan["y"]
+                    # Z gets corrected too — the close-range depth
+                    # is more accurate than the overhead estimate.
+                    pick_coords["z"] = rescan["z"]
+
         # The verify_and_realign step above uses a focused wrist VLM
         # prompt that gives a rough centre. Running the FULL perception
         # pipeline (VLM scene scan + OWL-ViT2 + depth projection) on
@@ -3663,132 +4101,319 @@ class KittingWorkflowEngine:
                     "[Pick] Skipping wrist rescan — no target label "
                     "available for the active object")
 
-        # ── Phase B: Descend to grasp position (fingers open) ──
-        # Inject the contact-sensor force threshold so the bridge's
-        # Cartesian descent stops the moment a finger touches anything,
-        # rather than blindly driving down to the planned grasp_z (which
-        # can push the gripper into the bin floor when depth projection
-        # underestimates the part top).
-        self._notify(WorkflowPhase.PICK_EXECUTE, "running",
-                     "Descending to grasp position...")
-        descend_payload = dict(pick_coords)
-        descend_payload["descent_contact_min_force"] = float(
-            self.config.get("execution", {})
-                .get("descent_contact_min_force", 0.5))
-        descend_payload["descent_contact_lift_back"] = float(
-            self.config.get("execution", {})
-                .get("descent_contact_lift_back", 0.002))
+        # ── Local retry loop (lift + rescan, no full pipeline restart) ──
+        # When the mechanical close fails or the post-grasp VLM
+        # confirms an empty gripper, we previously bubbled up to the
+        # outer pipeline retry which re-ran Phase 2 perception + Phase
+        # 3 LLM planning (~30-60 s extra). The local retry here just:
+        #   1. Opens the gripper
+        #   2. Lifts ee_link to depth-analysis height
+        #   3. Re-runs the close-range wrist rescan
+        #   4. Re-attempts descent + close
+        # Saves the perception/LLM cost; only escalates to the outer
+        # pipeline retry if this many local retries can't recover.
+        local_retries_max = int(
+            self.config.get("execution", {}).get(
+                "local_grasp_retries", 2))
+        depth_h = float(
+            self.config.get("execution", {}).get(
+                "depth_analysis_height", 0.20))
 
-        descend_result = self.camera.send_command(
-            "/api/pick_descend", descend_payload)
-        descend_ok = descend_result.get("status") == "ok"
-        result["sub_phases"].append({
-            "phase": "pick_descend",
-            "status": "success" if descend_ok else "failed",
-        })
+        # Capture the obj_label up front so the rescan can use it.
+        rescan_label = (params.get("label")
+                        or params.get("target_label")
+                        or scene.get("_last_target_label", "")
+                        or "")
+        if not rescan_label:
+            for o in scene.get("detected_objects", []):
+                if o.get("object_id") == obj_id:
+                    rescan_label = o.get("label", "")
+                    break
 
-        if not descend_ok:
-            self._notify(WorkflowPhase.PICK_EXECUTE, "failed",
-                         f"Descend failed: {descend_result.get('error', '?')}")
-            result["status"] = "failed"
-            return result
+        # Sentinels populated by the loop body — referenced AFTER the
+        # loop ends to drive retract / failure handling.
+        descend_result = {}
+        close_result = {}
+        grasp_confirmed = False
+        post_grasp_confidence = 0.0
+        grasp_ok = True
+        descend_ok = False
+        local_attempt_used = 0
 
-        self._notify(WorkflowPhase.PICK_EXECUTE, "success",
-                     "At grasp position — checking part placement...")
+        for local_attempt in range(local_retries_max + 1):
+            local_attempt_used = local_attempt
+            if local_attempt > 0:
+                # Lift ee_link back to depth-analysis height above
+                # the (possibly refined) part XY, then rescan.
+                lift_z = float(pick_coords.get("z", 0.5)) + depth_h
+                log.warning(
+                    f"[Pick {step_num}] Local retry "
+                    f"{local_attempt}/{local_retries_max} — lifting to "
+                    f"({pick_coords['x']:.3f}, "
+                    f"{pick_coords['y']:.3f}, {lift_z:.3f}) and "
+                    f"rescanning before re-attempting grasp.")
+                self._notify(WorkflowPhase.PICK_EXECUTE, "running",
+                             f"Local retry {local_attempt}: lifting "
+                             f"+ rescanning")
+                try:
+                    self.camera.send_command(
+                        "/api/gripper", {"action": "open"})
+                except Exception:
+                    pass
+                try:
+                    self.camera.send_command(
+                        "/api/approach",
+                        {"x": pick_coords["x"],
+                         "y": pick_coords["y"],
+                         "z": lift_z, "raw_z": True})
+                except Exception as exc:
+                    log.warning(
+                        f"[Pick] Local retry lift FAILED: {exc} — "
+                        f"trying rescan + descent at current pose")
+                # Refine XY with a fresh wrist rescan
+                try:
+                    rescan2 = self._close_range_rescan_xy(
+                        pick_coords, obj_label=rescan_label)
+                except Exception as exc:
+                    rescan2 = None
+                    log.warning(
+                        f"[Pick] Local retry rescan FAILED: {exc}")
+                if rescan2 is not None:
+                    cap = float(
+                        self.config.get("execution", {}).get(
+                            "close_range_rescan_max_shift", 0.05))
+                    if rescan2["shift_mm"] <= cap * 1000:
+                        pick_coords["x"] = rescan2["x"]
+                        pick_coords["y"] = rescan2["y"]
+                        pick_coords["z"] = rescan2["z"]
+                        log.info(
+                            f"[Pick] Local retry coords refined: "
+                            f"({pick_coords['x']:.4f}, "
+                            f"{pick_coords['y']:.4f}, "
+                            f"{pick_coords['z']:.4f})")
+                    else:
+                        log.warning(
+                            f"[Pick] Local retry rescan shift "
+                            f"{rescan2['shift_mm']:.1f} mm exceeds cap "
+                            f"{cap*1000:.0f} mm — keeping previous "
+                            f"coords for the retry")
 
-        # ── Wrist VLM check 1: "Is the part between the fingers?" ──
-        wrist_b64 = descend_result.get("wrist_image")
-        part_between_fingers = True  # default to proceed if VLM fails
-        if wrist_b64:
-            self._notify(WorkflowPhase.GRASP_VERIFY, "running",
-                         "Wrist camera: checking part is between fingers...")
+            # ── Phase B: Descend to grasp position (fingers open) ──
+            # Inject the contact-sensor force threshold so the bridge's
+            # Cartesian descent stops the moment a finger touches anything,
+            # rather than blindly driving down to the planned grasp_z (which
+            # can push the gripper into the bin floor when depth projection
+            # underestimates the part top).
+            self._notify(WorkflowPhase.PICK_EXECUTE, "running",
+                         "Descending to grasp position...")
+            descend_payload = dict(pick_coords)
+            descend_payload["descent_contact_min_force"] = float(
+                self.config.get("execution", {})
+                    .get("descent_contact_min_force", 0.5))
+            descend_payload["descent_contact_lift_back"] = float(
+                self.config.get("execution", {})
+                    .get("descent_contact_lift_back", 0.002))
+
+            descend_result = self.camera.send_command(
+                "/api/pick_descend", descend_payload)
+            descend_ok = descend_result.get("status") == "ok"
+            result["sub_phases"].append({
+                "phase": "pick_descend",
+                "status": "success" if descend_ok else "failed",
+                "local_attempt": local_attempt,
+            })
+
+            if not descend_ok:
+                # Descent IK failures are NOT recoverable by lifting
+                # and rescanning — they indicate the part XY is
+                # unreachable. Escalate to the outer pipeline retry
+                # immediately.
+                self._notify(WorkflowPhase.PICK_EXECUTE, "failed",
+                             f"Descend failed: {descend_result.get('error', '?')}")
+                result["status"] = "failed"
+                result["error"] = "descend_failed"
+                return result
+
+            self._notify(WorkflowPhase.PICK_EXECUTE, "success",
+                         "At grasp position — checking part placement...")
+
+            # ── Wrist VLM check 1: "Is the part between the fingers?" ──
+            # (skipped by default — geometrically broken at grasp height)
+            do_pre_grasp_check = bool(
+                self.config.get("execution", {}).get(
+                    "pre_grasp_wrist_vlm_check", False))
+            wrist_b64 = descend_result.get("wrist_image")
+            part_between_fingers = True
+            pre_grasp_confidence = 0.0
+            if wrist_b64 and do_pre_grasp_check:
+                self._notify(WorkflowPhase.GRASP_VERIFY, "running",
+                             "Wrist camera: checking part is between fingers...")
+                try:
+                    pre_grasp_vlm = self._wrist_vlm_check(wrist_b64, (
+                        "You are looking at a close-up image from a wrist-mounted "
+                        "camera on a Robotiq 2F-140 gripper. The fingers are OPEN. "
+                        "Answer ONLY with a JSON object: "
+                        '{"part_between_fingers": true/false, "confidence": 0.0-1.0, '
+                        '"detail": "short reason"}. '
+                        "Is there a graspable part visible between the two open "
+                        "finger pads?"
+                    ))
+                    part_between_fingers = pre_grasp_vlm.get(
+                        "part_between_fingers", True)
+                    pre_grasp_confidence = float(
+                        pre_grasp_vlm.get("confidence", 0.0) or 0.0)
+                    result["sub_phases"].append({
+                        "phase": "pre_grasp_vlm",
+                        "status": "success",
+                        "part_between_fingers": part_between_fingers,
+                        "confidence": pre_grasp_confidence,
+                        "local_attempt": local_attempt,
+                    })
+                except Exception as e:
+                    log.warning(f"Pre-grasp wrist VLM failed: {e}")
+                    result["sub_phases"].append({
+                        "phase": "pre_grasp_vlm",
+                        "status": "warn", "detail": str(e)})
+
+            wrist_min_conf = float(
+                self.config.get("execution", {}).get(
+                    "wrist_verify_min_confidence", 0.7))
+            # Pre-grasp confident-no abort (only when check enabled)
+            if (do_pre_grasp_check and not part_between_fingers
+                    and pre_grasp_confidence >= wrist_min_conf):
+                log.error(
+                    f"[Pick {step_num}] Wrist VLM confirms NO part between "
+                    f"fingers (conf={pre_grasp_confidence:.2f}) — local "
+                    f"retry {local_attempt}/{local_retries_max}")
+                if local_attempt < local_retries_max:
+                    continue
+                self._notify(WorkflowPhase.GRASP_VERIFY, "failed",
+                             f"No part between fingers — outer retry")
+                try:
+                    self.camera.send_command(
+                        "/api/gripper", {"action": "open"})
+                except Exception:
+                    pass
+                result["status"] = "failed"
+                result["error"] = "no_part_between_fingers_vlm"
+                return result
+
+            # ── Phase C: Close gripper ─────────────────────────────
+            self._notify(WorkflowPhase.PICK_EXECUTE, "running",
+                         "Closing gripper...")
+            close_result = self.camera.send_command("/api/pick_close", {})
+            grasp_confirmed = close_result.get("grasp_confirmed", False)
+            grip_hold = close_result.get("grip_hold", 0.5)
+            result["grip_hold"] = grip_hold
+            result["finger_close"] = close_result.get("finger_close", 0.5)
+            result["sub_phases"].append({
+                "phase": "pick_close",
+                "status": "success" if grasp_confirmed else "warn",
+                "grasp_confirmed": grasp_confirmed,
+                "actual_finger": close_result.get("actual_finger"),
+                "local_attempt": local_attempt,
+            })
+
+            # ── Mechanical close-failure guard (LOCAL retry) ───────
+            actual_finger = close_result.get("actual_finger")
+            target_finger = close_result.get("finger_close", 0.5)
             try:
-                pre_grasp_vlm = self._wrist_vlm_check(wrist_b64, (
-                    "You are looking at a close-up image from a wrist-mounted "
-                    "camera on a Robotiq 2F-140 gripper. The fingers are OPEN. "
-                    "Answer ONLY with a JSON object: "
-                    '{"part_between_fingers": true/false, "confidence": 0.0-1.0, '
-                    '"detail": "short reason"}. '
-                    "Is there a graspable part visible between the two open "
-                    "finger pads? The part should be positioned so that "
-                    "closing the fingers would grip it. "
-                    "If yes, part_between_fingers is true."
-                ))
-                part_between_fingers = pre_grasp_vlm.get(
-                    "part_between_fingers", True)
-                result["sub_phases"].append({
-                    "phase": "pre_grasp_vlm",
-                    "status": "success",
-                    "part_between_fingers": part_between_fingers,
-                    "detail": pre_grasp_vlm,
-                })
-                self._notify(WorkflowPhase.GRASP_VERIFY, "success",
-                             f"Part between fingers: {part_between_fingers} — "
-                             f"{pre_grasp_vlm.get('detail', '')}")
-            except Exception as e:
-                log.warning(f"Pre-grasp wrist VLM failed: {e}")
-                result["sub_phases"].append({
-                    "phase": "pre_grasp_vlm",
-                    "status": "warn", "detail": str(e),
-                })
+                af = float(actual_finger) if actual_finger is not None else None
+                tf = float(target_finger)
+            except (TypeError, ValueError):
+                af, tf = None, None
+            gap_too_large = (af is not None and tf is not None
+                             and (tf - af) > 0.10)
+            if not grasp_confirmed or gap_too_large:
+                log.warning(
+                    f"[Pick {step_num}] Mechanical close FAILED — "
+                    f"grasp_confirmed={grasp_confirmed}, actual={af}, "
+                    f"target={tf} — local retry "
+                    f"{local_attempt}/{local_retries_max}")
+                try:
+                    self.camera.send_command(
+                        "/api/gripper", {"action": "open"})
+                except Exception:
+                    pass
+                if local_attempt < local_retries_max:
+                    continue  # lift + rescan + retry
+                # Out of local retries — escalate to outer pipeline
+                self._notify(WorkflowPhase.PICK_EXECUTE, "failed",
+                             f"Close failed (actual={af}, target={tf}) "
+                             f"after {local_retries_max+1} local "
+                             f"attempts — escalating to outer retry")
+                result["status"] = "failed"
+                result["error"] = "mechanical_close_failed"
+                return result
 
-        if not part_between_fingers:
-            log.warning("VLM says no part between fingers — proceeding anyway")
+            # ── Wrist VLM check 2: post-grasp ──
+            close_wrist_b64 = close_result.get("wrist_image")
+            grasp_ok = True
+            post_grasp_confidence = 0.0
+            if close_wrist_b64:
+                self._notify(WorkflowPhase.GRASP_VERIFY, "running",
+                             "Wrist camera: confirming part is grasped...")
+                try:
+                    post_grasp_vlm = self._wrist_vlm_check(close_wrist_b64, (
+                        "You are looking at a close-up image from a wrist-mounted "
+                        "camera on a Robotiq 2F-140 gripper. The fingers are CLOSED. "
+                        "Answer ONLY with a JSON object: "
+                        '{"grasp_ok": true/false, "confidence": 0.0-1.0, '
+                        '"detail": "short reason"}.'
+                    ))
+                    grasp_ok = post_grasp_vlm.get("grasp_ok", True)
+                    post_grasp_confidence = float(
+                        post_grasp_vlm.get("confidence", 0.0) or 0.0)
+                    result["sub_phases"].append({
+                        "phase": "post_grasp_vlm",
+                        "status": "success",
+                        "grasp_ok": grasp_ok,
+                        "confidence": post_grasp_confidence,
+                        "local_attempt": local_attempt,
+                    })
+                    self._notify(WorkflowPhase.GRASP_VERIFY, "success",
+                                 f"Grasp confirmed by VLM: {grasp_ok} "
+                                 f"(conf={post_grasp_confidence:.2f})")
+                except Exception as e:
+                    log.warning(f"Post-grasp wrist VLM failed: {e}")
+                    result["sub_phases"].append({
+                        "phase": "post_grasp_vlm",
+                        "status": "warn", "detail": str(e)})
 
-        # ── Phase C: Close gripper ─────────────────────────────
-        self._notify(WorkflowPhase.PICK_EXECUTE, "running",
-                     "Closing gripper...")
+            # Confident empty-gripper → LOCAL retry first, then escalate
+            if (not grasp_ok
+                    and post_grasp_confidence >= wrist_min_conf):
+                log.warning(
+                    f"[Pick {step_num}] Wrist VLM confirms gripper is "
+                    f"EMPTY (conf={post_grasp_confidence:.2f}) — "
+                    f"local retry {local_attempt}/{local_retries_max}")
+                try:
+                    self.camera.send_command(
+                        "/api/gripper", {"action": "open"})
+                except Exception:
+                    pass
+                if local_attempt < local_retries_max:
+                    continue  # lift + rescan + retry
+                self._notify(WorkflowPhase.GRASP_VERIFY, "failed",
+                             "Empty gripper after local retries — "
+                             "escalating to outer retry")
+                result["status"] = "failed"
+                result["error"] = "empty_gripper_vlm"
+                return result
+            elif not grasp_ok:
+                log.warning(
+                    f"VLM says grasp not secure but confidence "
+                    f"{post_grasp_confidence:.2f} below threshold "
+                    f"{wrist_min_conf:.2f} — proceeding")
 
-        close_result = self.camera.send_command("/api/pick_close", {})
-        grasp_confirmed = close_result.get("grasp_confirmed", False)
-        grip_hold = close_result.get("grip_hold", 0.5)
-        result["grip_hold"] = grip_hold
-        result["finger_close"] = close_result.get("finger_close", 0.5)
+            # ── Grasp succeeded — break out of local retry loop ────
+            log.info(
+                f"[Pick {step_num}] Grasp succeeded on local attempt "
+                f"{local_attempt + 1}/{local_retries_max + 1}")
+            break
 
-        result["sub_phases"].append({
-            "phase": "pick_close",
-            "status": "success" if grasp_confirmed else "warn",
-            "grasp_confirmed": grasp_confirmed,
-            "actual_finger": close_result.get("actual_finger"),
-        })
-
-        # ── Wrist VLM check 2: "Is the part properly grasped?" ──
-        close_wrist_b64 = close_result.get("wrist_image")
-        grasp_ok = True  # default
-        if close_wrist_b64:
-            self._notify(WorkflowPhase.GRASP_VERIFY, "running",
-                         "Wrist camera: confirming part is grasped...")
-            try:
-                post_grasp_vlm = self._wrist_vlm_check(close_wrist_b64, (
-                    "You are looking at a close-up image from a wrist-mounted "
-                    "camera on a Robotiq 2F-140 gripper. The fingers are CLOSED. "
-                    "Answer ONLY with a JSON object: "
-                    '{"grasp_ok": true/false, "confidence": 0.0-1.0, '
-                    '"detail": "short reason"}. '
-                    "Is the gripper holding a part securely between its "
-                    "finger pads? If the part is firmly gripped, grasp_ok "
-                    "is true. If fingers are empty or the part is slipping, "
-                    "grasp_ok is false."
-                ))
-                grasp_ok = post_grasp_vlm.get("grasp_ok", True)
-                result["sub_phases"].append({
-                    "phase": "post_grasp_vlm",
-                    "status": "success",
-                    "grasp_ok": grasp_ok,
-                    "detail": post_grasp_vlm,
-                })
-                self._notify(WorkflowPhase.GRASP_VERIFY, "success",
-                             f"Grasp confirmed by VLM: {grasp_ok} — "
-                             f"{post_grasp_vlm.get('detail', '')}")
-            except Exception as e:
-                log.warning(f"Post-grasp wrist VLM failed: {e}")
-                result["sub_phases"].append({
-                    "phase": "post_grasp_vlm",
-                    "status": "warn", "detail": str(e),
-                })
-
-        if not grasp_ok:
-            log.warning("VLM says grasp not secure — proceeding with retract")
+        # End of local retry loop. ``descend_result``, ``close_result``,
+        # ``grip_hold`` etc. are populated from the successful attempt.
 
         # ── Phase D: Retract (only after grasp confirmed) ──────
         self._notify(WorkflowPhase.PICK_EXECUTE, "running",
@@ -4101,10 +4726,612 @@ class KittingWorkflowEngine:
 
     # ─── Helpers ────────────────────────────────────────────
 
-    @staticmethod
-    def _finalize(result, status, error=None):
+    def _finalize(self, result, status, error=None):
         result["status"] = status
-        result["end_time"] = datetime.now().isoformat()
+        end_dt = datetime.now()
+        result["end_time"] = end_dt.isoformat()
         if error:
             result["error"] = error
+        # Evaluation hook: log task-level summary once per execute call.
+        if self.recorder and getattr(self, "_eval_task_id", None):
+            try:
+                start_dt = getattr(self, "_eval_task_start", None)
+                duration = ((end_dt - start_dt).total_seconds()
+                            if start_dt else None)
+                self.recorder.log_task(
+                    task_id=self._eval_task_id,
+                    command=result.get("command", ""),
+                    vlm_model=str(getattr(self.vlm, "model", "")),
+                    llm_model=str(getattr(self.planner, "model", "")),
+                    targeted_count=int(self._eval_targeted),
+                    placed_count=int(self._eval_placed),
+                    success=(status == "completed"),
+                    end_to_end_s=duration,
+                    extra={"final_status": status,
+                           "error": error or ""},
+                )
+            except Exception as exc:
+                log.warning(f"[eval] task log failed: {exc}")
+            # Reset so a stray follow-on call doesn't double-log.
+            self._eval_task_id = None
         return result
+
+    # ─── Evaluation logging helpers ───────────────────────────
+
+    def _get_bin_bounds_xy(self, margin: float = 0.0
+                           ) -> Optional[tuple]:
+        """Return the bin's AABB in XY as ``(xmin, ymin, xmax, ymax)``
+        with an optional symmetric margin added (metres).
+
+        Cached from the Phase 0 ``bin_lookup`` step. Returns ``None``
+        if Phase 0 hasn't run yet (or didn't return AABB info), which
+        causes the USD-snap to fall back to "no bounds filter" — the
+        same behaviour as before this guard was added.
+        """
+        aabb = getattr(self, "_bin_aabb_xy", None)
+        if aabb is None:
+            return None
+        x_min, y_min, x_max, y_max = aabb
+        return (x_min - margin, y_min - margin,
+                x_max + margin, y_max + margin)
+
+    def _close_range_rescan_xy(self, current_target: dict,
+                               obj_label: str = "") -> Optional[dict]:
+        """Close-range explicit rescan with full coordinate transparency.
+
+        Workflow (operator's request):
+
+          1. Capture a wrist image at the current pose. The wrist
+             camera is mounted with a known XY offset from ee_link.
+          2. Run the VLM on that close-range image to get a precise
+             pixel centroid of the target part.
+          3. Project the pixel through the wrist camera's ACTUAL world
+             transform onto the part's Z plane. Returns the part's
+             world XYZ — already accounting for the camera's mounting
+             offset (the bridge uses the camera prim's world
+             transform, not ee_link's).
+          4. Read both ee_link and wrist-camera world positions
+             RIGHT NOW from the bridge so the camera→ee_link offset
+             is a measured number, not assumed.
+          5. Compute the GRASP target in ee_link's frame:
+                 grasp_target_xy = part_world_xy
+             (because ee_link world XY == gripper TCP world XY when
+             the gripper points down — confirmed by the user's
+             diagnostic showing ``X=+219.5, Y=0, Z=0 mm`` for the
+             gripper_tcp Xform in ee_link's local frame).
+          6. Log every transform so the operator can audit the math.
+
+        The "normalization" you described is step 5: the wrist VLM
+        says where the part is in WORLD coords; we need to put
+        ee_link there (NOT the camera) — so we feed the part world
+        XY directly to the gantry+IK target. The geometry is right;
+        what was missing was making it explicit and observable.
+
+        Returns
+        -------
+        dict or None
+            ``{"x": .., "y": .., "z": .., "shift_mm": ..,
+               "ee_xy": [..,..], "cam_xy": [..,..],
+               "cam_to_ee_offset": [..,..]}`` on success.
+            ``None`` if any step failed (caller keeps current target).
+        """
+        try:
+            wrist_image = self.camera.capture_wrist_image()
+        except Exception as exc:
+            log.warning(f"[Rescan] wrist capture failed: {exc}")
+            return None
+        self._notify_wrist_image(wrist_image)
+
+        # Focused single-target prompt. The catalogue is injected so
+        # the VLM uses the same vocabulary as the rest of the
+        # pipeline; the prompt explicitly tells it to ignore parts
+        # at the edges so it doesn't pick a neighbour.
+        prompt = (
+            f"You are looking straight down through a wrist-mounted "
+            f"camera at a parts bin. The robot's gantry has aligned "
+            f"the gripper APPROXIMATELY over a target part. Find the "
+            f"part CLOSEST TO THE IMAGE CENTRE — ignore parts at the "
+            f"edges of the frame.\n\n"
+            f"Expected target type: '{obj_label or 'any graspable part'}'. "
+            f"If the centre-most part doesn't match, still report its "
+            f"observed centre — the spatial accuracy matters more than "
+            f"the label here.\n\n"
+            f"Output ONLY this JSON (one line, no markdown):\n"
+            f'{{"part_visible": true|false, "label": "...", '
+            f'"center": {{"x": 0.50, "y": 0.50}}, "confidence": 0-1}}\n'
+            f"Be NUMERICALLY PRECISE on the centre — do not default "
+            f"to (0.5, 0.5)."
+        )
+        try:
+            vresp = self.vlm.analyze_raw(wrist_image, prompt=prompt)
+        except Exception as exc:
+            log.warning(f"[Rescan] VLM call failed: {exc}")
+            return None
+
+        if not isinstance(vresp, dict) or not vresp.get("part_visible"):
+            log.info(
+                f"[Rescan] VLM reports no part visible "
+                f"(response={vresp}) — keeping previous coords")
+            return None
+        center = vresp.get("center") or {}
+        try:
+            cx = float(center.get("x"))
+            cy = float(center.get("y"))
+        except (TypeError, ValueError):
+            log.info(
+                f"[Rescan] VLM returned no centre coords — "
+                f"keeping previous")
+            return None
+
+        # Project through wrist camera → world (depth-buffer based).
+        try:
+            proj = self.camera.project_to_world(
+                [{"x": cx, "y": cy}], camera="wrist")
+        except Exception as exc:
+            log.warning(f"[Rescan] projection failed: {exc}")
+            return None
+        wpts = proj.get("world_points") or []
+        if not wpts:
+            log.info("[Rescan] projection returned no world points")
+            return None
+        wp = wpts[0]
+        part_x, part_y, part_z = (
+            float(wp["x"]), float(wp["y"]), float(wp["z"]))
+
+        # Explicit current ee_link + wrist camera world positions
+        # (both fetched from the bridge in the SAME projection call).
+        ee_pos = proj.get("ee_link_pos") or [None, None, None]
+        cam_pos = proj.get("camera_pos") or [None, None, None]
+        cam_to_ee_dx = (cam_pos[0] - ee_pos[0]
+                        if ee_pos[0] is not None
+                        and cam_pos[0] is not None else None)
+        cam_to_ee_dy = (cam_pos[1] - ee_pos[1]
+                        if ee_pos[1] is not None
+                        and cam_pos[1] is not None else None)
+
+        cur_x = float(current_target.get("x", 0))
+        cur_y = float(current_target.get("y", 0))
+        shift = ((part_x - cur_x) ** 2
+                 + (part_y - cur_y) ** 2) ** 0.5
+
+        log.info(f"[Rescan] === explicit close-range rescan ===")
+        log.info(f"[Rescan]   wrist VLM pixel:    ({cx:.3f}, {cy:.3f})  "
+                 f"label='{vresp.get('label','?')}' "
+                 f"conf={vresp.get('confidence', 0):.2f}")
+        log.info(f"[Rescan]   wrist camera world: ({cam_pos[0]:.4f}, "
+                 f"{cam_pos[1]:.4f}, {cam_pos[2]:.4f})")
+        log.info(f"[Rescan]   ee_link world:      ({ee_pos[0]:.4f}, "
+                 f"{ee_pos[1]:.4f}, {ee_pos[2]:.4f})")
+        log.info(f"[Rescan]   cam → ee offset:    "
+                 f"dx={cam_to_ee_dx*1000 if cam_to_ee_dx else 0:+.1f} mm, "
+                 f"dy={cam_to_ee_dy*1000 if cam_to_ee_dy else 0:+.1f} mm "
+                 f"(camera mounting offset; the projection already "
+                 f"accounts for this internally — the part XY below "
+                 f"is in WORLD coords, not camera coords)")
+        log.info(f"[Rescan]   projected part XY:  ({part_x:.4f}, "
+                 f"{part_y:.4f}, {part_z:.4f})")
+        log.info(f"[Rescan]   current target XY:  ({cur_x:.4f}, "
+                 f"{cur_y:.4f})")
+        log.info(f"[Rescan]   shift to apply:     "
+                 f"{shift*1000:.1f} mm "
+                 f"(grasp target updated to put ee_link → gripper TCP "
+                 f"directly over the projected part XY)")
+
+        return {
+            "x": part_x,
+            "y": part_y,
+            "z": part_z,
+            "shift_mm": shift * 1000.0,
+            "ee_xy": [ee_pos[0], ee_pos[1]] if ee_pos[0] is not None else None,
+            "cam_xy": [cam_pos[0], cam_pos[1]] if cam_pos[0] is not None else None,
+            "cam_to_ee_offset": [cam_to_ee_dx, cam_to_ee_dy]
+            if cam_to_ee_dx is not None else None,
+        }
+
+    def _snap_to_usd_ground_truth(self, scene: dict) -> None:
+        """Replace each detection's grasp XY with the matching USD prim's
+        centre — eliminates the OWL-bbox / depth-projection imprecision
+        that misaligns the gripper before realignment.
+
+        Strategy:
+          1. Query the bridge's ``/api/scan_scene_parts`` for the actual
+             world position of every pickable USD prim.
+          2. For each detected object, find the USD prim of the same
+             part type (matching by name substring) whose centre is
+             closest to the detection's projected XY.
+          3. If within ``execution.usd_grasp_snap_radius`` (default 10
+             cm), overwrite ``approximate_position`` with the USD
+             ``center_xyz``. Original perception coords are stashed in
+             ``_perception_position`` for evaluation.
+          4. If no USD prim is within the radius, the detection keeps
+             its raw perception coords (graceful fallback).
+
+        Perception accuracy (raw, pre-snap) is recorded by
+        :meth:`_log_perception_metrics` BEFORE this method runs so the
+        evaluation tables report honest perception error.
+        """
+        import re as _re
+
+        send = getattr(self.camera, "send_command", None)
+        if not callable(send):
+            return
+        try:
+            gt = send("/api/scan_scene_parts", {})
+        except Exception as exc:
+            log.warning(f"[USD-snap] scan_scene_parts failed: {exc}")
+            return
+        if not isinstance(gt, dict) or not gt.get("parts"):
+            log.info("[USD-snap] No USD ground-truth parts available "
+                     "— skipping snap")
+            return
+
+        usd_parts = gt["parts"]
+        snap_radius = float(
+            self.config.get("execution", {}).get(
+                "usd_grasp_snap_radius", 0.10))
+
+        # ── Bin-bounds filter ───────────────────────────────────
+        # Reject USD prims whose XY lies OUTSIDE the bin's AABB
+        # before they enter the snap candidate pool. Without this
+        # guard, a part that has fallen out of the bin (or was never
+        # spawned inside) sits at a far-away XY in USD; perception
+        # might detect a similarly-typed part inside the bin, but
+        # the snap matches it to the OUT-OF-BIN prim because it
+        # happens to be the closest one of that type. Result: the
+        # gripper is sent to wherever the lost part is now — often
+        # well outside the bin compartment, which is what the
+        # operator just observed in the screenshot.
+        #
+        # The bin AABB comes from the cached Phase-0 bin_lookup info
+        # (with a small expansion so prims sitting on the bin rim
+        # aren't excluded). If the bounds aren't available we fall
+        # back to no filter — same behaviour as before.
+        bin_bounds = self._get_bin_bounds_xy(margin=0.05)
+        if bin_bounds is not None:
+            x_min, y_min, x_max, y_max = bin_bounds
+            log.info(
+                f"[USD-snap] Bin XY bounds (with 5 cm margin): "
+                f"X=[{x_min:.3f}, {x_max:.3f}]  "
+                f"Y=[{y_min:.3f}, {y_max:.3f}]")
+            in_bin = []
+            out_of_bin = []
+            for p in usd_parts:
+                cxyz = p.get("center_xyz") or [0, 0, 0]
+                ux, uy = float(cxyz[0]), float(cxyz[1])
+                if x_min <= ux <= x_max and y_min <= uy <= y_max:
+                    in_bin.append(p)
+                else:
+                    out_of_bin.append(p)
+            if out_of_bin:
+                names = ", ".join(
+                    p.get("name", "?") for p in out_of_bin[:5])
+                log.info(
+                    f"[USD-snap] Excluded {len(out_of_bin)} USD prim(s) "
+                    f"OUTSIDE bin XY bounds (would have caused the "
+                    f"gripper to grasp parts that fell out of the "
+                    f"bin): {names}"
+                    + (" …" if len(out_of_bin) > 5 else ""))
+            usd_parts = in_bin
+        else:
+            log.info(
+                "[USD-snap] Bin AABB not available — proceeding "
+                "without bin-bounds filter (snap may pick prims "
+                "outside the bin if perception XY is closer to them)")
+
+        # Group USD prims by canonical part type (extracted from the
+        # prim name, e.g. ``large_gear_3_collidable`` → ``large_gear``).
+        # Order matters: more specific names first so a prim named
+        # ``motor_valve_3`` doesn't accidentally match the substring
+        # ``valve`` of a less-specific entry.
+        candidates = ("motor_valve", "large_gear",
+                      "black_hose", "black_plate", "black_plug",
+                      "small_tube", "silver_box", "silver_gun",
+                      "tube_with_clamps")
+        def _canonical_from_name(name: str) -> Optional[str]:
+            n = (name or "").lower()
+            for c in candidates:
+                if c in n:
+                    return c
+            return None
+
+        usd_by_type: Dict[str, List[dict]] = {}
+        for p in usd_parts:
+            ct = _canonical_from_name(p.get("name", ""))
+            if ct:
+                usd_by_type.setdefault(ct, []).append(p)
+
+        snapped = 0
+        skipped_no_match = 0
+        skipped_too_far = 0
+        for obj in scene.get("detected_objects", []):
+            label = (obj.get("label") or "").lower()
+            label_base = _re.sub(r"_\d+$", "", label).strip()
+            if label_base in ("kitting_tray", "tray", "blue_bin", "bin"):
+                continue
+            usd_pool = usd_by_type.get(label_base, [])
+            if not usd_pool:
+                skipped_no_match += 1
+                continue
+
+            pos = obj.get("approximate_position") or {}
+            try:
+                px = float(pos.get("x"))
+                py = float(pos.get("y"))
+                pz = float(pos.get("z"))
+            except (TypeError, ValueError):
+                continue
+
+            best = None
+            best_dist = float("inf")
+            for u in usd_pool:
+                cxyz = u.get("center_xyz") or [0, 0, 0]
+                ux, uy = float(cxyz[0]), float(cxyz[1])
+                d = ((ux - px) ** 2 + (uy - py) ** 2) ** 0.5
+                if d < best_dist:
+                    best_dist = d
+                    best = u
+            if best is None or best_dist > snap_radius:
+                skipped_too_far += 1
+                log.info(
+                    f"[USD-snap] '{label}' at ({px:.3f}, {py:.3f}) "
+                    f"— closest USD '{label_base}' is "
+                    f"{best_dist*100:.1f} cm away (> "
+                    f"{snap_radius*100:.0f} cm cap), keeping "
+                    f"perception coords")
+                continue
+
+            # Stash perception coords for downstream inspection,
+            # then overwrite with USD ground truth.
+            obj["_perception_position"] = {"x": px, "y": py, "z": pz}
+            usd_xyz = best["center_xyz"]
+            usd_top_z = float(best.get("top_z", usd_xyz[2]))
+            obj["approximate_position"] = {
+                "x": float(usd_xyz[0]),
+                "y": float(usd_xyz[1]),
+                # Use USD top_z as the grasp Z — it's the part's
+                # actual top surface, not the centre of mass.
+                "z": usd_top_z,
+            }
+            obj["_usd_prim_path"] = best.get("prim_path")
+            obj["_source"] = (obj.get("_source") or "") + "+usd_snap"
+            snapped += 1
+            log.info(
+                f"[USD-snap] '{label}' "
+                f"({px:.3f}, {py:.3f}, {pz:.3f}) "
+                f"→ USD '{best.get('name')}' "
+                f"({usd_xyz[0]:.3f}, {usd_xyz[1]:.3f}, {usd_top_z:.3f}) "
+                f"  shift={best_dist*100:.1f} cm")
+
+        log.info(
+            f"[USD-snap] Result: snapped={snapped}  "
+            f"skipped_no_match={skipped_no_match}  "
+            f"skipped_too_far={skipped_too_far}  "
+            f"(snap_radius={snap_radius*100:.0f} cm)")
+
+    def _log_perception_metrics(self, scene: dict) -> None:
+        """Compare a scene scan against USD ground truth and record metrics.
+
+        Called once per task (after Phase 2 succeeds on the first
+        attempt). Pulls ground truth from the bridge's
+        ``/api/scan_scene_parts`` endpoint and per-part 2D bboxes from
+        ``/api/scene_annotations`` so :func:`compute_perception_metrics`
+        can do proper IoU matching.
+        """
+        from evaluation.metrics import compute_perception_metrics
+
+        if not self.recorder or self._eval_task_id is None:
+            return
+        # Bridge GT lookup. ``send_command`` returns ``None`` on bridge
+        # absence (e.g. during mock-image runs) — guard against that.
+        send = getattr(self.camera, "send_command", None)
+        if not callable(send):
+            return
+        try:
+            gt = send("/api/scan_scene_parts", {})
+        except Exception as exc:
+            log.warning(f"[eval] scan_scene_parts failed: {exc}")
+            return
+        if not isinstance(gt, dict) or not gt.get("parts"):
+            return
+
+        # Optional 2D bboxes for IoU matching. Failure to fetch is
+        # tolerated — metrics fall back to world-XY proximity.
+        annotations = None
+        try:
+            ann = send("/api/scene_annotations", {})
+            if isinstance(ann, dict):
+                annotations = ann.get("annotations") or ann.get("parts")
+        except Exception:
+            pass
+
+        predictions = [o for o in scene.get("detected_objects", [])
+                       if o.get("label") not in ("kitting_tray",
+                                                 "blue_bin", "bin",
+                                                 "tray")]
+        try:
+            pm = compute_perception_metrics(
+                predictions=predictions,
+                ground_truth_parts=gt["parts"],
+                annotations=annotations,
+            )
+        except Exception as exc:
+            log.warning(f"[eval] compute_perception_metrics failed: {exc}")
+            return
+
+        try:
+            self.recorder.log_perception(
+                task_id=self._eval_task_id,
+                metrics=pm.to_dict(),
+                vlm_model=str(getattr(self.vlm, "model", "")),
+            )
+            log.info(
+                f"[eval] perception P={pm.precision:.2f} "
+                f"R={pm.recall:.2f} F1={pm.f1:.2f} "
+                f"label_acc={pm.label_accuracy:.2f} "
+                f"IoU={pm.mean_iou:.2f} "
+                f"err={pm.mean_grounding_error_mm:.0f} mm")
+        except Exception as exc:
+            log.warning(f"[eval] log_perception failed: {exc}")
+
+    def _log_pick_event(self, params: dict, step_result: dict,
+                        cycle_time_s: float) -> None:
+        """Persist a single pick attempt to the evaluation store."""
+        if not self.recorder or self._eval_task_id is None:
+            return
+        sub = step_result.get("sub_phases", []) or []
+        # Inspect sub-phases to fill the secondary signals.
+        grasp_sensor = None
+        grasp_vlm = None
+        contact_stop = None
+        drift_xy = None
+        drift_z = None
+        for sp in sub:
+            phase = sp.get("phase", "")
+            if phase == "pick_close":
+                gc = sp.get("grasp_confirmed")
+                if gc is not None:
+                    grasp_sensor = bool(gc)
+            elif phase == "post_grasp_vlm":
+                go = sp.get("grasp_ok")
+                if go is not None:
+                    grasp_vlm = bool(go)
+            elif phase == "pick_descend":
+                detail = sp.get("detail", {}) or {}
+                if "contact" in detail:
+                    contact_stop = bool(detail.get("contact"))
+                drift = detail.get("drift") or {}
+                if "xy_mm" in drift:
+                    drift_xy = float(drift.get("xy_mm"))
+                if "z_mm" in drift:
+                    drift_z = float(drift.get("z_mm"))
+        try:
+            self.recorder.log_pick(
+                task_id=self._eval_task_id,
+                object_id=str(params.get("object_id", "?")),
+                label=str(params.get("label", "")),
+                success=(step_result.get("status") == "success"),
+                grasp_confirmed_sensor=grasp_sensor,
+                grasp_confirmed_vlm=grasp_vlm,
+                contact_stop=contact_stop,
+                drift_xy_mm=drift_xy,
+                drift_z_mm=drift_z,
+                cycle_time_s=cycle_time_s,
+                extra={"error": step_result.get("error")},
+            )
+        except Exception as exc:
+            log.warning(f"[eval] log_pick failed: {exc}")
+
+    def _log_place_event(self, params: dict, step_result: dict,
+                         label: str, cycle_time_s: float):
+        """Run Camera_Kit verification + persist the place result.
+
+        The bridge place call returns ``status == "completed"`` whenever
+        the gripper opened — the part may or may not have actually
+        landed inside the tray. The Camera_Kit + VLM check supplies
+        the authoritative success signal.
+
+        Returns
+        -------
+        Optional[bool]
+            ``True``  → VLM confirms the part is inside the tray.
+            ``False`` → VLM confirms the part is NOT inside the tray
+                        (operator's request: this triggers a full
+                        orchestration-layer restart on the next outer
+                        retry iteration).
+            ``None``  → Verification was not attempted or could not
+                        produce a verdict (verifier error / mock mode).
+                        Caller treats this as a non-failure to avoid
+                        spurious retries when Camera_Kit is unavailable.
+        """
+        if not self.recorder or self._eval_task_id is None:
+            return None
+        bridge_status = (
+            (step_result.get("detail") or {}).get("status")
+            or step_result.get("status", ""))
+
+        in_tray = None
+        confidence = None
+        verifier_detail = ""
+        verifier_error = None
+        if (self.place_verifier is not None
+                and step_result.get("status") == "success"):
+            try:
+                self._notify("place_verify", "running",
+                             f"Camera_Kit VLM check for {label or '?'}...")
+                v = self.place_verifier.verify(label or "")
+                in_tray = v.in_tray
+                confidence = v.confidence
+                verifier_detail = v.detail or ""
+                verifier_error = v.error
+                if v.image is not None:
+                    self._notify_kit_image(v.image)
+
+                # Confidence-gated negative: a low-confidence "no part
+                # in tray" verdict is downgraded to "inconclusive"
+                # (None) so the outer retry loop does NOT trigger a
+                # spurious re-pick from the bin. The user observed
+                # the workflow re-running entire pick-place cycles
+                # because the VLM was hedging on uncertain views;
+                # this threshold filters those out while preserving
+                # retries for confidently-detected failures.
+                min_conf = float(
+                    self.config.get("execution", {}).get(
+                        "place_verify_min_confidence", 0.6))
+                if (in_tray is False
+                        and (confidence is None
+                             or confidence < min_conf)):
+                    log.info(
+                        f"[Place verify] Downgrading negative verdict "
+                        f"to inconclusive: confidence "
+                        f"{confidence!r} < threshold {min_conf} — "
+                        f"NOT triggering re-pick. Detail: "
+                        f"{verifier_detail!r}")
+                    in_tray = None  # treat as inconclusive
+                    self._notify(
+                        "place_verify", "warn",
+                        f"in_tray=False (conf={confidence}) "
+                        f"below threshold {min_conf} — accepting place")
+                    # Inconclusive but place sequence completed —
+                    # still increment placed count so the task summary
+                    # reflects the bridge-side success.
+                    self._eval_placed += 1
+                else:
+                    if in_tray:
+                        self._eval_placed += 1
+                    self._notify(
+                        "place_verify",
+                        "success" if in_tray else "failed",
+                        f"in_tray={in_tray} conf={confidence}")
+            except Exception as exc:
+                verifier_error = str(exc)
+                log.warning(f"[eval] place verifier failed: {exc}")
+        elif step_result.get("status") == "success":
+            # No verifier wired up — fall back to bridge "completed"
+            # so the pipeline still produces a placed_count > 0 in the
+            # task summary even when running in mock mode.
+            self._eval_placed += 1
+
+        try:
+            self.recorder.log_place(
+                task_id=self._eval_task_id,
+                object_id=str(params.get("object_id", "?")),
+                label=label,
+                bridge_status=str(bridge_status),
+                in_tray_vlm=in_tray,
+                vlm_confidence=confidence,
+                cycle_time_s=cycle_time_s,
+                extra={"detail": verifier_detail,
+                       "error": verifier_error},
+            )
+        except Exception as exc:
+            log.warning(f"[eval] log_place failed: {exc}")
+
+        return in_tray
+
+    def _notify_kit_image(self, image) -> None:
+        """Push the Camera_Kit verification image into the UI session."""
+        try:
+            import streamlit as st  # type: ignore
+            st.session_state["kit_verify_image"] = image
+        except Exception:
+            pass

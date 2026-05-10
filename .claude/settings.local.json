@@ -18,7 +18,15 @@
       "Bash(python -m pytest generative_kitting/tests/)",
       "Bash(python -c ' *)",
       "Bash(git log *)",
-      "Bash(python -m pytest generative_kitting/tests/ -v)"
+      "Bash(python -m pytest generative_kitting/tests/ -v)",
+      "Bash(awk 'NR>=860 && NR<=875 {print NR\": \"$0}' \"c:/KP/AI_and_Automation/Sem_4/Thesis/robot_in_air/generative_kitting/ui/streamlit_app.py\")",
+      "Bash(awk 'NR>=4140 && NR<=4170 {print NR\": \"$0}' \"c:/KP/AI_and_Automation/Sem_4/Thesis/robot_in_air/generative_kitting/orchestration/workflow_engine.py\")",
+      "Bash(python -m py_compile ui/streamlit_app.py orchestration/workflow_engine.py evaluation/__init__.py evaluation/metrics.py evaluation/recorder.py evaluation/place_verifier.py perception/camera_interface.py)",
+      "Bash(python -m pytest tests/ -q --tb=line)",
+      "Read(//c/kp/ai_and_automation/sem_4/thesis/isaacsim/exts/**)",
+      "Bash(pip show *)",
+      "Read(//c/kp/ai_and_automation/sem_4/thesis/isaacsim/**)",
+      "Bash(python -c \"import curobo; print\\(curobo.__file__\\)\")"
     ]
   }
 }

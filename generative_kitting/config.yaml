@@ -123,10 +123,181 @@ perception:
   # edit, no code changes, and no per-camera tuning. Costs N extra VLM
   # calls per scan (~3-10s each on a small crop), so default is OFF.
   # Enable when first-pass labels are unreliable.
+  # Disabled — per-instance verification was over-correcting in the
+  # opposite direction, relabelling almost every silver part as
+  # ``motor_valve`` because the catalogue's motor_valve description
+  # ("silver metallic body with central bore") matches Gemma4's
+  # interpretation of any silver close-up. The spatial-fallback in
+  # ``_assign_detector_bboxes`` (rescues VLM detections that have no
+  # label-matching OWL bbox by spatially matching to nearby unclaimed
+  # bboxes) is doing the heavy lifting now without the over-correction
+  # bias. Re-enable only if you've made the verification prompt MORE
+  # discriminative (e.g. listing not_to_confuse_with examples per
+  # part type) — otherwise the cure is worse than the disease.
   verify_labels_with_vlm: false
   # Minimum VLM confidence to override an existing label. Lower values
   # are more aggressive (more re-labels), higher values are conservative.
-  verify_labels_min_confidence: 0.5
+  verify_labels_min_confidence: 0.7
+
+  # ── Camera_Kit place-verification confidence threshold ──
+  # After every place, the workflow captures the /World/Camera_Kit
+  # frame and asks the VLM whether the named part actually landed in
+  # the kitting tray. The verifier returns:
+  #     in_tray=True  → place succeeded
+  #     in_tray=False → place failed (re-initiate cycle)
+  #     in_tray=None  → inconclusive (no retry)
+  # With max_pick_retries=3 every confirmed negative triggers a full
+  # re-pick, which is expensive when the VLM produces low-confidence
+  # false negatives ("I think the tray is empty but I'm not sure").
+  # This knob gates the retry: only treat in_tray=False as a real
+  # failure when the VLM's reported confidence is >= this threshold.
+  # Below it, the verdict is downgraded to "inconclusive" so the
+  # workflow proceeds without re-picking.
+  # 0.6 default — set to 0.0 to retry on every negative (strict
+  # mode), or 1.0 to disable verification-driven retries entirely.
+  place_verify_min_confidence: 0.6
+
+  # ── Wrist-driven XY refinement (apply or only inform?) ──
+  # The wrist VLM is asked to pinpoint the part's pixel centre in
+  # the close-range view; the bridge projects that pixel through
+  # the wrist camera's actual USD transform to produce a "refined"
+  # world XY. The geometry is correct, but the VLM's pixel-centroid
+  # guess is only ~5 % accurate (~25 mm world error at 40 cm camera
+  # height) — applying its correction is *less* accurate than the
+  # overhead OWL-ViT2 bbox centre that produced the original Phase 2
+  # XY (sub-pixel detector accuracy → <1 cm world error).
+  #
+  # When this flag is true (default) the workflow only USES the
+  # wrist verify for visibility / path-clear checks, NOT for XY
+  # adjustment. The Z correction still applies because the wrist
+  # depth is much more accurate than the overhead depth at close
+  # range. If you observe genuine large XY errors that the overhead
+  # didn't catch, set this false to re-enable the (less precise)
+  # wrist refinement and rely on the 5 cm cap to reject neighbour-
+  # part hijacks.
+  # NOTE on history: this was set to true earlier when we believed
+  # the overhead OWL detector was sub-pixel accurate. The diagnostic
+  # log of 2026-05-10 disproved that — overhead error was 58 mm vs
+  # wrist projection's 17 mm for the same gear. With the wrist VLM
+  # prompt now constrained to the centre-most part and the 5 cm
+  # neighbour-rejection cap, the wrist refinement is the more
+  # accurate signal of the two. Setting back to false so the wrist
+  # XY correction is APPLIED (not just logged). USD-snap still
+  # overrides both when it fires; this is the fallback for any
+  # detection that USD-snap rejects (no matching prim within
+  # snap_radius) — and the path the system will take once on a real
+  # robot where USD ground truth is unavailable.
+  wrist_xy_refinement_informational_only: false
+
+  # ── USD ground-truth snap for grasp targets ──
+  # The overhead RGB-D projection is internally self-consistent
+  # (round-trip pixel error <2 px) but the OWL-ViT2 bbox centre is
+  # imprecise — at the camera's typical ~5 m height a 5-10 px
+  # bbox-centring error translates to 1-3 cm world XY drift, and
+  # for parts with holes (gears, washers) the bbox centre often
+  # lands on the hole, biasing the depth median and shifting XY
+  # further. The misalignment shows up BEFORE realignment because
+  # it's baked into the Phase 2 detection.
+  #
+  # When this flag is true, the workflow looks up each detected
+  # object's actual world position from the USD scene and SNAPS
+  # the perception XY to the matching prim's centre. Perception
+  # still runs end-to-end (catalogue grounding, OWL-ViT2 bbox,
+  # depth projection) and the evaluation module continues to
+  # record raw perception accuracy as ``mean_grounding_error_mm``
+  # — the snap only changes what the GRASP uses, not what gets
+  # logged for thesis evaluation.
+  #
+  # Default true for sim-only demos. Set false to grasp from raw
+  # perception (drives bigger XY misalignment in the gripper but
+  # represents true real-robot performance).
+  use_usd_grasp_targets: true
+  # Maximum XY distance (metres) between a detected object and a
+  # USD prim of the same part type for the snap to apply. Beyond
+  # this radius the perception coords are kept (the snap might
+  # otherwise grab a wrong prim if multiple instances of the same
+  # type sit close together).
+  usd_grasp_snap_radius: 0.10
+
+  # ── Realignment frame: gripper-over-part vs camera-over-part ──
+  # The wrist projection returns the part's WORLD XY (already
+  # accounting for the camera's mounting offset from ee_link).
+  # By default the workflow targets ee_link to that XY so the
+  # GRIPPER lands above the part — correct for grasping.
+  #
+  # Some scenes have a non-trivial offset between the wrist RGB
+  # camera and ee_link (the RealSense RSD455 mounts the camera
+  # slightly forward and to one side of the gripper TCP). When
+  # ``realign_camera_over_part`` is true, the workflow subtracts
+  # the (cam_world_xy − ee_world_xy) vector from the realignment
+  # target, so the CAMERA — not the gripper — ends up above the
+  # part. This is useful when:
+  #   * The gripper body would occlude the target during a final
+  #     wrist re-verification.
+  #   * You want a clean wrist-camera image of the grasp point
+  #     before descending (e.g. for evaluation logging).
+  # Default false because the natural "gripper above part" choice
+  # is what the descent + close need. Enable only if the wrist
+  # verification is more important than the immediate grasp pose.
+  realign_camera_over_part: false
+
+  # ── Depth-analysis VLM check at the approach pose ──
+  # After the gantry-driven approach moves ee_link near the part,
+  # the workflow can capture a depth image and ask the VLM "is the
+  # part visible / where is its centre / is the descent path
+  # clear?". The check has the same geometric weakness as the
+  # pre-grasp wrist VLM: the wrist depth camera sits ~55 mm offset
+  # from ee_link, and at the approach altitude the part can be
+  # outside the depth camera's narrow useful range — Gemma4 then
+  # confidently reports "no part visible, confidence 0.0" and
+  # aborts an otherwise good pick.
+  #
+  # Set false to skip the depth-analysis VLM call AND its abort
+  # path. The earlier overhead VLM + OWL-ViT2 detection already
+  # confirmed the part exists, the wrist verify+realign step
+  # confirms visibility from close range, the contact-aware descent
+  # handles unexpected surfaces, and the post-grasp wrist VLM
+  # confirms the actual grasp — the depth-analysis check is
+  # redundant. The bridge still captures the depth image for
+  # display/logging when this is false.
+  depth_analysis_vlm_check: false
+
+  # ── Pre-grasp wrist VLM check (close-range "is part between fingers?") ──
+  # After the descent reaches the grasp position the workflow can ask
+  # the wrist VLM whether a part is visible between the open fingers.
+  # This is geometrically problematic when the wrist RGB camera is
+  # mounted with a non-trivial XY offset from ee_link (typical for the
+  # RealSense RSD455 mounted on a UR10 ee_link — measured ~55 mm here):
+  # at grasp height (a few cm above the part), the camera looks at the
+  # bin floor NEXT to the part rather than the part itself, because
+  # the camera offset is a large fraction of the field of view at
+  # close range. The VLM correctly reports "no part between fingers"
+  # but the gripper IS over the part — we'd be aborting a valid grasp.
+  #
+  # Set false to skip this check and trust the earlier verifications
+  # (overhead VLM, depth-analysis VLM, depth-analysis-pose wrist
+  # verify) plus the contact-aware descent + adaptive close. The
+  # post-grasp VLM check (gripper closed → part actually held?) still
+  # runs because at that point the gripper has lifted slightly and
+  # the geometry is more favourable.
+  pre_grasp_wrist_vlm_check: false
+
+  # ── Wrist VLM verify confidence threshold ──
+  # The pre-grasp wrist check ("part_between_fingers") and the
+  # post-grasp wrist check ("grasp_ok") both return false negatives
+  # when the descent stops short (tip sensor never fires) and the
+  # gripper closes on empty space — but historically the workflow
+  # ignored those rejections and proceeded with the bad pick anyway.
+  # Now we honour the VLM verdict ONLY when it is reasonably
+  # confident, to avoid aborting on uncertain views (camera blur,
+  # bad lighting, partial occlusion).
+  # 0.7 default — high-confidence rejections (e.g. "fingers are
+  # empty, conf=0.95") abort the pick and trigger a re-scan via the
+  # outer retry loop. Low-confidence rejections fall through to the
+  # historical "warn and continue" behaviour.
+  # Set to 0.0 to abort on every VLM "no" (strict), or 1.0 to never
+  # abort based on the wrist VLM.
+  wrist_verify_min_confidence: 0.7
 
   # ── Per-instance Qwen crop-and-zoom refinement (Qwen-only path) ──
   # After the first-pass scene grounding returns rough bboxes, crop a
@@ -281,7 +452,46 @@ execution:
   # part because they're already pressed against the surface. A 1-2 mm
   # lift gives the fingers clearance to close cleanly. Set to 0.0 to
   # disable the lift-back (fingers stop exactly at contact).
-  descent_contact_lift_back: 0.002
+  descent_contact_lift_back: 0.005
+
+  # ── Local grasp retry (lift + rescan, no full pipeline restart) ──
+  # When the mechanical close fails (gripper closed on empty space)
+  # OR the post-grasp wrist VLM reports an empty gripper, this many
+  # local retries are tried BEFORE escalating to the outer pipeline
+  # retry. A local retry:
+  #     1. Opens the gripper.
+  #     2. Lifts ee_link to ``depth_analysis_height`` above the part.
+  #     3. Re-runs the close-range wrist rescan to refine XY.
+  #     4. Re-attempts the descent + close at the refined target.
+  # Saves ~30-60 s per failed attempt vs a full Phase 2 + Phase 3
+  # rerun. 0 disables (always escalate); 2 means up to three total
+  # attempts (1 initial + 2 local retries) before escalating.
+  local_grasp_retries: 2
+
+  # ── Close-range explicit XY rescan ─────────────────────────
+  # After the gantry+IK approach has parked the gripper near the
+  # planned target, this step does ONE more wrist-camera reading
+  # with explicit coordinate transparency: it logs ee_link world
+  # XY, wrist camera world XY, the camera→ee_link offset, and the
+  # projected part XY — then updates the grasp target to put the
+  # GRIPPER (which sits at ee_link XY in this geometry) directly
+  # over the projected part. This is operator-requested verification
+  # that the camera-vs-ee_link offset is being normalised correctly
+  # — every transform is observable in the logs as
+  # ``[Rescan]   ...`` lines.
+  #
+  # Differs from ``wrist_rescan_before_grasp`` (below): that uses
+  # the FULL perception pipeline (VLM + OWL-ViT2). This one uses
+  # only a focused single-target VLM prompt — cheaper, simpler,
+  # and shows the geometry math explicitly.
+  close_range_rescan_xy: true
+  # Reject rescan corrections beyond this radius (5 cm default).
+  # Larger shifts almost always mean the wrist VLM picked a
+  # neighbour part instead of the centre-most planned target;
+  # applying such a shift would land the gripper on the wrong
+  # part. Tune up if you trust the wrist VLM more, down for
+  # stricter rejection.
+  close_range_rescan_max_shift: 0.05
 
   # ── Wrist rescan before grasp ──
   # After the approach + verify_and_realign at the depth-analysis pose,
@@ -295,7 +505,7 @@ execution:
   # Costs one extra VLM call per pick (~30-90 s on Gemma4). Set false
   # to disable when the rough verify_and_realign offset is good
   # enough and you want faster picks.
-  wrist_rescan_before_grasp: true
+  wrist_rescan_before_grasp: false
 
   # Reject wrist-rescan corrections whose XY offset from the planned
   # coords exceeds this many metres. The rescan is meant to be a
@@ -362,7 +572,7 @@ execution:
   box_entry_margin: 0.20             # metres — clearance above rim
   place_drop_height: 0.0             # metres above destination surface
   place_retract_height: 0.20         # metres above destination after release
-  transit_safe_height: 0.30          # metres above safe_z during transit
+  transit_safe_height: 0.35          # metres above safe_z during transit
   max_pick_retries: 3               # retry scan + pick if grasp fails
   grasp_depth_fraction: 0.5          # 0.0=top, 0.5=mid, 1.0=bottom
 

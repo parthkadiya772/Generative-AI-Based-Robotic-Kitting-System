@@ -243,8 +243,8 @@ class BridgeCameraInterface:
         import json
 
         try:
-            # Use plain /api/camera for RGB, add ?type= for depth/wrist
-            if cam_type in ("depth", "wrist"):
+            # Use plain /api/camera for RGB, add ?type= for depth/wrist/kit
+            if cam_type in ("depth", "wrist", "kit"):
                 url = f"{self.bridge_url}/api/camera?type={cam_type}"
             else:
                 url = f"{self.bridge_url}/api/camera"
@@ -288,6 +288,15 @@ class BridgeCameraInterface:
     def capture_wrist_image(self) -> Image.Image:
         """Fetch an RGB frame from the wrist-mounted RealSense."""
         return self.capture_workspace_image(cam_type="wrist")
+
+    def capture_kit_image(self) -> Image.Image:
+        """Fetch an RGB frame from the tray-overlook camera (/World/Camera_Kit).
+
+        Used after the place phase to verify (via VLM) that the part
+        actually landed in the kitting tray, independent of the gripper
+        contact-sensor signal which can false-positive on empty closes.
+        """
+        return self.capture_workspace_image(cam_type="kit")
 
     def project_to_world(self, points: list, camera: str = "rgb",
                          method: str = None,

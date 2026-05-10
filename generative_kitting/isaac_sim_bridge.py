@@ -39,6 +39,10 @@ ROBOT_PRIM  = "/World"
 CAMERA_RGB_PRIM   = "/World/Camera"
 CAMERA_DEPTH_PRIM = "/World/Realsense/RSD455/Camera_Pseudo_Depth"
 CAMERA_WRIST_PRIM = "/World/Realsense/RSD455/Camera_OmniVision_OV9782_Color"
+# Tray-overlook camera — used after place to verify the part actually
+# landed in the kitting tray. Independent of the robot pose so the VLM
+# always gets a clean top-down view of the destination.
+CAMERA_KIT_PRIM   = "/World/Camera_Kit"
 IMU_PRIM          = "/World/Realsense/RSD455/Imu_Sensor"
 
 # Robot geometry
@@ -46,8 +50,31 @@ UR10_BASE_PATH = "/World/gantry_home/ur10_flattened/ur10_instanceable/base_link"
 EE_PATH        = "/World/gantry_home/ur10_flattened/ur10_instanceable/ee_link"
 PLACE_BOX_PATH = "/World/box_840"
 
-# Contact sensor on left inner finger (adaptive gripper control)
-CONTACT_SENSOR_PRIM = "/World/gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/left_inner_finger/Contact_Sensor"
+# Contact sensors — TWO of them, used for different phases.
+#
+#   1. Inner-finger PAD sensor — sits on the ``Finger4`` collider mesh
+#      (the rectangular inner pad). Fires when the gripper closes
+#      around a part. Used by ``_adaptive_close`` to terminate the
+#      close motion with a firm grip.
+#   2. Fingertip BOTTOM sensor — sits on the ``Fingertip`` collider
+#      mesh (the curved bottom edge). Fires when the finger tip
+#      touches the bin floor / part top during the descent. Used by
+#      ``_descend_with_contact_stop`` to halt the Cartesian descent
+#      before the gripper crashes into the surface, then lift back a
+#      few millimetres so the fingers can close cleanly.
+#
+# IMPORTANT: an Isaac Sim Contact Sensor MUST be a direct child of a
+# prim with ``UsdPhysics.CollisionAPI`` applied. The intermediate
+# Xforms ``left_inner_finger`` and ``Fingertip_01`` only carry
+# ``MeshCollisionAPI`` (a setting, not a collider), so a sensor
+# parented under them fails to initialise with
+#   "Contact Sensor needs to be created under another prim that has
+#    collision api enabled on."
+# The collider with ``CollisionAPI`` lives one level deeper on the
+# actual ``Mesh`` prims. Both sensor paths below point INTO those
+# mesh prims so the sensor finds its CollisionAPI parent.
+CONTACT_SENSOR_PRIM     = "/World/gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/left_inner_finger/Finger4_01/Finger4/Contact_Sensor"
+CONTACT_SENSOR_TIP_PRIM = "/World/gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/left_inner_finger/Fingertip_01/Fingertip/Contact_Sensor"
 
 # URDF / YAML for Lula IK
 URDF_PATH = r"c:/kp/ai_and_automation/sem_4/thesis/isaacsim/exts/isaacsim.asset.importer.urdf/data/urdf/robots/ur10/urdf/ur10.urdf"
@@ -76,13 +103,44 @@ GRIP_OVERSHOOT = 0.060   # 60mm extra closing past part width for firm contact
 ENTRY_CLEARANCE = 0.020  # 20mm extra gap over part width for bin-entry pre-shape
 
 # Gripper geometry
-GRIPPER_TCP_OFFSET   = 0.150
+# 219.5 mm = measured ee_link → gripper_tcp distance for the
+# Robotiq 2F-140 in this scene. Set by reading the world transform
+# of the ``gripper_tcp`` Xform the operator added at the gripper's
+# longest physical extension (the fingertip plane). The earlier
+# value (0.150) corresponded to the FINGER PAD only — left a 60-70
+# mm gap that wasn't modelled in IK, so Lula planned ee_link
+# positions that put the actual fingertips below the bin floor and
+# the gripper jammed under reaction force.
+GRIPPER_TCP_OFFSET   = 0.19357
 GRIPPER_BODY_WIDTH   = 0.160
 GRIPPER_HALF_WIDTH   = GRIPPER_BODY_WIDTH / 2.0
 HOVER_CLEARANCE      = 0.020
-GRASP_LIFT           = 0.040  # 40mm above surface Z — finger pads grip at part mid-height
-                              # (parts are ~20-50mm tall, so 40mm puts pads at ~mid-body)
-                              # Must keep clearance from bin bottom so fingers can close
+GRASP_LIFT           = 0.000  # Descent target: finger TCP exactly at part top.
+                              # The earlier value (+0.040) was tuned for tall
+                              # parts (~50 mm motor valves) and parked the
+                              # finger PADS 40 mm ABOVE the part top — fine
+                              # when the part body extends down past the
+                              # pads, useless for flat parts (~5 mm gears)
+                              # where the gripper closes on empty air.
+                              #
+                              # With GRASP_LIFT = 0 and the contact-aware
+                              # descent enabled, the fingertip sensor stops
+                              # the Cartesian Z motion the moment the tip
+                              # touches the part (or the bin floor, for
+                              # parts whose Z was under-projected). The
+                              # descent then lifts back ``contact_lift_back``
+                              # (default 5 mm) so the fingers have room to
+                              # close cleanly around the part edge — works
+                              # uniformly for thin and tall parts without
+                              # per-shape tuning.
+                              #
+                              # For parts that NEED to be gripped lower
+                              # than their visible top (e.g. tall valves
+                              # where you want to clamp mid-body, not the
+                              # cap), pass ``grasp_lift_override=-0.040``
+                              # in the bridge ``/api/pick_descend`` payload
+                              # — the workflow can read this from the
+                              # parts catalogue per part type.
 GRASP_DEPTH_FRACTION = 0.45   # only used by compute_grasp_geometry (legacy/debug)
 BOX_HEIGHT           = 0.05
 BOX_ENTRY_MARGIN     = 0.15
@@ -338,6 +396,20 @@ GRIPPER_TCP_LINK = """
     <origin xyz="0 0 {tcp_offset}" rpy="0 0 0"/>
   </joint>
 """.format(tcp_offset=GRIPPER_TCP_OFFSET, half_tcp=GRIPPER_TCP_OFFSET/2, width=GRIPPER_BODY_WIDTH)
+# NOTE on axis: in the standard UR10 URDF (Universal Robots'
+# convention), ``ee_link`` has its tool axis along LOCAL +Z. Lula
+# reads the URDF — not the USD — so the patched joint follows
+# the URDF convention. The earlier USD diagnostic the operator
+# ran reported the gripper_tcp Xform at LOCAL +X 219.5 mm of
+# ee_link, but that's the USD-side view: Isaac Sim's URDF
+# importer rotates the link frame so that URDF's +Z aligns with
+# USD's +X. The two views describe the same physical position;
+# the URDF patch must use URDF coords, hence ``xyz="0 0 0.220"``
+# (along URDF +Z). We tried placing the joint along +X earlier
+# to match the USD measurement directly — that broke IK because
+# Lula was then planning with a virtual gripper rotated 90° from
+# the actual physical scene, sending ee_link off-target by the
+# gripper's full length.
 
 
 def patch_urdf_and_yaml():
@@ -377,6 +449,7 @@ class BridgeState:
         self.camera_rgb = None
         self.camera_depth = None
         self.camera_wrist = None
+        self.camera_kit = None
         self.lula_solver = None
         self.target_frame = "ee_link"
         self.arm_names = []
@@ -385,7 +458,8 @@ class BridgeState:
         self.is_ready = False
         self.ik_ready = False
         self.is_executing = False
-        self.contact_sensor = None
+        self.contact_sensor = None        # Inner pad — for grip close
+        self.contact_sensor_tip = None    # Fingertip bottom — for descent stop
         self.last_error = None
         self.execution_log = []
         self._command_queue = []
@@ -459,7 +533,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         elif path == "/api/ping":
             self._send_json({
                 "status": "ok", "bridge": "isaac_sim", "port": BRIDGE_PORT,
-                "cameras": ["rgb", "depth", "wrist"], "ik_ready": STATE.ik_ready,
+                "cameras": ["rgb", "depth", "wrist", "kit"], "ik_ready": STATE.ik_ready,
             })
         elif path == "/api/scene_parts":
             self._handle_scene_parts()
@@ -519,6 +593,11 @@ class BridgeHandler(BaseHTTPRequestHandler):
             return
         try:
             joints = STATE.robot.get_joint_positions()
+            # Sensor health — the operator uses these flags to verify
+            # that a fresh bridge build is actually loaded after an
+            # ``exec(open(...))`` reload in the Script Editor. If
+            # ``contact_sensor_tip_ready`` is False the descent runs
+            # blind and will jam the gripper into the bin floor.
             self._send_json({
                 "status": "ready" if not STATE.is_executing else "executing",
                 "num_dof": STATE.num_dof,
@@ -526,6 +605,11 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 "joint_positions": joints.tolist() if joints is not None else [],
                 "is_executing": STATE.is_executing,
                 "ik_ready": STATE.ik_ready,
+                "contact_sensor_pad_ready":
+                    STATE.contact_sensor is not None,
+                "contact_sensor_tip_ready":
+                    STATE.contact_sensor_tip is not None,
+                "cameras": ["rgb", "depth", "wrist", "kit"],
                 "last_error": STATE.last_error,
             })
         except Exception as e:
@@ -682,6 +766,13 @@ async def _capture_camera(cam_type="rgb"):
                 for _ in range(10):
                     await omni.kit.app.get_app().next_update_async()
             cam = STATE.camera_wrist
+        elif cam_type == "kit":
+            if STATE.camera_kit is None:
+                STATE.camera_kit = Camera(prim_path=CAMERA_KIT_PRIM, resolution=(1280, 720))
+                STATE.camera_kit.initialize()
+                for _ in range(10):
+                    await omni.kit.app.get_app().next_update_async()
+            cam = STATE.camera_kit
         else:
             if STATE.camera_rgb is None:
                 STATE.camera_rgb = Camera(prim_path=CAMERA_RGB_PRIM, resolution=(1920, 1080))
@@ -829,6 +920,9 @@ async def _project_to_world(params):
     elif cam_alias == "wrist":
         cam_path = CAMERA_WRIST_PRIM
         res = (1280, 720)
+    elif cam_alias == "kit":
+        cam_path = CAMERA_KIT_PRIM
+        res = (1280, 720)
     else:
         cam_path = cam_alias
         res = (1280, 720)
@@ -840,6 +934,8 @@ async def _project_to_world(params):
         cam = STATE.camera_depth
     elif cam_alias == "wrist" and STATE.camera_wrist is not None:
         cam = STATE.camera_wrist
+    elif cam_alias == "kit" and STATE.camera_kit is not None:
+        cam = STATE.camera_kit
     else:
         cam = Camera(prim_path=cam_path, resolution=res)
         cam.initialize()
@@ -1111,9 +1207,46 @@ async def _project_to_world(params):
               f"→ world({wp['x']:.3f}, {wp['y']:.3f}, {wp['z']:.3f}) "
               f"[{point_method}]  {rt_str}")
 
+    # Augment the response with the actual world positions of the
+    # camera that took the image AND the robot's ee_link, so the
+    # caller can see the geometry that backed the projection.
+    # The wrist RealSense has TWO sensor prims (RGB + pseudo-depth)
+    # mounted with a small physical offset; if the caller wants to
+    # verify how their assumed-aligned coords actually relate to
+    # ee_link, they need both numbers.
+    extra: dict = {}
+    try:
+        ee_pos = get_world_pos(EE_PATH)
+        extra["ee_link_pos"] = [float(ee_pos[0]),
+                                float(ee_pos[1]),
+                                float(ee_pos[2])]
+    except Exception:
+        pass
+    try:
+        extra["camera_pos"] = [float(cam_pos[0]),
+                                float(cam_pos[1]),
+                                float(cam_pos[2])]
+    except Exception:
+        pass
+    # When projecting from the wrist colour camera, ALSO expose the
+    # depth camera's world transform — they are sibling prims on the
+    # RSD455 mount with different translations, and any caller doing
+    # depth alignment math needs both.
+    if cam_alias == "wrist":
+        try:
+            stage_d = omni.usd.get_context().get_stage()
+            d_prim = stage_d.GetPrimAtPath(CAMERA_DEPTH_PRIM)
+            if d_prim and d_prim.IsValid():
+                d_mat = omni.usd.get_world_transform_matrix(d_prim)
+                d_pos = d_mat.GetRow(3)
+                extra["wrist_depth_camera_pos"] = [
+                    float(d_pos[0]), float(d_pos[1]), float(d_pos[2])]
+        except Exception:
+            pass
     return {"status": "ok", "world_points": world_points,
             "camera": cam_path, "method": method_used,
-            "depth_buffer_used": has_depth}
+            "depth_buffer_used": has_depth,
+            **extra}
 
 
 # ═════════════════════════════════════════════════════════════
@@ -1307,6 +1440,8 @@ async def _get_scene_annotations(camera="rgb"):
         cam_path, res = CAMERA_DEPTH_PRIM, (1280, 720)
     elif camera == "wrist":
         cam_path, res = CAMERA_WRIST_PRIM, (1280, 720)
+    elif camera == "kit":
+        cam_path, res = CAMERA_KIT_PRIM, (1280, 720)
     else:
         cam_path, res = camera, (1280, 720)
 
@@ -1317,6 +1452,8 @@ async def _get_scene_annotations(camera="rgb"):
         cam = STATE.camera_depth
     elif camera == "wrist" and STATE.camera_wrist is not None:
         cam = STATE.camera_wrist
+    elif camera == "kit" and STATE.camera_kit is not None:
+        cam = STATE.camera_kit
     else:
         cam = Camera(prim_path=cam_path, resolution=res)
         cam.initialize()
@@ -1833,14 +1970,18 @@ async def _descend_with_contact_stop(target_z, x, y, locked_ori,
     # Confirmation line so the operator can see in the Isaac Sim console
     # that the contact-aware code path is actually running (vs. the
     # bridge being on a stale build that uses the old single-jump IK).
-    sensor_attached = STATE.contact_sensor is not None
+    # Use the FINGERTIP-BOTTOM sensor for descent stop detection.
+    # The inner-finger PAD sensor (used by the gripper-close motion)
+    # rarely registers when the tip strikes the bin floor because its
+    # normal points inward toward the part, not downward.
+    sensor_attached = STATE.contact_sensor_tip is not None
     print(f"  [DESCEND-CONTACT] starting from z={current_z:.3f} → "
           f"target z={target_z:.3f}, threshold={contact_min_force:.2f}N, "
-          f"step={step_size*1000:.0f}mm, sensor_attached={sensor_attached}")
+          f"step={step_size*1000:.0f}mm, tip_sensor_attached={sensor_attached}")
     if not sensor_attached:
-        print("  [DESCEND-CONTACT] WARNING: contact_sensor is None — "
-              "descent will run to planned target without contact "
-              "feedback. Check sensor init logs.")
+        print("  [DESCEND-CONTACT] WARNING: contact_sensor_tip is None — "
+              "descent will run to planned target without floor-touch "
+              "feedback. Check the tip-sensor init log line.")
 
     n_steps = max(2, int(np.ceil((current_z - target_z) / step_size)))
     warm = warm_start
@@ -1872,11 +2013,12 @@ async def _descend_with_contact_stop(target_z, x, y, locked_ori,
         warm = action
         last_z = float(get_world_pos(EE_PATH)[2])
 
-        # Per-step contact check — same sensor / threshold as the
-        # adaptive gripper close. If a finger touches anything during
-        # descent, stop immediately. Per-step force ALWAYS logged
-        # (even when below threshold) so silent zeros are visible.
-        touching, force_mag = _read_contact_sensor()
+        # Per-step contact check — uses the FINGERTIP-BOTTOM sensor
+        # (NOT the inner-pad sensor used by the gripper close). If the
+        # finger tip touches the bin floor or the top of a part during
+        # descent, stop immediately. Per-step force ALWAYS logged (even
+        # when below threshold) so silent zeros are visible.
+        touching, force_mag = _read_tip_contact_sensor()
         print(f"  [DESCEND-CONTACT] step {step}/{n_steps} "
               f"z={last_z:.3f} force={force_mag:.3f}N "
               f"touching={touching}")
@@ -2396,11 +2538,24 @@ async def _realign_gantry_hold_ee(params):
     }
 
 
-def _pick_z_positions(z):
-    """Shared Z waypoint calculations for the 3-phase pick sequence."""
+def _pick_z_positions(z, grasp_lift_override=None):
+    """Shared Z waypoint calculations for the 3-phase pick sequence.
+
+    ``grasp_lift_override`` (optional) — caller can override the global
+    ``GRASP_LIFT`` constant per pick. Negative values descend BELOW the
+    part top to grip mid-body for tall parts; zero parks the finger
+    TCP exactly at part top (default), which lets the contact-aware
+    descent stop on first touch and lift back a clean 5 mm.
+    """
     tcp_z_offset = 0.0 if STATE.target_frame == "gripper_tcp" else GRIPPER_TCP_OFFSET
+    grasp_lift = GRASP_LIFT
+    if grasp_lift_override is not None:
+        try:
+            grasp_lift = float(grasp_lift_override)
+        except (TypeError, ValueError):
+            pass
     part_top_z = z
-    grasp_z = z + GRASP_LIFT       # TCP stays ABOVE part top, pads wrap below
+    grasp_z = z + grasp_lift       # TCP at part top + lift (lift can be 0 or negative)
     safe_z = part_top_z + BOX_HEIGHT + BOX_ENTRY_MARGIN + tcp_z_offset
     entry_z = part_top_z + BOX_HEIGHT + tcp_z_offset
     hover_z = part_top_z + HOVER_CLEARANCE + tcp_z_offset
@@ -2408,7 +2563,7 @@ def _pick_z_positions(z):
     transit_z = safe_z + TRANSIT_SAFE_HEIGHT
     return dict(safe_z=safe_z, entry_z=entry_z, hover_z=hover_z,
                 grasp_target_z=grasp_target_z, transit_z=transit_z,
-                tcp_z_offset=tcp_z_offset)
+                tcp_z_offset=tcp_z_offset, grasp_lift=grasp_lift)
 
 
 # ─── PICK PHASE 1: Descend to grasp position ───────────────
@@ -2436,7 +2591,11 @@ async def _pick_descend(params):
     steps = []
     try:
         locked_ori = normalize_quat(DOWNWARD_ORIENTATION)
-        zp = _pick_z_positions(z)
+        # Optional per-part grasp-depth override from the workflow.
+        # Workflow looks this up in the parts catalogue (negative values
+        # descend below part top to grip mid-body of tall parts).
+        grasp_lift_override = params.get("grasp_lift_override")
+        zp = _pick_z_positions(z, grasp_lift_override=grasp_lift_override)
         safe_z = zp["safe_z"]
 
         safe_pos = np.array([x, y, safe_z])
@@ -2445,6 +2604,7 @@ async def _pick_descend(params):
         grasp_pos = np.array([x, y, zp["grasp_target_z"]])
 
         print(f"  [DESCEND] target=({x:.3f}, {y:.3f}, {z:.3f}) "
+              f"grasp_lift={zp['grasp_lift']:+.3f} "
               f"safe_z={safe_z:.3f} hover_z={zp['hover_z']:.3f} "
               f"grasp_z={zp['grasp_target_z']:.3f}")
 
@@ -2573,13 +2733,22 @@ async def _pick_descend(params):
             params.get("descent_contact_min_force", 0.5))
         contact_lift_back = float(
             params.get("descent_contact_lift_back", 0.002))
+        # 5 mm step instead of 10 mm — each per-step IK call introduces
+        # a tiny XY drift (~0.5 mm) because the solver picks a slightly
+        # different joint configuration at each Z slice. With 1 cm
+        # steps over a 22 cm descent that compounds to ~12 mm of XY
+        # drift visible at the gripper. Halving the step roughly
+        # halves the drift; the cost is twice as many IK solves
+        # (still <2 s extra wall-clock per pick).
+        descent_step = float(
+            params.get("descent_step_size", 0.005))
         descent_result = await _descend_with_contact_stop(
             target_z=zp["grasp_target_z"],
             x=x, y=y,
             locked_ori=locked_ori,
             warm_start=hover_action,
             finger_value=FINGER_OPEN,  # keep fingers open during approach
-            step_size=0.01,
+            step_size=descent_step,
             contact_min_force=contact_min_force,
             contact_lift_back=contact_lift_back)
         if not descent_result.get("ok", False):
@@ -2622,6 +2791,67 @@ async def _pick_descend(params):
               f"{dy_drift*1000:+.1f}, {dz_drift*1000:+.1f}) mm  "
               f"|XY|={xy_drift*1000:.1f} mm")
 
+        # 7c. Post-descent XY snap — single IK solve at the actual
+        #     stopped Z that targets EXACTLY (x, y) again. The
+        #     Cartesian micro-stepping accumulates joint-family drift
+        #     that shows up as residual XY at the bottom of the
+        #     descent (~12 mm in past runs). One IK solve at the
+        #     stopped Z, warm-started from the current joint state,
+        #     pulls the EE back onto the planned XY without the
+        #     "swing-out-of-bin" failure mode the previous attempt
+        #     had — that was caused by the OLD URDF having
+        #     gripper_tcp on the wrong axis (+Z instead of +X), so
+        #     the solver had to pick a wildly different config to
+        #     hit the target. With the corrected URDF the post-
+        #     descent IK stays in the same shoulder/elbow family.
+        #
+        #     Gated on ``post_descent_xy_snap`` (default true) so
+        #     the operator can disable it if it ever causes problems.
+        do_post_snap = bool(params.get("post_descent_xy_snap", True))
+        snap_threshold = float(
+            params.get("post_descent_xy_snap_threshold", 0.003))  # 3 mm
+        if do_post_snap and xy_drift > snap_threshold:
+            print(f"  [DESCEND] Post-descent XY snap: drift "
+                  f"{xy_drift*1000:.1f} mm > "
+                  f"{snap_threshold*1000:.1f} mm → re-IKing to "
+                  f"({x:.4f}, {y:.4f}) at z={float(actual_ee[2]):.4f}")
+            snap_pos = np.array([x, y, float(actual_ee[2])])
+            snap_warm = STATE.robot.get_joint_positions()[:6]
+            snap_action, snap_ok = ik_solve(
+                STATE.lula_solver, STATE.target_frame,
+                snap_pos, locked_ori, snap_warm)
+            if snap_ok:
+                snap_targets = apply_arm_joints(
+                    STATE.robot, STATE.dof_names,
+                    STATE.arm_names, snap_action)
+                snap_targets = set_finger_joints(
+                    STATE.robot, STATE.dof_names,
+                    FINGER_OPEN, snap_targets)
+                STATE.robot.apply_action(
+                    ArticulationAction(joint_positions=snap_targets))
+                for _ in range(SETTLE_FRAMES):
+                    await omni.kit.app.get_app().next_update_async()
+                snapped_ee = get_world_pos(EE_PATH)
+                snap_residual = (
+                    (float(snapped_ee[0]) - x) ** 2
+                    + (float(snapped_ee[1]) - y) ** 2) ** 0.5
+                print(f"  [DESCEND] Post-snap EE = ({snapped_ee[0]:.4f}, "
+                      f"{snapped_ee[1]:.4f}, {snapped_ee[2]:.4f}); "
+                      f"residual XY = {snap_residual*1000:.1f} mm")
+                steps.append({
+                    "phase": "post_descent_xy_snap",
+                    "status": "ok",
+                    "residual_mm": snap_residual * 1000.0,
+                })
+            else:
+                print(f"  [DESCEND] Post-snap IK FAILED — leaving EE "
+                      f"at drifted position; close may grasp off-centre")
+                steps.append({
+                    "phase": "post_descent_xy_snap",
+                    "status": "warn",
+                    "detail": "IK rejected; left as-is",
+                })
+
         # 8. Capture wrist camera — caller uses this for VLM "part between fingers?" check
         wrist_frame = await _capture_camera("wrist")
         wrist_b64 = wrist_frame.get("image_base64")
@@ -2647,7 +2877,11 @@ async def _pick_descend(params):
 # ─── PICK PHASE 2: Close gripper and confirm ───────────────
 
 def _read_contact_sensor():
-    """Read the contact sensor on the left inner finger.
+    """Read the contact sensor on the left inner finger PAD.
+
+    This sensor's normal points INWARD toward the part — it fires
+    when the gripper closes around something. Used by the adaptive
+    gripper-close motion to declare "in contact with part."
 
     Returns (in_contact: bool, force_magnitude: float).
     """
@@ -2655,6 +2889,28 @@ def _read_contact_sensor():
         return False, 0.0
     try:
         frame = STATE.contact_sensor.get_current_frame()
+        in_contact = bool(frame.get("in_contact", False))
+        force_vec = frame.get("force", [0, 0, 0])
+        force_mag = float(np.linalg.norm(force_vec))
+        return in_contact, force_mag
+    except Exception:
+        return False, 0.0
+
+
+def _read_tip_contact_sensor():
+    """Read the contact sensor on the FINGERTIP BOTTOM.
+
+    This sensor's normal is aligned with the descent axis — it fires
+    when the finger tip touches the bin floor or the top of a part
+    during the Cartesian Z descent. Used by the contact-aware descent
+    to halt before the gripper jams into the surface.
+
+    Returns (in_contact: bool, force_magnitude: float).
+    """
+    if STATE.contact_sensor_tip is None:
+        return False, 0.0
+    try:
+        frame = STATE.contact_sensor_tip.get_current_frame()
         in_contact = bool(frame.get("in_contact", False))
         force_vec = frame.get("force", [0, 0, 0])
         force_mag = float(np.linalg.norm(force_vec))
@@ -3439,18 +3695,69 @@ async def start_bridge():
     _timeline_sub = stream.create_subscription_to_pop(_on_timeline_event)
     print("[OK] Timeline subscription active — bridge will auto-stop on sim stop")
 
-    # ── Contact Sensor (adaptive gripper) ────────────────────
+    # ── Contact Sensors ──────────────────────────────────────
+    # Two independent sensors — one on the inner finger pad (used by
+    # the adaptive gripper-close motion) and one on the fingertip
+    # bottom (used by the contact-aware descent to detect floor / part
+    # top before the gripper jams into the surface).
+    #
+    # ``ContactSensor`` lives in two different namespaces depending on
+    # Isaac Sim version:
+    #   * Newer (4.5+):  isaacsim.sensors.contact_sensor.ContactSensor
+    #   * Older (≤ 4.4): omni.isaac.sensor.ContactSensor
+    # Try the new path first, fall back to the legacy path so the
+    # bridge works across both. The ``Camera`` class in this file
+    # already uses the legacy ``omni.isaac.sensor`` path successfully,
+    # which tells us the legacy namespace is available on this build.
+    ContactSensor = None
     try:
-        from isaacsim.sensors.contact_sensor import ContactSensor
-        cs = ContactSensor(prim_path=CONTACT_SENSOR_PRIM)
-        cs.initialize()
-        for _ in range(10):
-            await omni.kit.app.get_app().next_update_async()
-        STATE.contact_sensor = cs
-        print(f"[OK] Contact sensor ready: {CONTACT_SENSOR_PRIM}")
-    except Exception as e:
+        from isaacsim.sensors.contact_sensor import (
+            ContactSensor as _CS_NEW)
+        ContactSensor = _CS_NEW
+        _cs_namespace = "isaacsim.sensors.contact_sensor"
+    except ImportError:
+        try:
+            from omni.isaac.sensor import (
+                ContactSensor as _CS_OLD)
+            ContactSensor = _CS_OLD
+            _cs_namespace = "omni.isaac.sensor"
+        except ImportError:
+            _cs_namespace = None
+
+    if ContactSensor is None:
         STATE.contact_sensor = None
-        print(f"[WARN] Contact sensor init failed (preset gripper mode): {e}")
+        STATE.contact_sensor_tip = None
+        print("[WARN] ContactSensor class not found in either "
+              "'isaacsim.sensors.contact_sensor' or "
+              "'omni.isaac.sensor'. Descent will run blind and the "
+              "adaptive gripper close will use the open-loop fallback.")
+    else:
+        print(f"[OK] ContactSensor class loaded from "
+              f"'{_cs_namespace}'")
+        try:
+            cs_pad = ContactSensor(prim_path=CONTACT_SENSOR_PRIM)
+            cs_pad.initialize()
+            for _ in range(10):
+                await omni.kit.app.get_app().next_update_async()
+            STATE.contact_sensor = cs_pad
+            print(f"[OK] Contact sensor (PAD) ready: {CONTACT_SENSOR_PRIM}")
+        except Exception as e:
+            STATE.contact_sensor = None
+            print(f"[WARN] Contact sensor (PAD) init failed "
+                  f"(preset gripper mode): {e}")
+
+        try:
+            cs_tip = ContactSensor(prim_path=CONTACT_SENSOR_TIP_PRIM)
+            cs_tip.initialize()
+            for _ in range(10):
+                await omni.kit.app.get_app().next_update_async()
+            STATE.contact_sensor_tip = cs_tip
+            print(f"[OK] Contact sensor (TIP) ready: {CONTACT_SENSOR_TIP_PRIM}")
+        except Exception as e:
+            STATE.contact_sensor_tip = None
+            print(f"[WARN] Contact sensor (TIP) init failed — descent "
+                  f"will run to planned target without floor-touch "
+                  f"feedback: {e}")
 
     # ── HTTP Server ──────────────────────────────────────────
     _bridge_server = HTTPServer(("0.0.0.0", BRIDGE_PORT), BridgeHandler)
