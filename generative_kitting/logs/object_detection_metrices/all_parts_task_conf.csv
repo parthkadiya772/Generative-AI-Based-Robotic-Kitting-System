@@ -1,0 +1,8 @@
+﻿ID,Label,Conf,X,Y,Z,Type
+obj_001,large_gear_1,99%,-0.400,0.000,0.100,graspable
+obj_002,large_gear_2,99%,-0.200,0.000,0.100,graspable
+obj_003,large_gear_3,99%,0.000,0.000,0.100,graspable
+obj_004,motor_valve_1,99%,0.200,0.000,0.100,graspable
+obj_005,motor_valve_2,99%,0.400,0.000,0.100,graspable
+obj_006,motor_valve_3,99%,0.600,0.000,0.100,graspable
+obj_007,kitting_tray,98%,0.600,-0.400,0.000,destination

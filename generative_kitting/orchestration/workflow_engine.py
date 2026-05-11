@@ -4952,13 +4952,23 @@ class KittingWorkflowEngine:
         """
         import re as _re
 
-        send = getattr(self.camera, "send_command", None)
-        if not callable(send):
-            return
+        # /api/scene_parts is registered as a GET endpoint on the
+        # bridge; ``send_command`` forces POST so it 404s. Use the
+        # purpose-built ``get_scene_parts`` helper (GET) when the
+        # camera interface supports it; otherwise fall back to
+        # ``send_command`` (will only work if a future bridge
+        # version adds POST support).
+        get_scene = getattr(self.camera, "get_scene_parts", None)
         try:
-            gt = send("/api/scan_scene_parts", {})
+            if callable(get_scene):
+                gt = get_scene()
+            else:
+                send = getattr(self.camera, "send_command", None)
+                if not callable(send):
+                    return
+                gt = send("/api/scene_parts", {})
         except Exception as exc:
-            log.warning(f"[USD-snap] scan_scene_parts failed: {exc}")
+            log.warning(f"[USD-snap] scene_parts fetch failed: {exc}")
             return
         if not isinstance(gt, dict) or not gt.get("parts"):
             log.info("[USD-snap] No USD ground-truth parts available "
@@ -5119,29 +5129,68 @@ class KittingWorkflowEngine:
         """
         from evaluation.metrics import compute_perception_metrics
 
-        if not self.recorder or self._eval_task_id is None:
+        if not self.recorder:
+            log.warning(
+                "[eval] perception metrics skipped: recorder=None "
+                "(EvaluationRecorder not attached to engine)")
             return
-        # Bridge GT lookup. ``send_command`` returns ``None`` on bridge
-        # absence (e.g. during mock-image runs) — guard against that.
+        if self._eval_task_id is None:
+            log.warning(
+                "[eval] perception metrics skipped: _eval_task_id=None "
+                "(begin_task() never called)")
+            return
+        # Bridge GT lookup. ``/api/scene_parts`` is a GET endpoint —
+        # ``send_command`` forces POST and returns 404. Use the
+        # purpose-built ``get_scene_parts`` helper (GET) when
+        # available; fall back to send_command for forward
+        # compatibility if a future bridge adds POST support.
+        get_scene = getattr(self.camera, "get_scene_parts", None)
         send = getattr(self.camera, "send_command", None)
-        if not callable(send):
+        if not callable(get_scene) and not callable(send):
+            log.warning(
+                "[eval] perception metrics skipped: camera interface "
+                "has neither get_scene_parts nor send_command "
+                "(mock mode? bridge offline?)")
             return
         try:
-            gt = send("/api/scan_scene_parts", {})
+            if callable(get_scene):
+                gt = get_scene()
+            else:
+                gt = send("/api/scene_parts", {})
         except Exception as exc:
-            log.warning(f"[eval] scan_scene_parts failed: {exc}")
+            log.warning(f"[eval] /api/scene_parts fetch failed: {exc}")
             return
-        if not isinstance(gt, dict) or not gt.get("parts"):
+        if not isinstance(gt, dict):
+            log.warning(
+                f"[eval] perception metrics skipped: "
+                f"/api/scan_scene_parts returned {type(gt).__name__}, "
+                f"expected dict — value={str(gt)[:200]}")
+            return
+        if not gt.get("parts"):
+            log.warning(
+                f"[eval] perception metrics skipped: "
+                f"/api/scan_scene_parts returned no parts. "
+                f"Response keys={list(gt.keys())}, "
+                f"error={gt.get('error', 'none')}")
             return
 
-        # Optional 2D bboxes for IoU matching. Failure to fetch is
-        # tolerated — metrics fall back to world-XY proximity.
+        # Optional 2D bboxes for IoU matching. /api/scene_annotations
+        # is a GET endpoint just like /api/scene_parts — same lesson.
+        # Failure to fetch is tolerated; metrics fall back to
+        # world-XY proximity matching when annotations are absent.
         annotations = None
         try:
-            ann = send("/api/scene_annotations", {})
+            get_ann = getattr(self.camera, "get_scene_annotations", None)
+            if callable(get_ann):
+                ann = get_ann()
+            elif callable(send):
+                ann = send("/api/scene_annotations", {})
+            else:
+                ann = None
             if isinstance(ann, dict):
                 annotations = ann.get("annotations") or ann.get("parts")
-        except Exception:
+        except Exception as exc:
+            log.debug(f"[eval] /api/scene_annotations fetch failed: {exc}")
             pass
 
         predictions = [o for o in scene.get("detected_objects", [])
