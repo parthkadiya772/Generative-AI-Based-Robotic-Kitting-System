@@ -562,6 +562,48 @@ distributions and substantially reduce the mean pick time.
 
 ---
 
+### Figure 9 — Place cycle time distribution by outcome
+
+![Figure 9 — place cycle time histogram](generative_kitting/logs/evaluation/figures/fig09_place_cycle_time_hist.png)
+
+**Explanation.** Companion to Figure 7 (pick cycle times) — same
+analysis applied to the **34 place attempts that followed
+successful picks**. Three series are explicitly represented in the
+legend so the chart fully describes the place phase:
+
+- **Mechanically completed (24, green)** — the bridge's
+  `/api/place` endpoint returned `status: completed`, meaning the
+  full transit → descend → release → retract sequence finished
+  without an IK rejection or aborted gripper command. This is the
+  reliable proxy for "actual place success" in this batch, giving
+  a **mechanical place completion rate of 70.6 % (24 / 34)**.
+- **Mechanically failed (10, red)** — the place sequence aborted
+  before release, typically at the transit-IK step when the tray
+  drop point sat outside Lula's reachable workspace for the
+  particular arm configuration the previous pick left it in. All
+  10 failures cluster at the upper end of the time distribution
+  (~62 s), confirming the failure happens **late** in the place
+  sequence (after transit + descent) rather than early — failed
+  places do not save time.
+- **Camera_Kit verified in-tray (0)** — the independent verifier
+  that captures a top-down image of the kitting tray via
+  `/World/Camera_Kit` and asks the VLM "is the placed part visible
+  inside the tray boundary?" returned `in_tray=None` for every
+  attempt in this batch (no verdict). The series is retained in
+  the legend with `N = 0` and explicitly annotated on the figure
+  so the reviewer can see the verifier was *attempted* but did not
+  contribute a usable signal — a known limitation tied to a
+  JSON-parsing issue in the verifier prompt response (see §7).
+  Once the verifier is fixed, future runs will populate this
+  third series alongside the mechanical bars, giving a two-tier
+  place-success rate (mechanical / VLM-verified).
+
+The 24 mechanical successes are spread across the 48-62 s range
+with a peak at 56 s; total spread is narrow (14 s) compared to
+the 300+ s spread on pick cycle times (Figure 7) because the
+place sequence is deterministic — no per-instance perception or
+verification VLM calls inside the place loop.
+
 ### Figure 8 — Perception accuracy trend across all scans
 
 ![Figure 8 — perception trend over time](generative_kitting/logs/evaluation/figures/fig08_perception_trend.png)

@@ -365,6 +365,108 @@ def fig_pick_cycle_time_hist(conn, out_path: str) -> Dict[str, Any]:
     }
 
 
+def fig_place_cycle_time_hist(conn, out_path: str) -> Dict[str, Any]:
+    """Histogram of per-place cycle time, separated by mechanical
+    completion vs failure, with Camera_Kit verified-in-tray overlaid
+    as a third series (zero in this batch — shown explicitly in the
+    legend with an annotation on the plot).
+    """
+    rows = conn.execute(
+        "SELECT cycle_time_s, bridge_status, in_tray_vlm "
+        "FROM place_events WHERE cycle_time_s IS NOT NULL").fetchall()
+    succ = [r[0] for r in rows
+            if (r[1] or "").lower() == "completed"]
+    fail = [r[0] for r in rows
+            if (r[1] or "").lower() == "failed"]
+    verified = [r[0] for r in rows if r[2] == 1]
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    all_times = [r[0] for r in rows]
+    if all_times:
+        # Use 12 narrow bins so the 48-62 s range is well-resolved.
+        bins = np.linspace(min(all_times) - 1,
+                           max(all_times) + 1, 12)
+    else:
+        bins = [0, 1]
+
+    ax.hist([succ, fail], bins=bins,
+            color=[PALETTE["success"], PALETTE["failure"]],
+            edgecolor="black", alpha=0.78,
+            label=[f"Success (N = {len(succ)})",
+                   f"Failure (N = {len(fail)})"],
+            stacked=False)
+
+    # Capture y-limit so the legend / annotation don't overlap bars
+    cur_ymax = ax.get_ylim()[1]
+    ax.set_ylim(0, cur_ymax * 1.55)  # leave 55 % headroom for legend/annot
+
+    # ── Verified-in-tray series ──
+    # The Camera_Kit VLM verifier returned in_tray=True 0 times in
+    # this batch. Use a Patch in the legend so the series is
+    # explicitly represented even though there are no bars to draw.
+    from matplotlib.patches import Patch
+    if verified:
+        ax.hist(verified, bins=bins,
+                color=PALETTE["neutral"], edgecolor="black",
+                alpha=0.7, hatch="//",
+                label=f"Camera_Kit verified in-tray (N = {len(verified)})")
+        zero_annotation = None
+    else:
+        zero_patch = Patch(
+            facecolor=PALETTE["neutral"], edgecolor="black",
+            alpha=0.7, hatch="//",
+            label=f"Camera_Kit verified in-tray (N = 0)")
+        zero_annotation = (
+            "Camera_Kit VLM verification = 0 / 34 attempts")
+
+    ax.set_xlabel("Place cycle time (s)")
+    ax.set_ylabel("Count")
+    ax.set_title(
+        f"Place cycle time distribution by outcome "
+        f"(N = {len(rows)} place attempts from 34 successful picks)")
+
+    # Build the legend in the upper-left so it doesn't overlap the
+    # tall failure bar on the right.
+    handles, labels = ax.get_legend_handles_labels()
+    if not verified:
+        handles.append(zero_patch)
+        labels.append(zero_patch.get_label())
+    ax.legend(handles=handles, labels=labels,
+              loc="upper left", frameon=True, fontsize=9,
+              framealpha=0.95)
+
+    # Explicit "0 verified" annotation top-right (away from legend
+    # which lives top-left). The tallest bar (failed places) peaks at
+    # ~10, so with the 55 % headroom buffer there is plenty of room.
+    if zero_annotation:
+        ax.text(
+            0.98, 0.96, zero_annotation,
+            transform=ax.transAxes,
+            ha="right", va="top", fontsize=9.5,
+            color=PALETTE["neutral"],
+            bbox={"boxstyle": "round,pad=0.5",
+                  "facecolor": "#eef2ff",
+                  "edgecolor": PALETTE["neutral"],
+                  "alpha": 0.95})
+
+    # Subtitle at the bottom — total breakdown
+    ax.text(0.02, -0.18,
+            f"Of 34 successful picks → {len(succ)} mechanical place "
+            f"completions, {len(fail)} place failures, "
+            f"{len(verified)} Camera_Kit-verified",
+            transform=ax.transAxes, ha="left", va="top", fontsize=9,
+            color=PALETTE["muted"], style="italic")
+
+    _save(fig, out_path)
+    return {
+        "n_success": len(succ),
+        "n_failure": len(fail),
+        "n_verified": len(verified),
+        "success_mean": statistics.mean(succ) if succ else 0.0,
+        "failure_mean": statistics.mean(fail) if fail else 0.0,
+    }
+
+
 def fig_perception_trend(conn, out_path: str) -> Dict[str, Any]:
     """Line chart: precision, recall, F1 vs task_id (trend over time)."""
     rows = conn.execute(
@@ -496,6 +598,22 @@ CAPTIONS = {
         "depth-analysis + verify+realign chain. Closing the "
         "wrist-camera-offset failure mode (Fig. 3) would tighten "
         "both distributions substantially."),
+    "fig09_place_cycle_time_hist.png": (
+        "Figure 9 — Place cycle time distribution by outcome. ",
+        "Side-by-side histogram of per-place wall-clock time across "
+        "the 34 place attempts (each one followed a successful pick). "
+        "The bridge reports 'completed' for 24 of 34 attempts (green) "
+        "and 'failed' for 10 (red) — a 70.6 % mechanical place "
+        "completion rate. Mechanical failures are concentrated at "
+        "the same cycle-time range as successes (~57-62 s); the "
+        "place phase aborts late in its sequence (after transit + "
+        "descent), so a failed place doesn't terminate early. The "
+        "Camera_Kit VLM verification series shows N = 0 — the "
+        "verifier returned ``in_tray=None`` (no verdict) for every "
+        "place attempt in this batch due to a JSON-parsing issue "
+        "documented in §7 — but is retained explicitly in the legend "
+        "so future runs can show its contribution alongside the "
+        "mechanical signal."),
     "fig08_perception_trend.png": (
         "Figure 8 — Perception accuracy trend across all scans. ",
         "Precision, recall, and F1 remain stable across the "
@@ -543,6 +661,9 @@ def generate_all_figures(db_path: str = None,
                                "fig07_pick_cycle_time_hist.png"))
         stats["fig08"] = fig_perception_trend(
             conn, os.path.join(out_dir, "fig08_perception_trend.png"))
+        stats["fig09"] = fig_place_cycle_time_hist(
+            conn, os.path.join(out_dir,
+                               "fig09_place_cycle_time_hist.png"))
     finally:
         conn.close()
     return stats
@@ -553,7 +674,7 @@ def main() -> None:
     here = os.path.abspath(os.path.dirname(__file__))
     repo = os.path.abspath(os.path.join(here, ".."))
     out_dir = os.path.join(repo, "logs", "evaluation", "figures")
-    print(f"Wrote 8 figures to {out_dir}")
+    print(f"Wrote {len(stats)} figures to {out_dir}")
     for fn in sorted(os.listdir(out_dir)):
         full = os.path.join(out_dir, fn)
         size = os.path.getsize(full)
