@@ -557,7 +557,7 @@ with st.sidebar:
     )
 
     # ── Apply Model Selection ────────────────────────────────
-    if st.button("🔄 Apply Models", use_container_width=True, key="apply_settings"):
+    if st.button("🔄 Apply Models", width="stretch", key="apply_settings"):
         # Update VLM config from selection
         st.session_state.config["perception"]["vlm_provider"] = vlm_selected["provider"]
         st.session_state.config["perception"]["vlm_model"] = vlm_selected["model"]
@@ -590,7 +590,7 @@ with st.sidebar:
     st.markdown("### 🚨 Safety")
     if st.button(
         "🛑 EMERGENCY STOP",
-        use_container_width=True,
+        width="stretch",
         type="primary",
         key="estop",
     ):
@@ -608,7 +608,7 @@ with st.sidebar:
     if st.session_state.system_status == "error":
         if st.button(
             "🔄 Reset System",
-            use_container_width=True,
+            width="stretch",
             key="reset_estop",
         ):
             # Send robot home if bridge is connected
@@ -644,7 +644,7 @@ with st.sidebar:
 
     # ── Hot Reload ───────────────────────────────────────────
     st.markdown("### 🔧 Developer Tools")
-    if st.button("♻️ Hot Reload Backend", use_container_width=True, key="hot_reload"):
+    if st.button("♻️ Hot Reload Backend", width="stretch", key="hot_reload"):
         # Clear cached imports so Python reloads changed modules
         import importlib
         modules_to_reload = [
@@ -711,19 +711,19 @@ with col_left:
     with stream_col1:
         scan_btn = st.button(
             "🔍 Analyze Scene",
-            use_container_width=True,
+            width="stretch",
             key="scan_btn",
         )
     with stream_col2:
         depth_btn = st.button(
             "🔬 Depth Analysis",
-            use_container_width=True,
+            width="stretch",
             key="depth_btn",
         )
     with stream_col3:
         refresh_btn = st.button(
             "🔄 Refresh",
-            use_container_width=True,
+            width="stretch",
             key="refresh_btn",
         )
 
@@ -942,7 +942,7 @@ with col_left:
             ])
             st.dataframe(
                 df,
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
                 column_config={
                     "Conf": st.column_config.TextColumn("Confidence"),
@@ -1002,15 +1002,15 @@ with col_center:
     btn_col1, btn_col2, btn_col3 = st.columns(3)
     with btn_col1:
         execute_btn = st.button(
-            "▶️ Execute", use_container_width=True, type="primary", key="execute_btn"
+            "▶️ Execute", width="stretch", type="primary", key="execute_btn"
         )
     with btn_col2:
         plan_only_btn = st.button(
-            "📋 Plan Only", use_container_width=True, key="plan_btn"
+            "📋 Plan Only", width="stretch", key="plan_btn"
         )
     with btn_col3:
         clear_btn = st.button(
-            "🗑️ Clear Chat", use_container_width=True, key="clear_btn"
+            "🗑️ Clear Chat", width="stretch", key="clear_btn"
         )
 
     if clear_btn:
@@ -1385,7 +1385,7 @@ else:
             try:
                 import pandas as pd
                 df = pd.DataFrame(view)
-                st.dataframe(df, use_container_width=True, height=320)
+                st.dataframe(df, width="stretch", height=320)
                 # IoU + grounding error trend
                 if {"mean_iou", "mean_grounding_error_mm"} <= set(df.columns):
                     chart_df = df[
@@ -1409,7 +1409,7 @@ else:
                     pdf = pd.DataFrame([
                         {k: v for k, v in r.items()
                          if k != "detail_json"} for r in picks])
-                    st.dataframe(pdf, use_container_width=True, height=260)
+                    st.dataframe(pdf, width="stretch", height=260)
                 except Exception:
                     st.write(picks[-10:])
             else:
@@ -1423,7 +1423,7 @@ else:
                     plf = pd.DataFrame([
                         {k: v for k, v in r.items()
                          if k != "detail_json"} for r in places])
-                    st.dataframe(plf, use_container_width=True, height=260)
+                    st.dataframe(plf, width="stretch", height=260)
                 except Exception:
                     st.write(places[-10:])
             else:
@@ -1437,7 +1437,7 @@ else:
                 tdf = pd.DataFrame([
                     {k: v for k, v in r.items()
                      if k != "detail_json"} for r in tasks])
-                st.dataframe(tdf, use_container_width=True, height=200)
+                st.dataframe(tdf, width="stretch", height=200)
             except Exception:
                 st.write(tasks[-10:])
         else:
