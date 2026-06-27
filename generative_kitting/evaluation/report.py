@@ -39,7 +39,20 @@ def _connect(db_path: str) -> sqlite3.Connection:
     return sqlite3.connect(db_path)
 
 
+# Only these table names may be interpolated into the SELECT — sqlite
+# does not parameterise table names, so we have to validate against a
+# fixed allowlist before f-stringing to keep the call SQLi-safe even
+# if a future caller passes a string from outside this module.
+_ALLOWED_TABLES = frozenset({
+    "perception_events", "pick_events", "place_events", "task_events",
+})
+
+
 def _fetch(conn: sqlite3.Connection, table: str) -> List[dict]:
+    if table not in _ALLOWED_TABLES:
+        raise ValueError(
+            f"Refusing to query unknown table {table!r}; "
+            f"allowed: {sorted(_ALLOWED_TABLES)}")
     cur = conn.cursor()
     cur.execute(f"SELECT * FROM {table} ORDER BY id")
     cols = [c[0] for c in cur.description]

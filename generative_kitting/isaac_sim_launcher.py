@@ -6,7 +6,8 @@ It works within Isaac Sim's own Python environment without external dependencies
 
 Prerequisites:
   - AIKIDO.usd is already loaded in the stage
-  - VPN is connected to 10.7.0.35 (for Ollama models)
+  - OLLAMA_BASE_URL env var points at your model server
+    (defaults to http://localhost:11434 — see .env.example)
 """
 
 import sys
@@ -18,7 +19,7 @@ import numpy as np
 
 # ─── Configuration ───────────────────────────────────────────
 
-OLLAMA_BASE_URL = "http://10.7.0.35:11434"
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 VLM_MODEL = "qwen2.5vl:32b"
 LLM_MODEL = "llama3.1:8b"
 

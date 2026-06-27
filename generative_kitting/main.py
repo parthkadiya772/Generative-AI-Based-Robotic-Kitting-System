@@ -19,15 +19,15 @@ import argparse
 import asyncio
 import json
 import os
+import subprocess
 import sys
 import time
 from typing import Any, Dict, Optional
 
-import yaml
-
 # Add package root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from utils.config_loader import load_config
 from utils.logger import setup_logger, get_session_id, log
 from utils.image_utils import save_debug_image
 from perception.vlm_perception import VLMPerception
@@ -54,12 +54,11 @@ class KittingApplication:
         config_path : str
             Path to the config.yaml file.
         """
-        # Load config
+        # Load config (resolves ${VAR} placeholders against os.environ).
         config_file = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), config_path
         )
-        with open(config_file, "r") as f:
-            self.config = yaml.safe_load(f)
+        self.config = load_config(config_file)
 
         # Set up logging
         setup_logger(self.config)
@@ -522,10 +521,12 @@ Examples:
 
     args = parser.parse_args()
 
-    # Launch Streamlit UI
+    # Launch Streamlit UI. Use subprocess.run with an arg list (not a
+    # shell string) so spaces / special chars in the path can't become
+    # command-injection vectors.
     if args.ui:
         ui_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui", "streamlit_app.py")
-        os.system(f"streamlit run {ui_path}")
+        subprocess.run([sys.executable, "-m", "streamlit", "run", ui_path], check=False)
         return
 
     # Create application

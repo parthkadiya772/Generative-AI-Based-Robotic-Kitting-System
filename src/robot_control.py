@@ -33,8 +33,17 @@ GRIPPER_FINGER_PATHS = [
     "/World/gantry_home/ur10_flattened/ur10_instanceable/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/robotiq_base_link",
 ]
 
-BROKEN_URDF = r"c:/kp/ai_and_automation/sem_4/thesis/isaacsim/exts/isaacsim.asset.importer.urdf/data/urdf/robots/ur10/urdf/ur10.urdf"
-BROKEN_YAML = r"c:/kp/ai_and_automation/sem_4/thesis/isaacsim/exts/isaacsim.robot_motion.motion_generation/motion_policy_configs/universal_robots/ur10/rmpflow/ur10_robot_description.yaml"
+# UR10 URDF / motion-policy YAML bundled with Isaac Sim. Built from the
+# ISAACSIM_PATH env var (set it to the root of your Isaac Sim install,
+# i.e. the directory containing `exts/`) so this works on any machine.
+_ISAACSIM_PATH = os.environ.get("ISAACSIM_PATH", "")
+BROKEN_URDF = os.path.join(
+    _ISAACSIM_PATH, "exts", "isaacsim.asset.importer.urdf",
+    "data", "urdf", "robots", "ur10", "urdf", "ur10.urdf")
+BROKEN_YAML = os.path.join(
+    _ISAACSIM_PATH, "exts", "isaacsim.robot_motion.motion_generation",
+    "motion_policy_configs", "universal_robots", "ur10", "rmpflow",
+    "ur10_robot_description.yaml")
 
 # ========================================================
 # ROBOTIQ 2F-140 PHYSICAL DIMENSIONS

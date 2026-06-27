@@ -101,7 +101,7 @@ pytest tests/test_planner.py::TestPlanValidation::test_valid_plan -v  # Single t
 
 | Constraint | Details |
 |-----------|---------|
-| **VPN Required** | Ollama models at `10.7.0.35:11434` — VPN-only access |
+| **Model server** | Ollama endpoint configured via the `OLLAMA_BASE_URL` env var (see `.env.example`) — VPN may be required for remote hosts |
 | **Isaac Sim Bridge Process** | Runs inside **Script Editor**, NOT terminal — separate Python environment |
 | **7-DOF Joints** | `[gantry_x, shoulder_pan, shoulder_lift, elbow, wrist1, wrist2, wrist3]` — not standard 6-DOF |
 | **Gripper TCP** | 0.150m from ee_link to finger pad (Robotiq 2F-140) — critical for IK accuracy |

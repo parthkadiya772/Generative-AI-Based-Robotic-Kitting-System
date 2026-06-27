@@ -24,6 +24,7 @@ API:
 import argparse
 import base64
 import io
+import os
 import time
 
 import numpy as np
@@ -198,7 +199,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Zero-Shot Detector Server")
     parser.add_argument("--model", default="owlv2", choices=["owlv2", "grounding_dino"])
     parser.add_argument("--port", type=int, default=8700)
-    parser.add_argument("--host", default="0.0.0.0")
+    # Loopback by default — the detector endpoint has no auth and
+    # exposes /detect to whoever can reach the port. Pass --host
+    # 0.0.0.0 explicitly (or set DETECTOR_HOST in your environment)
+    # when you knowingly want LAN access.
+    parser.add_argument(
+        "--host",
+        default=os.environ.get("DETECTOR_HOST", "127.0.0.1"))
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 

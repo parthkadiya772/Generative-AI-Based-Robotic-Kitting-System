@@ -3,7 +3,7 @@
 # ============================================================
 
 simulation:
-  usd_scene_path: "C:/KP/AI_and_Automation/Sem_4/Thesis/robot_in_air/AIKIDO.usd"
+  usd_scene_path: "${PROJECT_ROOT}/AIKIDO.usd"
   robot_prim_path: "/World"
   ur10_base_path: "/World/gantry_home/ur10_flattened/ur10_instanceable/base_link"
   ee_path: "/World/gantry_home/ur10_flattened/ur10_instanceable/ee_link"
@@ -17,9 +17,11 @@ simulation:
   gantry_x_joint: "gantry_vagn_joint"
   gantry_x_offset: 1.27
 
-  # URDF/YAML paths for Lula IK solver
-  urdf_path: "c:/kp/ai_and_automation/sem_4/thesis/isaacsim/exts/isaacsim.asset.importer.urdf/data/urdf/robots/ur10/urdf/ur10.urdf"
-  yaml_path: "c:/kp/ai_and_automation/sem_4/thesis/isaacsim/exts/isaacsim.robot_motion.motion_generation/motion_policy_configs/universal_robots/ur10/rmpflow/ur10_robot_description.yaml"
+  # URDF/YAML paths for Lula IK solver. Resolved from ISAACSIM_PATH so
+  # any operator can run the project by pointing that env var at their
+  # own Isaac Sim install (see .env.example).
+  urdf_path: "${ISAACSIM_PATH}/exts/isaacsim.asset.importer.urdf/data/urdf/robots/ur10/urdf/ur10.urdf"
+  yaml_path: "${ISAACSIM_PATH}/exts/isaacsim.robot_motion.motion_generation/motion_policy_configs/universal_robots/ur10/rmpflow/ur10_robot_description.yaml"
 
   # Gripper finger prim paths (Robotiq 2F-140)
   gripper_finger_paths:
@@ -59,38 +61,44 @@ simulation:
 
 # ─── Perception (VLM) ───────────────────────────────────────
 perception:
-  vlm_provider: "ollama_qwen"         # Active provider (overridden by UI model selection)
-  vlm_model: "qwen2.5vl:7b"          # Active model  (overridden by UI model selection)
-  vlm_base_url: "http://10.7.0.35:11434"   # Active endpoint (overridden by UI model selection)
+  # Gemma4 is the default for both perception and orchestration so a
+  # single small model covers the whole pipeline. Override via the
+  # Streamlit dropdown if you want Qwen-VL's higher recall on dense
+  # scenes.
+  vlm_provider: "ollama_gemma"        # Active provider (overridden by UI model selection)
+  vlm_model: "gemma4:e4b"             # Active model  (overridden by UI model selection)
+  vlm_base_url: "${OLLAMA_BASE_URL}"   # Active endpoint
   max_retries: 2
   temperature: 0.0                    # Low temperature for deterministic perception
   confidence_threshold: 0.5           # Reject objects below this confidence
   vlm_num_ctx: 32768                  # Larger context for catalogue + image tokens
-  vlm_num_predict: 8192               # Give Qwen more room to finish JSON instead of truncating at 4096
+  vlm_num_predict: 8192               # Give the VLM headroom to finish JSON
 
   # ── Available VLM Models (shown as dropdown in Streamlit UI) ──
-  # Add your VPN model endpoints here.  "name" is the dropdown label.
   vlm_models:
 
-    # ── VPN Remote Server ────────────────────────────────────
+    - name: "Gemma4 2B"
+      provider: "ollama_gemma"
+      model: "gemma4:e2b"
+      base_url: "${OLLAMA_BASE_URL}"
 
-    - name: "Gemma4 4B (VPN Remote)"
+    - name: "Gemma4 4B"
       provider: "ollama_gemma"
       model: "gemma4:e4b"
-      base_url: "http://10.7.0.35:11434"
+      base_url: "${OLLAMA_BASE_URL}"
 
-    - name: "Qwen3-VL 8B (VPN Remote)"
+    - name: "Qwen3-VL 8B (fallback)"
       provider: "ollama_qwen"
       model: "qwen3-vl:8b"
-      base_url: "http://10.7.0.35:11434"
+      base_url: "${OLLAMA_BASE_URL}"
 
-    - name: "Qwen3-VL 30B (VPN Remote)"
+    - name: "Qwen3-VL 30B (fallback)"
       provider: "ollama_qwen"
       model: "qwen3-vl:30b"
-      base_url: "http://10.7.0.35:11434"
+      base_url: "${OLLAMA_BASE_URL}"
 
   # ── Zero-Shot Detector (precise bounding boxes — replaces VLM coord guesses) ──
-  # detector_url: "http://10.7.0.35:8700"  # uncomment to use remote server instead of local
+  # detector_url: "${DETECTOR_BASE_URL}"  # set DETECTOR_BASE_URL in .env to use a remote detector
   detector_model: "owlv2"              # "owlv2" (lightweight) or "grounding_dino" (more accurate)
   detector_confidence: 0.15            # minimum detection confidence
   detector_device: "cpu"               # "cpu" or "cuda" (set to cuda if you have a local GPU)
@@ -339,24 +347,39 @@ perception:
 
 # ─── Orchestration (LLM) ────────────────────────────────────
 orchestration:
-  llm_provider: "ollama_llama"        # Active provider (overridden by UI model selection)
-  llm_model: "llama3.1:8b"           # Active model  (overridden by UI model selection)
+  # The planner now uses Gemma4 by default so a single VLM serves both
+  # perception and task-planning. The same Ollama endpoint is reused;
+  # only the messages differ (perception sends images, planning sends
+  # text only). Switch the dropdown in the Streamlit UI to pick a
+  # different planner without restarting.
+  llm_provider: "ollama_gemma"        # Active provider (overridden by UI model selection)
+  llm_model: "gemma4:e4b"             # Active model  (overridden by UI model selection)
   llm_api_key_env: "OPENAI_API_KEY"
-  llm_base_url: "http://localhost:11434"   # Active endpoint (overridden by UI model selection)
+  llm_base_url: "${OLLAMA_BASE_URL:-http://localhost:11434}"   # Active endpoint
   max_retries: 3
   temperature: 0.0                    # Zero temperature for deterministic planning
   max_tokens: 4096
   max_plan_steps: 50                  # Reject plans with more steps (hallucination guard)
 
   # ── Available LLM Models (shown as dropdown in Streamlit UI) ──
-  # Add your VPN model endpoints here.  "name" is the dropdown label.
+  # Gemma4 is the default planner. Llama-3.1 is retained as a
+  # fallback in case Gemma struggles on a particular command shape.
   llm_models:
 
-    # ── VPN Remote Server ────────────────────────────────────
-    - name: "Llama 3.1 8B (VPN Remote)"
+    - name: "Gemma4 2B"
+      provider: "ollama_gemma"
+      model: "gemma4:e2b"
+      base_url: "${OLLAMA_BASE_URL:-http://localhost:11434}"
+
+    - name: "Gemma4 4B"
+      provider: "ollama_gemma"
+      model: "gemma4:e4b"
+      base_url: "${OLLAMA_BASE_URL:-http://localhost:11434}"
+
+    - name: "Llama 3.1 8B (fallback)"
       provider: "ollama_llama"
       model: "llama3.1:8b"
-      base_url: "http://10.7.0.35:11434"
+      base_url: "${OLLAMA_BASE_URL:-http://localhost:11434}"
 
 # ─── Execution ───────────────────────────────────────────────
 execution:

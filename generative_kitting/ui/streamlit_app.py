@@ -23,9 +23,9 @@ import streamlit as st
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import yaml
 from PIL import Image
 
+from utils.config_loader import load_config
 from utils.logger import setup_logger, get_session_id, log
 from perception.vlm_perception import VLMPerception
 from perception.camera_interface import MockCameraInterface, BridgeCameraInterface
@@ -287,8 +287,7 @@ def init_session_state():
         "config.yaml",
     )
     if "config" not in st.session_state:
-        with open(config_path, "r") as f:
-            st.session_state.config = yaml.safe_load(f)
+        st.session_state.config = load_config(config_path)
 
     if "session_id" not in st.session_state:
         st.session_state.session_id = get_session_id()

@@ -20,8 +20,10 @@ API on port 8600 that the Streamlit dashboard consumes for:
   POST /api/pick          → full pick sequence at XYZ
   POST /api/place         → full place sequence at XYZ
 
-Usage in Isaac Sim Script Editor:
-  exec(open("c:/KP/AI_and_Automation/Sem_4/Thesis/robot_in_air/generative_kitting/isaac_sim_bridge.py").read())
+Usage in Isaac Sim Script Editor (replace <PROJECT_ROOT> with the
+path to your local clone, or run kitting_bridge_server.py which does
+this for you using its own __file__ location):
+  exec(open("<PROJECT_ROOT>/generative_kitting/isaac_sim_bridge.py").read())
 """
 
 import sys, os, json, asyncio, threading, traceback, io, base64, time, tempfile
@@ -32,7 +34,12 @@ import numpy as np
 # CONFIGURATION (mirrors the constants in robot_control.py)
 # ═════════════════════════════════════════════════════════════
 
-BRIDGE_PORT = 8600
+# Bridge host/port come from env so the operator can pin the listener
+# to loopback (default) or open it to the LAN deliberately. The HTTP
+# API has no authentication; binding to 0.0.0.0 lets anyone on the
+# subnet call /api/execute, so the safe default is 127.0.0.1.
+BRIDGE_HOST = os.environ.get("BRIDGE_HOST", "127.0.0.1")
+BRIDGE_PORT = int(os.environ.get("BRIDGE_PORT", "8600"))
 ROBOT_PRIM  = "/World"
 
 # Dual cameras
@@ -76,9 +83,19 @@ PLACE_BOX_PATH = "/World/box_840"
 CONTACT_SENSOR_PRIM     = "/World/gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/left_inner_finger/Finger4_01/Finger4/Contact_Sensor"
 CONTACT_SENSOR_TIP_PRIM = "/World/gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/left_inner_finger/Fingertip_01/Fingertip/Contact_Sensor"
 
-# URDF / YAML for Lula IK
-URDF_PATH = r"c:/kp/ai_and_automation/sem_4/thesis/isaacsim/exts/isaacsim.asset.importer.urdf/data/urdf/robots/ur10/urdf/ur10.urdf"
-YAML_PATH = r"c:/kp/ai_and_automation/sem_4/thesis/isaacsim/exts/isaacsim.robot_motion.motion_generation/motion_policy_configs/universal_robots/ur10/rmpflow/ur10_robot_description.yaml"
+# URDF / YAML for Lula IK. Resolved from the ISAACSIM_PATH env var so
+# the bridge runs on any operator's machine (Windows / Linux / Mac)
+# without editing this file. Set ISAACSIM_PATH to the root of your
+# Isaac Sim install (the directory containing `exts/`). os.path.join
+# keeps the separator OS-correct.
+_ISAACSIM_PATH = os.environ.get("ISAACSIM_PATH", "")
+URDF_PATH = os.path.join(
+    _ISAACSIM_PATH, "exts", "isaacsim.asset.importer.urdf",
+    "data", "urdf", "robots", "ur10", "urdf", "ur10.urdf")
+YAML_PATH = os.path.join(
+    _ISAACSIM_PATH, "exts", "isaacsim.robot_motion.motion_generation",
+    "motion_policy_configs", "universal_robots", "ur10", "rmpflow",
+    "ur10_robot_description.yaml")
 
 # HOME_JOINTS is captured from the USD scene at startup (see _init_robot).
 # The robot is ceiling-mounted on the gantry — the correct rest pose depends
@@ -3760,11 +3777,11 @@ async def start_bridge():
                   f"feedback: {e}")
 
     # ── HTTP Server ──────────────────────────────────────────
-    _bridge_server = HTTPServer(("0.0.0.0", BRIDGE_PORT), BridgeHandler)
+    _bridge_server = HTTPServer((BRIDGE_HOST, BRIDGE_PORT), BridgeHandler)
     _bridge_server.timeout = 1  # so shutdown() isn't blocked forever
 
     def serve():
-        print(f"[OK] Bridge v2 on http://localhost:{BRIDGE_PORT}")
+        print(f"[OK] Bridge v2 on http://{BRIDGE_HOST}:{BRIDGE_PORT}")
         print(f"     IK: {'Lula ({})'.format(STATE.target_frame) if STATE.ik_ready else 'DISABLED'}")
         print(f"     Cameras: RGB={CAMERA_RGB_PRIM}")
         print(f"              Depth={CAMERA_DEPTH_PRIM}")

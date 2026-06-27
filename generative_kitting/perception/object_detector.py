@@ -63,8 +63,8 @@ class ZeroShotDetector:
         ----------
         config : dict
             Optional configuration with keys:
-            - ``detector_url``: URL of remote detector server
-              (e.g. ``"http://10.7.0.35:8700"``).  If set, remote mode
+            - ``detector_url``: URL of remote detector server (e.g.
+              ``"http://detector-host:8700"``).  If set, remote mode
               is used and no local model is loaded.
             - ``detector_model``: ``"owlv2"`` or ``"grounding_dino"``
             - ``detector_confidence``: min confidence (default 0.15)

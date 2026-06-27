@@ -189,13 +189,19 @@ class LLMPlanner:
     # ─── Provider Backends ───────────────────────────────────
 
     def _call_llm(self, user_prompt: str) -> str:
-        """Route to the appropriate LLM backend."""
+        """Route to the appropriate LLM backend.
+
+        Any provider starting with ``ollama`` (``ollama_llama``,
+        ``ollama_gemma``, ``ollama_qwen``, ...) is treated as an
+        Ollama chat call. The provider tag only selects the prompt /
+        client path; the actual model is given by ``self.model``,
+        so the same code path serves Gemma4, Llama-3, Qwen, etc.
+        """
         if self.provider == "openai":
             return self._call_openai(user_prompt)
-        elif self.provider in ("ollama_llama", "ollama"):
+        if self.provider.startswith("ollama"):
             return self._call_ollama(user_prompt)
-        else:
-            raise ValueError(f"Unknown LLM provider: {self.provider}")
+        raise ValueError(f"Unknown LLM provider: {self.provider}")
 
     def _call_openai(self, user_prompt: str) -> str:
         """Send prompt to OpenAI GPT-4o API."""
@@ -215,7 +221,13 @@ class LLMPlanner:
         return response.choices[0].message.content
 
     def _call_ollama(self, user_prompt: str) -> str:
-        """Send prompt to Ollama (Llama-3.1 or compatible)."""
+        """Send the prompt to an Ollama-served model.
+
+        ``format="json"`` is set on every call. Smaller models
+        (Gemma4 e2b / e4b in particular) frequently wrap their JSON
+        in chatter or markdown without it; enabling JSON-mode lets
+        the server enforce schema-valid output and saves a retry.
+        """
         import ollama
 
         client = ollama.Client(host=self.base_url)
@@ -226,6 +238,7 @@ class LLMPlanner:
                 {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
+            format="json",
             options={
                 "temperature": self.temperature,
                 "num_predict": self.max_tokens,

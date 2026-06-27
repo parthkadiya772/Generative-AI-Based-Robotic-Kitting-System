@@ -6,6 +6,8 @@ transforms_simple/
 .vscode/
 .aikido/
 __pycache__/
+.env
+.env.local
 .DS_Store
 ur10_setup/
 aikido_files.txt
