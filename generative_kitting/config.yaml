@@ -25,11 +25,11 @@ simulation:
 
   # Gripper finger prim paths (Robotiq 2F-140)
   gripper_finger_paths:
-    - "/World/gantry_home/ur10_flattened/ur10_instanceable/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/left_inner_finger"
-    - "/World/gantry_home/ur10_flattened/ur10_instanceable/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/right_inner_finger"
-    - "/World/gantry_home/ur10_flattened/ur10_instanceable/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/left_outer_finger"
-    - "/World/gantry_home/ur10_flattened/ur10_instanceable/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/right_outer_finger"
-    - "/World/gantry_home/ur10_flattened/ur10_instanceable/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/robotiq_base_link"
+    - "/World/gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/left_inner_finger"
+    - "/World/gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/right_inner_finger"
+    - "/World/gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/left_outer_finger"
+    - "/World/gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/right_outer_finger"
+    - "/World/gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/robotiq_base_link"
   box_prim_path: "/World/robot_facade_full"
 
   # ── Wrist-scan pipeline (current approach) ─────────────────────
