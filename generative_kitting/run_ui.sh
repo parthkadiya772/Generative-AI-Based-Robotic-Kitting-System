@@ -2,10 +2,6 @@
 # ============================================================
 # Generative Kitting System — Streamlit UI Launcher (Linux/Mac)
 # ============================================================
-#  Uses direct venv paths (venv/bin/python, venv/bin/pip) instead
-#  of sourcing activate — avoids hardcoded-path issues in the
-#  auto-generated activation script.
-# ============================================================
 
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 VENV_NAME=".aikido"
@@ -14,6 +10,18 @@ PYTHON_EXE="$VENV_DIR/bin/python"
 PIP_EXE="$VENV_DIR/bin/pip"
 REQUIREMENTS="$PROJECT_DIR/requirements.txt"
 STREAMLIT_APP="$PROJECT_DIR/ui/streamlit_app.py"
+
+# Flag to track if we need to install dependencies
+NEEDS_INSTALL=false
+
+catch_error() {
+    echo ""
+    echo "============================================================"
+    echo "[ERROR] Script failed. Press Enter to close this window..."
+    echo "============================================================"
+    read -r
+    exit 1
+}
 
 echo "============================================================"
 echo " Generative Kitting - Streamlit UI"
@@ -24,11 +32,12 @@ echo "============================================================"
 echo ""
 
 # ── Step 1: Create virtual environment if missing ──────────
-if [ -f "$PYTHON_EXE" ]; then
-    echo "[1/4] Virtual environment found."
+if [ -d "$VENV_DIR" ] && [ -f "$PYTHON_EXE" ]; then
+    echo "[1/3] Virtual environment found. Skipping setup..."
 else
-    echo "[1/4] Virtual environment not found at \"$VENV_DIR\""
+    echo "[1/3] Virtual environment not found or incomplete at \"$VENV_DIR\""
     echo "      Creating it now..."
+    NEEDS_INSTALL=true # Mark that we need to install packages after this
 
     # Find a system Python
     SYS_PYTHON=""
@@ -43,7 +52,7 @@ else
         echo ""
         echo "[ERROR] No Python interpreter found on PATH."
         echo "        Install Python 3.9+ and re-run."
-        exit 1
+        catch_error
     fi
 
     echo "      Using: $SYS_PYTHON"
@@ -51,33 +60,44 @@ else
     if [ $? -ne 0 ]; then
         echo ""
         echo "[ERROR] Failed to create virtual environment."
-        exit 1
+        catch_error
     fi
-    echo "[1/4] Virtual environment created."
+    echo "      Virtual environment created successfully."
 fi
 
-# ── Step 2: Upgrade pip ─────────────────────────────────────
-echo "[2/4] Checking pip..."
-"$PYTHON_EXE" -m pip install --upgrade pip --quiet 2>/dev/null || \
-    echo "[WARN] pip upgrade failed — continuing with existing version."
+# ── Step 2: Install dependencies ONLY IF the venv was just created ──
+if [ "$NEEDS_INSTALL" = true ]; then
+    echo "[2/3] First-time setup: Installing dependencies..."
+    
+    # Upgrade pip first
+    "$PYTHON_EXE" -m pip install --upgrade pip --quiet 2>/dev/null
 
-# ── Step 3: Install / verify dependencies ───────────────────
-echo "[3/4] Checking dependencies..."
-if [ ! -f "$REQUIREMENTS" ]; then
-    echo "[WARN] requirements.txt not found — skipping dependency install."
+    if [ ! -f "$REQUIREMENTS" ]; then
+        echo "[WARN] requirements.txt not found — skipping dependency install."
+    else
+        echo "      Processing packages line-by-line..."
+        while read -r line || [ -n "$line" ]; do
+            cleaned_line=$(echo "$line" | tr -d '\r' | xargs)
+            [[ -z "$cleaned_line" || "$cleaned_line" == \#* ]] && continue
+            
+            echo "      -> Installing $cleaned_line..."
+            if ! "$PIP_EXE" install "$cleaned_line" --quiet --no-cache-dir 2>/dev/null; then
+                echo "      [SKIPPED] Non-compatible or failing package: $cleaned_line"
+            fi
+        done < "$REQUIREMENTS"
+    fi
 else
-    "$PIP_EXE" install -r "$REQUIREMENTS" --quiet 2>&1 || \
-        echo "[WARN] Some packages failed to install — attempting to launch anyway..."
+    echo "[2/3] Skipping dependency check (Environment already configured)."
 fi
 
-# ── Step 4: Launch Streamlit ───────────────────────────────
+# ── Step 3: Launch Streamlit ───────────────────────────────
 if [ ! -f "$STREAMLIT_APP" ]; then
     echo ""
     echo "[ERROR] App file not found: $STREAMLIT_APP"
-    exit 1
+    catch_error
 fi
 
-echo "[4/4] Launching Streamlit UI..."
+echo "[3/3] Launching Streamlit UI..."
 echo ""
 echo "  App : $STREAMLIT_APP"
 echo "  URL : http://localhost:8501"
