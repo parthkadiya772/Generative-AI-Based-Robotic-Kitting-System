@@ -83,11 +83,10 @@ Open `.env` and pick **one of the two options** for the model server:
 1. Install Ollama on your own machine: <https://ollama.com/download>
 2. Pull the models you want to use:
    ```bash
-   ollama pull qwen2.5vl:7b        # VLM for perception
+   ollama pull gemma4:e4b          # VLM for perception
    ollama pull llama3.1:8b         # LLM for planning
    # Optional larger / alternative models:
    # ollama pull qwen3-vl:8b
-   # ollama pull gemma4:e4b
    ```
 3. Start the Ollama daemon (default port 11434):
    ```bash
