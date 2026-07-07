@@ -5,11 +5,9 @@ commands ("pick all motor valves") into safe robot motion. The system
 combines:
 
 - **Vision-Language Models (VLMs)** — Qwen2.5-VL / Qwen3-VL / Gemma4
-  for zero-shot scene understanding.
+  for zero-shot scene understanding and task planning (constrained to a fixed action vocabulary).
 - **Zero-shot object detectors** — OWL-ViT2 or Grounding DINO for
   precise per-part bounding boxes.
-- **Large Language Models (LLMs)** — Gemma4 / Llama-class models for task
-  planning (constrained to a fixed action vocabulary).
 - **NVIDIA Isaac Sim** — UR10 arm with a Robotiq 2F-140 gripper on a
   gantry rail, controlled deterministically via a Lula IK solver.
 
@@ -27,7 +25,7 @@ Operator command
        ▼
 ┌───────────────┐    ┌────────────────┐    ┌────────────────┐
 │  Perception   │ →  │ Orchestration  │ →  │   Execution    │
-│ (VLM + OWL)   │    │   (VLM/LLM)    │    │ (Isaac Sim)    │
+│ (VLM + OWL)   │    │     (VLM)      │    │  (Isaac Sim)   │
 └───────────────┘    └────────────────┘    └────────────────┘
    scene JSON          task plan            joint motion
 ```
@@ -79,10 +77,7 @@ Open `.env` and pick **one of the two options** for the model server:
 1. Install Ollama on your own machine: <https://ollama.com/download>
 2. Pull the models you want to use:
    ```bash
-   ollama pull gemma4:e4b          # VLM for perception
-   ollama pull llama3.1:8b         # LLM for planning
-   # Optional larger / alternative models:
-   # ollama pull qwen3-vl:8b
+   ollama pull gemma4:e2b          # VLM for perception & task planning
    ```
 3. Start the Ollama daemon (default port 11434):
    ```bash
