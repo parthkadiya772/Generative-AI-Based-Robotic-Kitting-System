@@ -43,7 +43,7 @@ Detailed breakdown in [`CLAUDE.md`](CLAUDE.md).
 | Python | 3.9 or newer (3.10+ recommended) |
 | NVIDIA Isaac Sim | 5.1.0 (only for simulator-attached runs) |
 | Ollama | Any recent version (local or remote) |
-| OS | Windows / Linux / macOS (paths are resolved cross-platform) |
+| OS | Windows / Linux (paths are resolved cross-platform) |
 | GPU | NVIDIA RTX 4070 or above with minimum 24GB VRAM |
 
 You can run the standalone CLI / Streamlit UI **without** Isaac Sim
