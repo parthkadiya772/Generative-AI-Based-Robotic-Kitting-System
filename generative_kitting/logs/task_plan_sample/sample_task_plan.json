@@ -1,0 +1,141 @@
+{
+    "task_summary": "Pick motor valve and large gear, then place them into kitting tray",
+    "total_steps": 19,
+    "plan": [
+        {
+            "step": 1,
+            "action": "move_home",
+            "params": {}
+        },
+        {
+            "step": 2,
+            "action": "open_gripper",
+            "params": {}
+        },
+        {
+            "step": 3,
+            "action": "pick_object",
+            "params": {
+                "object_id": "obj_004",
+                "x": -0.8951506578351454,
+                "y": -0.7027811717845012,
+                "z": 0.8021429777145386
+            }
+        },
+        {
+            "step": 4,
+            "action": "verify_grasp",
+            "params": {}
+        },
+        {
+            "step": 5,
+            "action": "place_object",
+            "params": {
+                "object_id": "obj_004",
+                "x": 0.6826795384586296,
+                "y": -0.7532925564977881,
+                "z": 1.4270709517207014
+            }
+        },
+        {
+            "step": 6,
+            "action": "open_gripper",
+            "params": {}
+        },
+        {
+            "step": 7,
+            "action": "pick_object",
+            "params": {
+                "object_id": "obj_001",
+                "x": -1.586311764551377,
+                "y": -0.5489227671560535,
+                "z": 0.8163048028945923
+            }
+        },
+        {
+            "step": 8,
+            "action": "verify_grasp",
+            "params": {}
+        },
+        {
+            "step": 9,
+            "action": "place_object",
+            "params": {
+                "object_id": "obj_001",
+                "x": 0.6826795384586296,
+                "y": -0.7532925564977881,
+                "z": 1.4270709517207014
+            }
+        },
+        {
+            "step": 10,
+            "action": "open_gripper",
+            "params": {}
+        },
+        {
+            "step": 11,
+            "action": "pick_object",
+            "params": {
+                "object_id": "obj_002",
+                "x": -1.7098310670702739,
+                "y": -0.6347000611598823,
+                "z": 0.8121527433395386
+            }
+        },
+        {
+            "step": 12,
+            "action": "verify_grasp",
+            "params": {}
+        },
+        {
+            "step": 13,
+            "action": "place_object",
+            "params": {
+                "object_id": "obj_002",
+                "x": 0.6826795384586296,
+                "y": -0.7532925564977881,
+                "z": 1.4270709517207014
+            }
+        },
+        {
+            "step": 14,
+            "action": "open_gripper",
+            "params": {}
+        },
+        {
+            "step": 15,
+            "action": "pick_object",
+            "params": {
+                "object_id": "obj_003",
+                "x": -1.584873298592389,
+                "y": -0.7051882937966738,
+                "z": 0.808932900428772
+            }
+        },
+        {
+            "step": 16,
+            "action": "verify_grasp",
+            "params": {}
+        },
+        {
+            "step": 17,
+            "action": "place_object",
+            "params": {
+                "object_id": "obj_003",
+                "x": 0.6826795384586296,
+                "y": -0.7532925564977881,
+                "z": 1.4270709517207014
+            }
+        },
+        {
+            "step": 18,
+            "action": "open_gripper",
+            "params": {}
+        },
+        {
+            "step": 19,
+            "action": "move_home",
+            "params": {}
+        }
+    ]
+}

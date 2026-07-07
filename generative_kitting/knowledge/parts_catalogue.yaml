@@ -1,0 +1,94 @@
+# Parts Visual Catalogue — fed to the VLM (Gemma4) alongside each scene image.
+#
+# Decision flow: COLOUR alone is enough.
+#   BLACK round  → large_gear
+#   SILVER bulky → motor_valve
+#
+# small_hinge has been removed from the active scene — operators
+# have physically taken those parts out of the bin, so eliminating
+# its catalogue entry stops the VLM and OWL-ViT2 from conflating
+# motor_valves with silver hinges (every silver part is now
+# unambiguously a motor_valve).
+#
+# Edit this file as the scene contents change — no code changes
+# needed. Loaded by knowledge/parts_catalogue.py and injected into
+# the scene-analysis and bin-zoom prompts.
+
+parts:
+
+  # ── BLACK PARTS ───────────────────────────────────────────────
+  large_gear:
+    # OWL-ViT2 query alternatives. All run in one batch; the detector
+    # picks whichever phrasing matches each instance best. Different
+    # phrasings can catch different lighting / angle / clutter cases.
+    detector_queries:
+      - "flat black circular disc"
+      - "small black washer"
+      - "black rubber grommet"
+    color: "solid BLACK, uniform, non-reflective"
+    shape: "flat circular disc with uniform thickness — looks like a
+      simple washer, rubber grommet, or small mounting plate viewed
+      from above"
+    size: "small (low-profile disc, only a few mm thick)"
+    distinguishing_features:
+      - "the ONLY BLACK part type — colour alone is enough to
+        identify it"
+      - "perfectly circular outline viewed from above"
+      - "solid BLACK colour across the entire face"
+      - "flat, uniform thickness, no visible 3D structure"
+    not_to_confuse_with:
+      - "all other parts in the bin are SILVER motor_valves — if
+        the part is BLACK and round, it is ALWAYS a large_gear"
+
+  # ── SILVER PARTS ──────────────────────────────────────────────
+  # small_hinge intentionally REMOVED — the operator has taken hinges
+  # out of the scene. Every silver part is now a motor_valve, no
+  # disambiguation needed.
+  motor_valve:
+    # ``silver round metal valve with central hole`` is too long /
+    # abstract for OWL — it returns 0 hits. Concrete real-world object
+    # names (these parts ARE engine throttle bodies) match much better.
+    detector_queries:
+      - "metal throttle body"
+      - "silver engine throttle"
+      - "silver metal valve"
+      - "silver pipe fitting with flange"
+    color: "metallic SILVER cast metal, matte cast finish"
+    shape: "BULKY 3D silver cast housing with a HUGE round opening
+      straight through the middle (the throttle bore) which you can
+      see THROUGH. Inside that hole a thin horizontal SHAFT or
+      BUTTERFLY PLATE bisects the bore. Around the perimeter,
+      several flange tabs with FOUR bolt holes stick out. Looks like
+      an engine throttle body."
+    size: "the only SILVER part type in the scene — every silver
+      object visible in the bin is a motor_valve"
+    distinguishing_features:
+      - "the ONLY SILVER part type — colour alone is enough to
+        identify it"
+      - "ONE LARGE round hole through the middle that you can see
+        STRAIGHT THROUGH (the throttle bore)"
+      - "thin horizontal shaft / butterfly plate visible inside the
+        bore"
+      - "BULKY 3D cast body — casts a clear shadow inside the bin"
+      - "rough cast-metal finish (not polished sheet metal)"
+    not_to_confuse_with:
+      - "all other parts in the bin are BLACK large_gears — if the
+        part is SILVER, it is ALWAYS a motor_valve"
+
+# ─── Labelling rules applied across all parts ────────────────────
+labelling_rules:
+  - "Use the EXACT label keys (large_gear, motor_valve). Do NOT
+    invent descriptive labels."
+  - "Step 1: SCAN the entire bin and COUNT every visible part. The
+    bin holds parts of TWO types — do not stop after finding only
+    one type. There can be 3+ of each type."
+  - "Step 2 — COLOUR alone is the disambiguator:
+      BLACK and round → large_gear (every black round part)
+      SILVER         → motor_valve (every silver part)"
+  - "If multiple parts of the same type, suffix _1, _2, _3
+    (e.g. large_gear_1, large_gear_2, large_gear_3,
+    motor_valve_1, motor_valve_2, motor_valve_3)."
+  - "If a part doesn't clearly match any entry above, label it
+    'unknown' rather than guessing."
+  - "Label the white kitting tray as 'kitting_tray' with affordance
+    'destination'."
