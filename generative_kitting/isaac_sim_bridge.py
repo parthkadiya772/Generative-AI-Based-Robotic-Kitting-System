@@ -20,10 +20,10 @@ API on port 8600 that the Streamlit dashboard consumes for:
   POST /api/pick          → full pick sequence at XYZ
   POST /api/place         → full place sequence at XYZ
 
-Usage in Isaac Sim Script Editor (replace <PROJECT_ROOT> with the
-path to your local clone, or run kitting_bridge_server.py which does
-this for you using its own __file__ location):
-  exec(open("<PROJECT_ROOT>/generative_kitting/isaac_sim_bridge.py").read())
+Usage in Isaac Sim Script Editor:
+  exec(open("/path/to/robot_in_air/generative_kitting/kitting_bridge_server.py").read())
+  # kitting_bridge_server.py auto-discovers KITTING_PROJECT_ROOT from your .env
+  # and then exec()s this file — do not run isaac_sim_bridge.py directly.
 """
 
 import sys, os, json, asyncio, threading, traceback, io, base64, time, tempfile
@@ -80,8 +80,8 @@ PLACE_BOX_PATH = "/World/box_840"
 # The collider with ``CollisionAPI`` lives one level deeper on the
 # actual ``Mesh`` prims. Both sensor paths below point INTO those
 # mesh prims so the sensor finds its CollisionAPI parent.
-CONTACT_SENSOR_PRIM     = "/World/gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/left_inner_finger/Finger4_01/Finger4/Contact_Sensor"
-CONTACT_SENSOR_TIP_PRIM = "/World/gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/left_inner_finger/Fingertip_01/Fingertip/Contact_Sensor"
+CONTACT_SENSOR_PRIM     = "/World/gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/left_inner_finger/Fingertip_01/Fingertip/Contact_Sensor"
+CONTACT_SENSOR_TIP_PRIM = CONTACT_SENSOR_PRIM
 
 # URDF / YAML for Lula IK. Resolved from the ISAACSIM_PATH env var so
 # the bridge runs on any operator's machine (Windows / Linux / Mac)
