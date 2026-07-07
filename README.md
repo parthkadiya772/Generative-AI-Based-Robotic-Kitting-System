@@ -32,10 +32,6 @@ Operator command
    scene JSON          task plan            joint motion
 ```
 
-Detailed breakdown in [`CLAUDE.md`](CLAUDE.md).
-
----
-
 ## Prerequisites
 
 | Component | Version / Notes |
