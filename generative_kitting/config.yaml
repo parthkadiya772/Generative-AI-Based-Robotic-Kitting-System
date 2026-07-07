@@ -61,7 +61,7 @@ simulation:
 perception:
   vlm_provider: "ollama_qwen"         # Active provider (overridden by UI model selection)
   vlm_model: "qwen2.5vl:7b"          # Active model  (overridden by UI model selection)
-  vlm_base_url: "http://10.7.0.35:11434"   # Active endpoint (overridden by UI model selection)
+  vlm_base_url: "${OLLAMA_BASE_URL}"         # Active endpoint (overridden by UI model selection)
   max_retries: 2
   temperature: 0.0                    # Low temperature for deterministic perception
   confidence_threshold: 0.5           # Reject objects below this confidence
@@ -77,20 +77,20 @@ perception:
     - name: "Gemma4 4B (VPN Remote)"
       provider: "ollama_gemma"
       model: "gemma4:e4b"
-      base_url: "http://10.7.0.35:11434"
+      base_url: "${OLLAMA_BASE_URL}"
 
     - name: "Gemma4 2B (VPN Remote)"
       provider: "ollama_gemma"
       model: "gemma4:e2b"
-      base_url: "http://10.7.0.35:11434"
+      base_url: "${OLLAMA_BASE_URL}"
 
     - name: "Qwen3-VL 30B (VPN Remote)"
       provider: "ollama_qwen"
       model: "qwen3-vl:30b"
-      base_url: "http://10.7.0.35:11434"
+      base_url: "${OLLAMA_BASE_URL}"
 
   # ── Zero-Shot Detector (precise bounding boxes — replaces VLM coord guesses) ──
-  # detector_url: "http://10.7.0.35:8700"  # uncomment to use remote server instead of local
+  # detector_url: "${DETECTOR_BASE_URL}"    # uncomment to use remote server instead of local
   detector_model: "owlv2"              # "owlv2" (lightweight) or "grounding_dino" (more accurate)
   detector_confidence: 0.15            # minimum detection confidence
   detector_device: "cpu"               # "cpu" or "cuda" (set to cuda if you have a local GPU)
@@ -356,7 +356,7 @@ orchestration:
     - name: "Llama 3.1 8B (VPN Remote)"
       provider: "ollama_llama"
       model: "llama3.1:8b"
-      base_url: "http://10.7.0.35:11434"
+      base_url: "${OLLAMA_BASE_URL}"
 
 # ─── Execution ───────────────────────────────────────────────
 execution:
