@@ -341,6 +341,7 @@ robot_in_air/
 If you use this repository or find the baseline configuration helpful for your research, please cite it as follows:
 
 **BibTeX:**
+[Download reference.bib](v1.0.1_metadata_reference.bib)
 ```bibtex
 @misc{parth2026thesis,
   author       = {Kadiya Parth},
