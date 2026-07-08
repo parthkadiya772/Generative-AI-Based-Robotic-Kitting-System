@@ -40,7 +40,13 @@ Operator command
 
 Gear grasping in Isaac Sim:
 
+<<<<<<< HEAD
 https://github.com/user-attachments/assets/ce842b65-8fff-49ce-ba43-e309332c6cd6
+=======
+<p align="center">
+  <video src="https://github.com/user-attachments/assets/ce842b65-8fff-49ce-ba43-e309332c6cd6" controls muted loop width="100%" height="auto" style="object-fit: contain;"></video>
+</p>
+>>>>>>> 8f132a9 (Video clip updated)
 
 ---
 
