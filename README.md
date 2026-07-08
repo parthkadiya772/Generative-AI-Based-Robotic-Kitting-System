@@ -17,7 +17,7 @@ combines:
 - **NVIDIA Isaac Sim** — UR10 arm with a Robotiq 2F-140 gripper on a
   gantry rail, controlled deterministically via a Lula IK solver.
 
-The LLM never drives the robot directly; it only emits validated
+The VLM never drives the robot directly; it only emits validated
 action primitives (`pick_object`, `place_object`, `move_home`, …).
 Execution is fully deterministic.
 
@@ -38,11 +38,9 @@ Operator command
 
 ## Demo
 
-Gear grasping in Isaac Sim (2× speed):
+Gear grasping in Isaac Sim:
 
-<p align="center">
-  <video src="resources/Gear_grasping_2x.mp4" controls muted loop width="100%"></video>
-</p>
+![Demo Video](resources/Gear_grasping_2x.mp4){type="video/mp4"}
 
 ---
 
