@@ -40,7 +40,9 @@ Operator command
 
 Gear grasping in Isaac Sim:
 
-![Demo Video](resources/Gear_grasping_2x.mp4){type="video/mp4"}
+<p align="center">
+<video src="https://github.com/parthkadiya772/Generative-AI-Based-Robotic-Kitting-System/blob/version-1.0.1/resources/Gear_grasping_2x.mp4" controls muted loop width=100%></video>
+</p>
 
 ---
 
