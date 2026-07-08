@@ -33,7 +33,7 @@ Operator command
 │  Perception   │ →  │ Orchestration  │ →  │   Execution    │
 │ (VLM + OWL)   │    │   (VLM/LLM)    │    │ (Isaac Sim)    │
 └───────────────┘    └────────────────┘    └────────────────┘
-   scene JSON          task plan            joint motion
+   scene JSON            task plan            joint motion
 ```
 
 ## Demo
