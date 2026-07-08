@@ -348,7 +348,7 @@ If you use this repository or find the baseline configuration helpful for your r
   year         = {2026},
   publisher    = {GitHub},
   journal      = {GitHub Repository},
-  howpublished = {\url{URL_TO_YOUR_PUBLIC_REPO}}
+  howpublished = {\url{https://github.com/parthkadiya772/Generative-AI-Based-Robotic-Kitting-System/tree/version-1.0.1}}
 }
 ```
 
