@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+authors:
+  - family-names: "Kadiya"
+    given-names: "Parth"
+title: "Generative AI-Based Robot Kitting"
+version: 1.0.1
+date-released: 2026-07-08
+url: "URL_TO_YOUR_PUBLIC_REPO"

@@ -336,7 +336,24 @@ robot_in_air/
 
 ---
 
-## License & citation
+## Citation
 
-This codebase accompanies the Master's thesis "Generative AI-based
-Robotic Kitting System" (P. Kadiya, 2026).
+If you use this repository or find the baseline configuration helpful for your research, please cite it as follows:
+
+**BibTeX:**
+```bibtex
+@misc{parth2026thesis,
+  author       = {Kadiya Parth},
+  title        = {Generative AI-Based Robot Kitting (Version 1.0.1)},
+  year         = {2026},
+  publisher    = {GitHub},
+  journal      = {GitHub Repository},
+  howpublished = {\url{URL_TO_YOUR_PUBLIC_REPO}}
+}
+```
+
+---
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
