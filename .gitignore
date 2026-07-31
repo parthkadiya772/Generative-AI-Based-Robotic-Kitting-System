@@ -33,4 +33,7 @@ diagnose_vlm_perception.py
 diagnose_qwen.py
 kitting_station.usd
 kitting_station_flattened.usd
-.gitignore
+resources/Gear_grasping.mp4
+resources/Gear_grasping.webm
+tests/
+calibration_memory.md

@@ -8,8 +8,8 @@ simulation:
   ur10_base_path: "/World/gantry_home/ur10_flattened/ur10_instanceable/base_link"
   ee_path: "/World/gantry_home/ur10_flattened/ur10_instanceable/ee_link"
   camera_prim_path: "/World/Camera"
-  depth_camera_prim_path: "/World/Realsense/RSD455/Camera_Pseudo_Depth"
-  imu_sensor_prim_path: "/World/Realsense/RSD455/Imu_Sensor"
+  depth_camera_prim_path: "/World/rsd555/Depth"
+  imu_sensor_prim_path: "/World/rsd555/Imu_Sensor"
   physics_dt: 0.01667          # 1/60
   rendering_dt: 0.01667        # 1/60
 
@@ -21,7 +21,10 @@ simulation:
   # any operator can run the project by pointing that env var at their
   # own Isaac Sim install (see .env.example).
   urdf_path: "${ISAACSIM_PATH}/exts/isaacsim.asset.importer.urdf/data/urdf/robots/ur10/urdf/ur10.urdf"
-  yaml_path: "${ISAACSIM_PATH}/exts/isaacsim.robot_motion.motion_generation/motion_policy_configs/universal_robots/ur10/rmpflow/ur10_robot_description.yaml"
+  # Isaac Sim 6.0 moved motion_generation into extsDeprecated/ (the URDF
+  # importer stayed in exts/). The bridge resolves this automatically; this
+  # path is used by the in-process robot_controller fallback.
+  yaml_path: "${ISAACSIM_PATH}/extsDeprecated/isaacsim.robot_motion.motion_generation/motion_policy_configs/universal_robots/ur10/rmpflow/ur10_robot_description.yaml"
 
   # Gripper finger prim paths (Robotiq 2F-140)
   gripper_finger_paths:
@@ -40,7 +43,7 @@ simulation:
   # come from these USD prims (no overhead VLM landmark detection).
   bin_prim_path:  "/World/robot_facade_full"
   tray_prim_path: "/World/box_840"
-  wrist_rgb_camera_prim_path: "/World/Realsense/RSD455/Camera_OmniVision_OV9782_Color"
+  wrist_rgb_camera_prim_path: "/World/rsd555/Camera_OmniVision_OV9782_Color"
 
   # Scan-pose marker prim REMOVED from the scene — the workflow now
   # derives the safe ee_link Z geometrically from
@@ -585,7 +588,7 @@ execution:
   #                        rim during placement.
   bin_scan_height:        0.60
   pick_align_height:      0.40
-  depth_analysis_height:  0.20
+  depth_analysis_height:  1.10   # D555 accurate range ~0.6-6 m (was 0.20 for RSD455)
   tray_safe_height:       0.25
 
   # Motion parameters

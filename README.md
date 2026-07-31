@@ -5,15 +5,16 @@ commands ("pick all motor valves") into safe robot motion. The system
 combines:
 
 - **Vision-Language Models (VLMs)** — Qwen2.5-VL / Qwen3-VL / Gemma4
-  for zero-shot scene understanding.
-- **Zero-shot object detectors** — OWL-ViT2 or Grounding DINO for
-  precise per-part bounding boxes.
-- **Large Language Models (LLMs)** — Gemma4 / Llama-class models for task
-  planning (constrained to a fixed action vocabulary).
-- **NVIDIA Isaac Sim** — UR10 arm with a Robotiq 2F-140 gripper on a
-  gantry rail, controlled deterministically via a Lula IK solver.
+  for zero-shot scene understanding. The VLM both identifies parts and
+  **self-grounds their bounding boxes** — there is no separate
+  object-detector stage.
+- **VLM-based task planning** — the same VLM family turns the scene plus
+  the operator command into a plan, constrained to a fixed action
+  vocabulary.
+- **NVIDIA Isaac Sim 6.0.1** — UR10 arm with a Robotiq 2F-140 gripper on
+  a gantry rail, controlled deterministically via a Lula IK solver.
 
-The LLM never drives the robot directly; it only emits validated
+The VLM never drives the robot directly; it only emits validated
 action primitives (`pick_object`, `place_object`, `move_home`, …).
 Execution is fully deterministic.
 
@@ -27,7 +28,7 @@ Operator command
        ▼
 ┌───────────────┐    ┌────────────────┐    ┌────────────────┐
 │  Perception   │ →  │ Orchestration  │ →  │   Execution    │
-│ (VLM + OWL)   │    │   (VLM/LLM)    │    │ (Isaac Sim)    │
+│    (VLM)      │    │     (VLM)      │    │ (Isaac Sim)    │
 └───────────────┘    └────────────────┘    └────────────────┘
    scene JSON          task plan            joint motion
 ```
@@ -37,7 +38,7 @@ Operator command
 | Component | Version / Notes |
 |---|---|
 | Python | 3.9 or newer (3.10+ recommended) |
-| NVIDIA Isaac Sim | 5.1.0 (only for simulator-attached runs) |
+| NVIDIA Isaac Sim | 6.0.1 (only for simulator-attached runs) |
 | Ollama | Any recent version (local or remote) |
 | OS | Windows / Linux (paths are resolved cross-platform) |
 | GPU | NVIDIA RTX 4070 or above with minimum 24GB VRAM |
@@ -79,10 +80,7 @@ Open `.env` and pick **one of the two options** for the model server:
 1. Install Ollama on your own machine: <https://ollama.com/download>
 2. Pull the models you want to use:
    ```bash
-   ollama pull gemma4:e4b          # VLM for perception
-   ollama pull llama3.1:8b         # LLM for planning
-   # Optional larger / alternative models:
-   # ollama pull qwen3-vl:8b
+   ollama pull gemma4:e2b          # VLM for both perception and planning
    ```
 3. Start the Ollama daemon (default port 11434):
    ```bash
@@ -157,7 +155,7 @@ want to do.
 
 ### A. Streamlit operator dashboard (most common)
 
-Live overhead + wrist camera, VLM / detector overlays, chat command
+Live overhead + wrist camera, VLM detection overlays, chat command
 interface, execution logs. Connects to Isaac Sim if the bridge is
 running; otherwise falls back to mock images.
 
@@ -280,12 +278,12 @@ robot_in_air/
 │   ├── main.py               # CLI / UI entry point
 │   ├── isaac_sim_bridge.py   # HTTP bridge run inside Isaac Sim
 │   ├── kitting_bridge_server.py   # one-line bridge launcher
+│   ├── isaac_compat.py       # Isaac Sim 6.0.1 experimental-core adapter
 │   ├── requirements.txt
-│   ├── perception/           # VLM + zero-shot detector + camera
-│   ├── orchestration/        # LLM planner + validators + workflow
+│   ├── perception/           # VLM perception + camera interface
+│   ├── orchestration/        # VLM planner + validators + workflow
 │   ├── execution/            # robot controller + motion + safety
 │   ├── knowledge/            # parts DB + catalogue
-│   ├── simulation/           # scene + spawn helpers
 │   ├── ui/streamlit_app.py   # operator dashboard
 │   ├── utils/config_loader.py  # env-aware YAML loader
 │   └── tests/                # pytest suite
@@ -296,11 +294,10 @@ robot_in_air/
 
 ## Security notes
 
-- The Isaac Sim bridge and the optional detector server bind to
-  loopback (`127.0.0.1`) by default. They expose endpoints that move
-  the physical / simulated robot and have **no authentication** —
-  only set `BRIDGE_HOST` / `--host` to `0.0.0.0` when you control the
-  network you're on.
+- The Isaac Sim bridge binds to loopback (`127.0.0.1`) by default. It
+  exposes endpoints that move the physical / simulated robot and has
+  **no authentication** — only set `BRIDGE_HOST` / `--host` to
+  `0.0.0.0` when you control the network you're on.
 - API keys, server IPs, and install paths are loaded from environment
   variables, not committed to the repo. `.env` is gitignored.
 - Don't commit `eval.db`, captured camera frames, or session logs —

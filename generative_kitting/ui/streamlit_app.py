@@ -1275,209 +1275,209 @@ with col_right:
 # ═════════════════════════════════════════════════════════════
 
 st.divider()
-st.markdown("## 📊 Quantitative Evaluation")
-st.caption(
-    "Per-event records persist to `logs/evaluation/eval.db` (SQLite) "
-    "and `logs/evaluation/session_<id>.jsonl`. Use the CSV exports "
-    "below to pull the tables that go in the thesis Results section."
-)
-
-evaluator = st.session_state.get("evaluator")
-if evaluator is None:
-    st.info("Evaluation recorder not initialised.")
-else:
-    eval_tab_summary, eval_tab_perception, eval_tab_pickplace, eval_tab_export = st.tabs(
-        ["📈 Headline Numbers", "🎯 Perception", "🦾 Pick / Place", "💾 Export"]
+with st.expander("📊 Quantitative Evaluation", expanded=False):
+    st.caption(
+        "Per-event records persist to `logs/evaluation/eval.db` (SQLite) "
+        "and `logs/evaluation/session_<id>.jsonl`. Use the CSV exports "
+        "below to pull the tables that go in the thesis Results section."
     )
 
-    summary = {}
-    try:
-        summary = evaluator.summary()
-    except Exception as exc:
-        st.warning(f"Cumulative summary unavailable: {exc}")
-
-    # ── Headline cumulative metrics ─────────────────────────
-    with eval_tab_summary:
-        if not summary or not any(v.get("n", v.get("n_scans", 0))
-                                  for v in summary.values()):
-            st.info(
-                "No evaluation events recorded yet. Run a kitting "
-                "task to populate the metrics."
-            )
-        else:
-            perc = summary.get("perception", {})
-            pick = summary.get("pick", {})
-            place = summary.get("place", {})
-            task = summary.get("task", {})
-
-            st.markdown("#### Perception (vs USD ground truth)")
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Scans", perc.get("n_scans", 0))
-            c2.metric("Precision", f"{perc.get('precision', 0):.2f}")
-            c3.metric("Recall", f"{perc.get('recall', 0):.2f}")
-            c4.metric("F1", f"{perc.get('f1', 0):.2f}")
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Label accuracy",
-                      f"{perc.get('label_accuracy', 0):.2f}")
-            c2.metric("Mean IoU",
-                      f"{perc.get('mean_iou', 0):.2f}")
-            c3.metric(
-                "Mean grounding error",
-                f"{perc.get('mean_grounding_error_mm', 0):.1f} mm")
-            c4.metric("Avg VLM latency",
-                      f"{perc.get('vlm_latency_s', 0):.2f} s")
-
-            st.markdown("#### Pick + Place")
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Pick attempts", pick.get("n", 0))
-            c2.metric(
-                "Pick success rate",
-                f"{pick.get('rate', 0)*100:.1f} %")
-            c3.metric("Avg pick cycle",
-                      f"{pick.get('avg_cycle_s', 0):.2f} s")
-            c4.metric(
-                "Avg drift |xy|",
-                f"{pick.get('avg_drift_xy_mm', 0):.1f} mm")
-
-            c1, c2, c3, c4 = st.columns(4)
-            n_place = place.get("n", 0)
-            n_verified = place.get("n_verified", 0)
-            place_label = (f"{n_place}"
-                           if n_verified == n_place
-                           else f"{n_place}  (verified: {n_verified})")
-            c1.metric("Place attempts", place_label)
-            c2.metric(
-                "Place success (Camera_Kit VLM)",
-                f"{place.get('rate_vlm', 0)*100:.1f} %"
-                if n_verified else "—")
-            c3.metric(
-                "Avg place VLM confidence",
-                f"{place.get('avg_vlm_confidence', 0):.2f}"
-                if n_verified else "—")
-            c4.metric("Avg place cycle",
-                      f"{place.get('avg_cycle_s', 0):.2f} s")
-
-            st.markdown("#### End-to-End Tasks")
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Total tasks", task.get("n", 0))
-            c2.metric(
-                "End-to-end success rate",
-                f"{task.get('rate', 0)*100:.1f} %")
-            c3.metric(
-                "Avg completion ratio",
-                f"{task.get('avg_completion_ratio', 0)*100:.1f} %")
-            c4.metric(
-                "Avg total time",
-                f"{task.get('avg_end_to_end_s', 0):.1f} s")
-
-    # ── Per-perception-event detail ─────────────────────────
-    with eval_tab_perception:
-        rows = evaluator.fetch_all("perception_events")
-        if not rows:
-            st.info("No perception events recorded yet.")
-        else:
-            # Strip the heavy detail_json column for the table view
-            view = [
-                {k: v for k, v in r.items() if k != "detail_json"}
-                for r in rows
-            ]
-            try:
-                import pandas as pd
-                df = pd.DataFrame(view)
-                st.dataframe(df, width="stretch", height=320)
-                # IoU + grounding error trend
-                if {"mean_iou", "mean_grounding_error_mm"} <= set(df.columns):
-                    chart_df = df[
-                        ["task_id", "mean_iou",
-                         "mean_grounding_error_mm",
-                         "precision_", "recall", "f1"]
-                    ].set_index("task_id")
-                    st.line_chart(chart_df)
-            except Exception:
-                st.write(view)
-
-    # ── Per-pick / per-place detail ─────────────────────────
-    with eval_tab_pickplace:
-        col_a, col_b = st.columns(2)
-        with col_a:
-            st.markdown("##### Pick events")
-            picks = evaluator.fetch_all("pick_events")
-            if picks:
-                try:
-                    import pandas as pd
-                    pdf = pd.DataFrame([
-                        {k: v for k, v in r.items()
-                         if k != "detail_json"} for r in picks])
-                    st.dataframe(pdf, width="stretch", height=260)
-                except Exception:
-                    st.write(picks[-10:])
-            else:
-                st.info("No pick events yet.")
-        with col_b:
-            st.markdown("##### Place events")
-            places = evaluator.fetch_all("place_events")
-            if places:
-                try:
-                    import pandas as pd
-                    plf = pd.DataFrame([
-                        {k: v for k, v in r.items()
-                         if k != "detail_json"} for r in places])
-                    st.dataframe(plf, width="stretch", height=260)
-                except Exception:
-                    st.write(places[-10:])
-            else:
-                st.info("No place events yet.")
-
-        st.markdown("##### Tasks")
-        tasks = evaluator.fetch_all("task_events")
-        if tasks:
-            try:
-                import pandas as pd
-                tdf = pd.DataFrame([
-                    {k: v for k, v in r.items()
-                     if k != "detail_json"} for r in tasks])
-                st.dataframe(tdf, width="stretch", height=200)
-            except Exception:
-                st.write(tasks[-10:])
-        else:
-            st.info("No task events yet.")
-
-    # ── CSV export ──────────────────────────────────────────
-    with eval_tab_export:
-        st.markdown(
-            "Download the full per-event tables as CSV. Each table "
-            "below maps to a column-set you can paste into the thesis "
-            "Results chapter."
+    evaluator = st.session_state.get("evaluator")
+    if evaluator is None:
+        st.info("Evaluation recorder not initialised.")
+    else:
+        eval_tab_summary, eval_tab_perception, eval_tab_pickplace, eval_tab_export = st.tabs(
+            ["📈 Headline Numbers", "🎯 Perception", "🦾 Pick / Place", "💾 Export"]
         )
-        export_dir = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "logs", "evaluation",
-        )
-        for table_name, friendly in (
-            ("perception_events", "Perception (per scan)"),
-            ("pick_events", "Pick events (per attempt)"),
-            ("place_events", "Place events (per attempt)"),
-            ("task_events", "Task events (per command)"),
-        ):
-            rows = evaluator.fetch_all(table_name)
+
+        summary = {}
+        try:
+            summary = evaluator.summary()
+        except Exception as exc:
+            st.warning(f"Cumulative summary unavailable: {exc}")
+
+        # ── Headline cumulative metrics ─────────────────────────
+        with eval_tab_summary:
+            if not summary or not any(v.get("n", v.get("n_scans", 0))
+                                      for v in summary.values()):
+                st.info(
+                    "No evaluation events recorded yet. Run a kitting "
+                    "task to populate the metrics."
+                )
+            else:
+                perc = summary.get("perception", {})
+                pick = summary.get("pick", {})
+                place = summary.get("place", {})
+                task = summary.get("task", {})
+
+                st.markdown("#### Perception (vs USD ground truth)")
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Scans", perc.get("n_scans", 0))
+                c2.metric("Precision", f"{perc.get('precision', 0):.2f}")
+                c3.metric("Recall", f"{perc.get('recall', 0):.2f}")
+                c4.metric("F1", f"{perc.get('f1', 0):.2f}")
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Label accuracy",
+                          f"{perc.get('label_accuracy', 0):.2f}")
+                c2.metric("Mean IoU",
+                          f"{perc.get('mean_iou', 0):.2f}")
+                c3.metric(
+                    "Mean grounding error",
+                    f"{perc.get('mean_grounding_error_mm', 0):.1f} mm")
+                c4.metric("Avg VLM latency",
+                          f"{perc.get('vlm_latency_s', 0):.2f} s")
+
+                st.markdown("#### Pick + Place")
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Pick attempts", pick.get("n", 0))
+                c2.metric(
+                    "Pick success rate",
+                    f"{pick.get('rate', 0)*100:.1f} %")
+                c3.metric("Avg pick cycle",
+                          f"{pick.get('avg_cycle_s', 0):.2f} s")
+                c4.metric(
+                    "Avg drift |xy|",
+                    f"{pick.get('avg_drift_xy_mm', 0):.1f} mm")
+
+                c1, c2, c3, c4 = st.columns(4)
+                n_place = place.get("n", 0)
+                n_verified = place.get("n_verified", 0)
+                place_label = (f"{n_place}"
+                               if n_verified == n_place
+                               else f"{n_place}  (verified: {n_verified})")
+                c1.metric("Place attempts", place_label)
+                c2.metric(
+                    "Place success (Camera_Kit VLM)",
+                    f"{place.get('rate_vlm', 0)*100:.1f} %"
+                    if n_verified else "—")
+                c3.metric(
+                    "Avg place VLM confidence",
+                    f"{place.get('avg_vlm_confidence', 0):.2f}"
+                    if n_verified else "—")
+                c4.metric("Avg place cycle",
+                          f"{place.get('avg_cycle_s', 0):.2f} s")
+
+                st.markdown("#### End-to-End Tasks")
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Total tasks", task.get("n", 0))
+                c2.metric(
+                    "End-to-end success rate",
+                    f"{task.get('rate', 0)*100:.1f} %")
+                c3.metric(
+                    "Avg completion ratio",
+                    f"{task.get('avg_completion_ratio', 0)*100:.1f} %")
+                c4.metric(
+                    "Avg total time",
+                    f"{task.get('avg_end_to_end_s', 0):.1f} s")
+
+        # ── Per-perception-event detail ─────────────────────────
+        with eval_tab_perception:
+            rows = evaluator.fetch_all("perception_events")
             if not rows:
-                st.caption(f"_{friendly} — no rows yet_")
-                continue
-            out_path = os.path.join(
-                export_dir, f"{table_name}.csv")
-            evaluator.export_csv(table_name, out_path)
-            try:
-                with open(out_path, "rb") as f:
-                    st.download_button(
-                        label=f"⬇ {friendly}  ({len(rows)} rows)",
-                        data=f.read(),
-                        file_name=f"{table_name}.csv",
-                        mime="text/csv",
-                        key=f"dl_{table_name}",
-                    )
-            except Exception as exc:
-                st.warning(
-                    f"Could not prepare {table_name} CSV: {exc}")
+                st.info("No perception events recorded yet.")
+            else:
+                # Strip the heavy detail_json column for the table view
+                view = [
+                    {k: v for k, v in r.items() if k != "detail_json"}
+                    for r in rows
+                ]
+                try:
+                    import pandas as pd
+                    df = pd.DataFrame(view)
+                    st.dataframe(df, width="stretch", height=320)
+                    # IoU + grounding error trend
+                    if {"mean_iou", "mean_grounding_error_mm"} <= set(df.columns):
+                        chart_df = df[
+                            ["task_id", "mean_iou",
+                             "mean_grounding_error_mm",
+                             "precision_", "recall", "f1"]
+                        ].set_index("task_id")
+                        st.line_chart(chart_df)
+                except Exception:
+                    st.write(view)
+
+        # ── Per-pick / per-place detail ─────────────────────────
+        with eval_tab_pickplace:
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.markdown("##### Pick events")
+                picks = evaluator.fetch_all("pick_events")
+                if picks:
+                    try:
+                        import pandas as pd
+                        pdf = pd.DataFrame([
+                            {k: v for k, v in r.items()
+                             if k != "detail_json"} for r in picks])
+                        st.dataframe(pdf, width="stretch", height=260)
+                    except Exception:
+                        st.write(picks[-10:])
+                else:
+                    st.info("No pick events yet.")
+            with col_b:
+                st.markdown("##### Place events")
+                places = evaluator.fetch_all("place_events")
+                if places:
+                    try:
+                        import pandas as pd
+                        plf = pd.DataFrame([
+                            {k: v for k, v in r.items()
+                             if k != "detail_json"} for r in places])
+                        st.dataframe(plf, width="stretch", height=260)
+                    except Exception:
+                        st.write(places[-10:])
+                else:
+                    st.info("No place events yet.")
+
+            st.markdown("##### Tasks")
+            tasks = evaluator.fetch_all("task_events")
+            if tasks:
+                try:
+                    import pandas as pd
+                    tdf = pd.DataFrame([
+                        {k: v for k, v in r.items()
+                         if k != "detail_json"} for r in tasks])
+                    st.dataframe(tdf, width="stretch", height=200)
+                except Exception:
+                    st.write(tasks[-10:])
+            else:
+                st.info("No task events yet.")
+
+        # ── CSV export ──────────────────────────────────────────
+        with eval_tab_export:
+            st.markdown(
+                "Download the full per-event tables as CSV. Each table "
+                "below maps to a column-set you can paste into the thesis "
+                "Results chapter."
+            )
+            export_dir = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "logs", "evaluation",
+            )
+            for table_name, friendly in (
+                ("perception_events", "Perception (per scan)"),
+                ("pick_events", "Pick events (per attempt)"),
+                ("place_events", "Place events (per attempt)"),
+                ("task_events", "Task events (per command)"),
+            ):
+                rows = evaluator.fetch_all(table_name)
+                if not rows:
+                    st.caption(f"_{friendly} — no rows yet_")
+                    continue
+                out_path = os.path.join(
+                    export_dir, f"{table_name}.csv")
+                evaluator.export_csv(table_name, out_path)
+                try:
+                    with open(out_path, "rb") as f:
+                        st.download_button(
+                            label=f"⬇ {friendly}  ({len(rows)} rows)",
+                            data=f.read(),
+                            file_name=f"{table_name}.csv",
+                            mime="text/csv",
+                            key=f"dl_{table_name}",
+                        )
+                except Exception as exc:
+                    st.warning(
+                        f"Could not prepare {table_name} CSV: {exc}")
 
 
 # ═════════════════════════════════════════════════════════════

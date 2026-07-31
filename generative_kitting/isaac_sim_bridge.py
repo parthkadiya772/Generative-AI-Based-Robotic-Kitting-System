@@ -44,13 +44,13 @@ ROBOT_PRIM  = "/World"
 
 # Dual cameras
 CAMERA_RGB_PRIM   = "/World/Camera"
-CAMERA_DEPTH_PRIM = "/World/Realsense/RSD455/Camera_Pseudo_Depth"
-CAMERA_WRIST_PRIM = "/World/Realsense/RSD455/Camera_OmniVision_OV9782_Color"
+CAMERA_DEPTH_PRIM = "/World/rsd555/Depth"
+CAMERA_WRIST_PRIM = "/World/rsd555/Camera_OmniVision_OV9782_Color"
 # Tray-overlook camera — used after place to verify the part actually
 # landed in the kitting tray. Independent of the robot pose so the VLM
 # always gets a clean top-down view of the destination.
 CAMERA_KIT_PRIM   = "/World/Camera_Kit"
-IMU_PRIM          = "/World/Realsense/RSD455/Imu_Sensor"
+IMU_PRIM          = "/World/rsd555/Imu_Sensor"
 
 # Robot geometry
 UR10_BASE_PATH = "/World/gantry_home/ur10_flattened/ur10_instanceable/base_link"
@@ -89,11 +89,24 @@ CONTACT_SENSOR_TIP_PRIM = CONTACT_SENSOR_PRIM
 # Isaac Sim install (the directory containing `exts/`). os.path.join
 # keeps the separator OS-correct.
 _ISAACSIM_PATH = os.environ.get("ISAACSIM_PATH", "")
+
+
+def _resolve_ext_dir(ext_name):
+    """Return the ext directory for ``ext_name``, checking both ``exts``
+    and ``extsDeprecated``. Isaac Sim 6.0 moved several bundled exts (e.g.
+    ``isaacsim.robot_motion.motion_generation``) into ``extsDeprecated``."""
+    for _sub in ("exts", "extsDeprecated"):
+        _cand = os.path.join(_ISAACSIM_PATH, _sub, ext_name)
+        if os.path.isdir(_cand):
+            return _cand
+    return os.path.join(_ISAACSIM_PATH, "exts", ext_name)
+
+
 URDF_PATH = os.path.join(
-    _ISAACSIM_PATH, "exts", "isaacsim.asset.importer.urdf",
+    _resolve_ext_dir("isaacsim.asset.importer.urdf"),
     "data", "urdf", "robots", "ur10", "urdf", "ur10.urdf")
 YAML_PATH = os.path.join(
-    _ISAACSIM_PATH, "exts", "isaacsim.robot_motion.motion_generation",
+    _resolve_ext_dir("isaacsim.robot_motion.motion_generation"),
     "motion_policy_configs", "universal_robots", "ur10", "rmpflow",
     "ur10_robot_description.yaml")
 
@@ -766,7 +779,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
 async def _capture_camera(cam_type="rgb"):
     try:
-        from omni.isaac.sensor import Camera
+        from isaacsim.sensors.camera import Camera
         import omni.kit.app
 
         if cam_type == "depth":
@@ -912,7 +925,7 @@ async def _project_to_world(params):
         {status, world_points: [{x, y, z, depth_m, method}, ...]}
     """
     import omni.kit.app, omni.usd
-    from omni.isaac.sensor import Camera
+    from isaacsim.sensors.camera import Camera
     from pxr import UsdGeom, Gf
     import math
 
@@ -1447,7 +1460,7 @@ async def _get_scene_annotations(camera="rgb"):
     """
     import omni.usd
     from pxr import Gf
-    from omni.isaac.sensor import Camera
+    from isaacsim.sensors.camera import Camera
     import omni.kit.app
 
     # Map camera alias → prim path + resolution (mirror _capture_camera)
@@ -3667,7 +3680,7 @@ async def start_bridge():
 
     # ── Lula IK Solver ───────────────────────────────────────
     try:
-        from omni.isaac.motion_generation import LulaKinematicsSolver
+        from isaacsim.robot_motion.motion_generation import LulaKinematicsSolver
 
         fixed_urdf, fixed_yaml = patch_urdf_and_yaml()
         print(f"[OK] URDF patched: {fixed_urdf}")
@@ -3726,20 +3739,22 @@ async def start_bridge():
     # bridge works across both. The ``Camera`` class in this file
     # already uses the legacy ``omni.isaac.sensor`` path successfully,
     # which tells us the legacy namespace is available on this build.
+    # Isaac Sim 6.0.1: ContactSensor lives in ``isaacsim.sensors.physics``.
+    # Older names (``isaacsim.sensors.contact_sensor`` on 4.5-5.x,
+    # ``omni.isaac.sensor`` on <=4.4) are kept as fallbacks for older installs.
     ContactSensor = None
-    try:
-        from isaacsim.sensors.contact_sensor import (
-            ContactSensor as _CS_NEW)
-        ContactSensor = _CS_NEW
-        _cs_namespace = "isaacsim.sensors.contact_sensor"
-    except ImportError:
+    _cs_namespace = None
+    for _cs_mod in ("isaacsim.sensors.physics",
+                    "isaacsim.sensors.contact_sensor",
+                    "omni.isaac.sensor"):
         try:
-            from omni.isaac.sensor import (
-                ContactSensor as _CS_OLD)
-            ContactSensor = _CS_OLD
-            _cs_namespace = "omni.isaac.sensor"
-        except ImportError:
-            _cs_namespace = None
+            import importlib as _importlib
+            ContactSensor = getattr(
+                _importlib.import_module(_cs_mod), "ContactSensor")
+            _cs_namespace = _cs_mod
+            break
+        except (ImportError, AttributeError):
+            continue
 
     if ContactSensor is None:
         STATE.contact_sensor = None

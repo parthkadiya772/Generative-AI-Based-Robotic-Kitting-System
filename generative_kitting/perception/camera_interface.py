@@ -40,7 +40,7 @@ class CameraInterface:
         self._camera = None
 
         try:
-            from omni.isaac.sensor import Camera
+            from isaacsim.sensors.camera import Camera
             self._camera = Camera(
                 prim_path=camera_prim_path,
                 resolution=resolution,

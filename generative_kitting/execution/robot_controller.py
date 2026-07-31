@@ -300,7 +300,7 @@ class RobotController:
         from isaacsim.core.prims import SingleArticulation
         from isaacsim.core.utils.prims import get_prim_at_path
         from isaacsim.core.utils.types import ArticulationAction
-        from omni.isaac.motion_generation import LulaKinematicsSolver
+        from isaacsim.robot_motion.motion_generation import LulaKinematicsSolver
 
         # World
         if self.world is None:

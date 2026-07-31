@@ -10,7 +10,7 @@ from isaacsim.core.api import World
 from isaacsim.core.prims import SingleArticulation
 from isaacsim.core.utils.prims import get_prim_at_path, is_prim_path_valid
 from isaacsim.core.utils.types import ArticulationAction
-from omni.isaac.motion_generation import LulaKinematicsSolver
+from isaacsim.robot_motion.motion_generation import LulaKinematicsSolver
 
 # ========================================================
 # CONFIGURATION
@@ -41,7 +41,7 @@ BROKEN_URDF = os.path.join(
     _ISAACSIM_PATH, "exts", "isaacsim.asset.importer.urdf",
     "data", "urdf", "robots", "ur10", "urdf", "ur10.urdf")
 BROKEN_YAML = os.path.join(
-    _ISAACSIM_PATH, "exts", "isaacsim.robot_motion.motion_generation",
+    _ISAACSIM_PATH, "extsDeprecated", "isaacsim.robot_motion.motion_generation",
     "motion_policy_configs", "universal_robots", "ur10", "rmpflow",
     "ur10_robot_description.yaml")
 
