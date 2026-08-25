@@ -1,4 +1,4 @@
-meshes/
+raw_meshes/
 New folder/
 transforms/
 transforms_simple/
@@ -37,3 +37,5 @@ resources/Gear_grasping.mp4
 resources/Gear_grasping.webm
 tests/
 calibration_memory.md
+diagnose_camera_calibration.py
+diagnose_projection_bias.py

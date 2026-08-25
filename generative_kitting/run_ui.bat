@@ -8,8 +8,11 @@ set "VENV_DIR=%PROJECT_DIR%.aikido"
 set "REQUIREMENTS=%PROJECT_DIR%requirements.txt"
 set "STREAMLIT_APP=%PROJECT_DIR%ui\streamlit_app.py"
 
-REM -- Step 1: Check virtual environment -----------------------
-if not exist "%VENV_DIR%\Scripts\activate.bat" goto :novenv
+REM -- Step 1: Check / Create virtual environment -----------------------
+if not exist "%VENV_DIR%\Scripts\activate.bat" (
+    echo [INFO] Virtual environment not found. Creating it now...
+    call python -m venv "%VENV_DIR%"
+)
 
 echo [1/3] Activating virtual environment...
 call "%VENV_DIR%\Scripts\activate.bat"
@@ -30,9 +33,3 @@ echo.
 echo Streamlit exited.
 pause
 goto :eof
-
-:novenv
-echo [ERROR] Virtual environment not found at %VENV_DIR%
-echo Run:  python -m venv "%VENV_DIR%"
-pause
-exit /b 1

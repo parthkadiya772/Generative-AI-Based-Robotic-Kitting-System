@@ -24,9 +24,9 @@ VLM_MODEL = "qwen2.5vl:32b"
 LLM_MODEL = "llama3.1:8b"
 
 # Robot prim paths (from your AIKIDO.usd)
-ROBOT_PRIM = "/World"
-UR10_BASE = "/World/gantry_home/ur10_flattened/ur10_instanceable/base_link"
-EE_LINK   = "/World/gantry_home/ur10_flattened/ur10_instanceable/ee_link"
+ROBOT_PRIM = "/World/gantry"
+UR10_BASE = "/World/gantry/gantry_home/ur10_flattened/ur10_instanceable/base_link"
+EE_LINK   = "/World/gantry/gantry_home/ur10_flattened/ur10_instanceable/ee_link"
 CAMERA    = "/World/Camera"
 
 # Home joint positions (from robot_control.py)

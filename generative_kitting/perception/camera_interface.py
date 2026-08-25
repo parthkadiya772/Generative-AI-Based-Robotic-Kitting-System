@@ -253,22 +253,12 @@ class BridgeCameraInterface:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 data = json.loads(resp.read().decode())
 
-            # If bridge returned "Unknown endpoint" (old bridge without query parsing)
-            # fallback to plain /api/camera
-            if "error" in data and "Unknown endpoint" in data.get("error", ""):
-                log.debug(f"Retrying without query param: {data['error']}")
-                url = f"{self.bridge_url}/api/camera"
-                req = urllib.request.Request(url, method="GET")
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    data = json.loads(resp.read().decode())
-
             if "error" in data:
-                log.warning(f"Bridge camera error: {data['error']}")
-                return self._placeholder_image()
+                raise RuntimeError(f"bridge camera error: {data['error']}")
 
             b64 = data.get("image_base64", "")
             if not b64:
-                return self._placeholder_image()
+                raise RuntimeError("bridge returned no image data")
 
             img_bytes = base64.b64decode(b64)
             image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
@@ -277,9 +267,12 @@ class BridgeCameraInterface:
             return image
 
         except Exception as e:
+            # No placeholder fallback: a synthetic frame sent through the
+            # VLM yields hallucinated parts and bogus projections, which
+            # is far harder to diagnose than an outright failure.
             self._connected = False
-            log.warning(f"Bridge camera fetch failed: {e}")
-            return self._placeholder_image()
+            raise RuntimeError(
+                f"{cam_type} camera capture failed: {e}") from e
 
     def capture_depth_image(self) -> Image.Image:
         """Fetch a depth camera frame from the arm-mounted RealSense."""
@@ -298,50 +291,77 @@ class BridgeCameraInterface:
         """
         return self.capture_workspace_image(cam_type="kit")
 
+    def build_collision_world(self, exclude_points: list = None,
+                              carve_radius: float = None,
+                              voxel_size: float = None) -> dict:
+        """Rebuild the cuMotion collision world from the 4 corner cameras.
+
+        Parameters
+        ----------
+        exclude_points : list of [x, y, z]
+            World coords of parts to be picked. An XY cylinder is cleared
+            around each so the target never becomes its own obstacle —
+            without this a grasp pose cannot be planned.
+        carve_radius : float
+            Cylinder radius in metres (bridge default 0.06).
+        voxel_size : float
+            Downsample grid in metres (bridge default 0.02).
+
+        Call once per scan cycle, AFTER perception, before planning.
+        """
+        payload = {}
+        if exclude_points:
+            payload["exclude_points"] = [list(p) for p in exclude_points]
+        if carve_radius:
+            payload["carve_radius"] = float(carve_radius)
+        if voxel_size:
+            payload["voxel_size"] = float(voxel_size)
+        return self.send_command("/api/build_collision_world", payload,
+                                 timeout=180)
+
+    def add_wrist_obstacles(self, grasp_xy: list,
+                            carve_radius: float = 0.06) -> dict:
+        """Add neighbour-part obstacles seen by the wrist camera.
+
+        Call at standoff height, before the final descent. A cylinder of
+        ``carve_radius`` around ``grasp_xy`` is excluded so the target
+        part itself never becomes an obstacle.
+        """
+        return self.send_command(
+            "/api/wrist_obstacles",
+            {"grasp_xy": list(grasp_xy), "carve_radius": float(carve_radius)},
+            timeout=60)
+
     def project_to_world(self, points: list, camera: str = "rgb",
-                         method: str = None,
-                         image_x_sign: int = 1,
-                         image_y_sign: int = 1) -> dict:
+                         fresh_depth: bool = False) -> dict:
         """Project normalised image coordinates to world XYZ via depth.
+
+        Uses the depth buffer captured alongside the last RGB frame from
+        this camera, so the geometry matches the image that was analysed.
 
         Parameters
         ----------
         points : list of dict
             Each dict has ``x`` and ``y`` in [0, 1] (normalised image coords).
         camera : str
-            Camera alias: "rgb", "depth", or "wrist".
-        method : str, optional
-            Force projection method: "geometric" skips the depth buffer
-            and uses ray-plane intersection (useful for overhead landmark
-            detection where depth buffer hits bin walls instead of floor).
-        image_x_sign, image_y_sign : int
-            Sign overrides for the image axes — set to ``-1`` to mirror
-            an axis when the camera was placed in USD with a non-standard
-            rotation. Default is +1 (OpenGL convention).
+            Camera alias: "rgb", "depth", "wrist", or "kit".
+        fresh_depth : bool
+            Re-render instead of using the cached frame.
 
         Returns
         -------
         dict
-            ``world_points`` list with ``x``, ``y``, ``z``, ``depth_m`` per point.
+            ``world_points`` list with ``x``, ``y``, ``z``, ``depth_m`` per
+            point, or ``error`` when no usable depth exists.
         """
-        payload = {"points": points, "camera": camera,
-                   "image_x_sign": int(image_x_sign),
-                   "image_y_sign": int(image_y_sign)}
-        if method:
-            payload["method"] = method
+        payload = {"points": points, "camera": camera}
+        if fresh_depth:
+            payload["fresh_depth"] = True
         return self.send_command(
             "/api/project_to_world",
             payload,
             timeout=15,
         )
-
-    def _placeholder_image(self) -> Image.Image:
-        """Generate a placeholder when the bridge is unreachable."""
-        arr = np.zeros((480, 640, 3), dtype=np.uint8)
-        arr[:, :, 0] = np.linspace(30, 70, 480)[:, None]
-        arr[:, :, 1] = np.linspace(30, 50, 640)[None, :]
-        arr[:, :, 2] = 40
-        return Image.fromarray(arr)
 
     def capture_and_save(
         self,

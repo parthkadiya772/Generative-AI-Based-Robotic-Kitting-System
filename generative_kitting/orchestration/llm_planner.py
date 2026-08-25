@@ -199,15 +199,40 @@ class LLMPlanner:
         """
         if self.provider == "openai":
             return self._call_openai(user_prompt)
+        if self.provider == "vllm":
+            return self._call_vllm(user_prompt)
         if self.provider.startswith("ollama"):
             return self._call_ollama(user_prompt)
         raise ValueError(f"Unknown LLM provider: {self.provider}")
 
     def _call_openai(self, user_prompt: str) -> str:
-        """Send prompt to OpenAI GPT-4o API."""
+        """Send prompt to OpenAI's hosted API."""
+        return self._call_openai_compatible(user_prompt)
+
+    def _call_vllm(self, user_prompt: str) -> str:
+        """Send prompt to a self-hosted vLLM server.
+
+        vLLM serves the OpenAI chat-completions schema, so only the base
+        URL and the placeholder key differ (vLLM ignores the key unless
+        started with ``--api-key``).
+        """
+        return self._call_openai_compatible(
+            user_prompt,
+            base_url=self.base_url.rstrip("/"),
+            api_key=self.api_key or "EMPTY",
+        )
+
+    def _call_openai_compatible(self, user_prompt: str,
+                                base_url: str = None,
+                                api_key: str = None) -> str:
+        """Chat-completions call. ``base_url=None`` targets api.openai.com.
+
+        JSON mode is requested for the same reason the Ollama path sets
+        ``format="json"``: smaller models wrap plans in prose otherwise.
+        """
         from openai import OpenAI
 
-        client = OpenAI(api_key=self.api_key)
+        client = OpenAI(api_key=api_key or self.api_key, base_url=base_url)
 
         response = client.chat.completions.create(
             model=self.model,
@@ -217,8 +242,9 @@ class LLMPlanner:
             ],
             temperature=self.temperature,
             max_tokens=self.max_tokens,
+            response_format={"type": "json_object"},
         )
-        return response.choices[0].message.content
+        return response.choices[0].message.content or ""
 
     def _call_ollama(self, user_prompt: str) -> str:
         """Send the prompt to an Ollama-served model.

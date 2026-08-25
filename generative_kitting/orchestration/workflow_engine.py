@@ -5,7 +5,7 @@ Orchestrates the full AI-driven pick-and-place pipeline:
   0.   Overhead RGB + VLM → locate bin + kitting tray (landmarks + bbox)
   1.   Bridge depth projection → bin/tray world coordinates
   2.   Crop bin region from overhead image → VLM zoom analysis →
-       identify parts in the cropped, higher-detail view
+       identify parts in the captured frame
        Convert crop-local coords → full-image coords →
        Bridge depth projection → part world coordinates
   3.   LLM generates plan using real-world coordinates
@@ -35,9 +35,7 @@ from knowledge.parts_catalogue import (
     detector_query_list,
     format_catalogue_for_prompt,
 )
-from perception.depth_estimator import DepthEstimator
 from perception.object_detector import ZeroShotDetector
-from perception.vlm_perception import qwen_target_size
 from utils.logger import log
 
 
@@ -144,7 +142,7 @@ RESPOND ONLY WITH VALID JSON:
   "scene_summary": "..."
 }"""
 
-# ─── Bin zoom prompt — applied to the cropped bin region ───
+# ─── Scene grounding prompt ───
 BIN_ZOOM_PROMPT = """You are a robotic vision system. This image is a CROPPED close-up of
 ONLY the blue parts bin from an overhead industrial workspace view.
 The bin (and the parts inside it) fills most or all of the frame.
@@ -392,6 +390,7 @@ Set path_clear to false if obstacles block the descent path.
 collision_risk: "none", "low", "medium", or "high"."""
 
 
+
 class WorkflowPhase:
     """Represents a single phase in the kitting workflow."""
     BIN_LOOKUP      = "bin_lookup"      # USD lookup of bin + tray centres
@@ -433,11 +432,7 @@ class KittingWorkflowEngine:
         self._cancelled = False
         self._bin_top_z = None  # set by Phase 0-1 landmark detection
         self._bin_bot_z = None
-        self._bin_aabb_xy = None  # (xmin, ymin, xmax, ymax) — for USD-snap bounds filter
         self._tray_position = None  # set by Phase 0 USD lookup
-        self._depth_estimator = DepthEstimator(
-            self.config.get("perception", {})
-        )
         self._detector = ZeroShotDetector(
             self.config.get("perception", {})
         )
@@ -526,20 +521,6 @@ class KittingWorkflowEngine:
             bin_bot_z  = float(bin_info["bot_z"])
             self._bin_top_z = bin_top_z
             self._bin_bot_z = bin_bot_z
-            # Cache the bin's XY footprint for the USD-snap bounds
-            # filter (rejects USD prims that have fallen outside the
-            # bin so the gripper isn't sent to a far-away match).
-            try:
-                _bin_min = bin_info.get("min_pt") or []
-                _bin_max = bin_info.get("max_pt") or []
-                if len(_bin_min) >= 2 and len(_bin_max) >= 2:
-                    self._bin_aabb_xy = (
-                        float(_bin_min[0]), float(_bin_min[1]),
-                        float(_bin_max[0]), float(_bin_max[1]))
-                else:
-                    self._bin_aabb_xy = None
-            except (TypeError, ValueError):
-                self._bin_aabb_xy = None
             # ``pivot`` is the prim's transform translation (xformOp:translate)
             # — the AUTHORITATIVE position the prim was placed at in USD.
             # ``center_xy`` is the bbox geometric centre, which can drift
@@ -606,14 +587,6 @@ class KittingWorkflowEngine:
             log.info(
                 f"[Phase 1] Overhead capture: "
                 f"{overhead_image.size[0]}x{overhead_image.size[1]} px")
-            # The placeholder image (bridge unreachable) is 640x480
-            # with a near-black gradient. Detect + bail rather than
-            # send phantom data through the VLM + planner.
-            if self._looks_like_placeholder(overhead_image):
-                raise RuntimeError(
-                    "Overhead capture returned the placeholder image "
-                    "(640x480, near-black). The Isaac Sim bridge is "
-                    "unreachable — check it's running on port 8600.")
             result["phases"].append({
                 "phase": WorkflowPhase.SCENE_SCAN,
                 "status": "success",
@@ -623,8 +596,6 @@ class KittingWorkflowEngine:
             })
             self._notify(WorkflowPhase.SCENE_SCAN, "success",
                          "Overhead frame captured")
-
-            bin_crop_box = (0.0, 0.0, 1.0, 1.0)
 
             if self._cancelled:
                 return self._finalize(result, "cancelled")
@@ -655,9 +626,8 @@ class KittingWorkflowEngine:
                         f"{target_parts}")
 
                 # Use the full overhead frame directly.
-                scene, coord_source = self._detect_parts_from_bin_crop(
+                scene, coord_source = self._detect_parts(
                     current_overhead,
-                    bin_crop_box=bin_crop_box,
                     target_parts=target_parts,
                     bin_top_z=bin_top_z,
                     camera_alias="rgb")
@@ -791,6 +761,34 @@ class KittingWorkflowEngine:
                             continue
                         return self._finalize(result, "error", msg)
 
+                # ── Collision world for cuMotion ────────────────
+                # Built AFTER perception so the detected part positions
+                # can be carved out of the cloud. Without that carve a
+                # grasp pose sits inside an obstacle and cannot plan.
+                # Rebuilt once per scan — the scene is static while we
+                # plan, and 4 render products plus a merge is not cheap.
+                if hasattr(self.camera, "build_collision_world"):
+                    try:
+                        part_xyz = [
+                            [p["x"], p["y"], p["z"]]
+                            for o in scene.get("detected_objects", [])
+                            for p in [o.get("approximate_position") or {}]
+                            if {"x", "y", "z"} <= set(p)
+                        ]
+                        cw = self.camera.build_collision_world(
+                            exclude_points=part_xyz)
+                        if cw.get("status") == "ok":
+                            log.info(
+                                f"[Collision] {cw['spheres']} spheres from "
+                                f"{cw['raw_points']} points; carved "
+                                f"{cw['carved']} around {cw['targets']} part(s)")
+                        else:
+                            log.warning(
+                                f"[Collision] build failed: {cw.get('error')} "
+                                f"— planning without scene obstacles")
+                    except Exception as exc:
+                        log.warning(f"[Collision] build failed: {exc}")
+
                 num_reachable = len(scene.get("detected_objects", []))
                 result["scene_description"] = scene
                 result["phases"].append({
@@ -807,36 +805,14 @@ class KittingWorkflowEngine:
                              f"{num_reachable} parts from bin crop{tag}")
 
                 # ── Evaluation hook: perception metrics ─────────
-                # Only run on the first attempt — retries re-use the
-                # same scene for matching purposes and would just
-                # double-count.
-                # IMPORTANT: log metrics BEFORE the USD ground-truth
-                # snap below, so the recorded perception accuracy
-                # reflects the raw VLM+detector pipeline, not the
-                # snap-corrected coordinates.
+                # USD ground truth is read here ONLY to measure error.
+                # It never feeds grasp coordinates.
                 if self.recorder and attempt == 0:
                     try:
                         self._log_perception_metrics(scene)
                     except Exception as exc:
                         log.warning(
                             f"[eval] perception metrics failed: {exc}")
-
-                # ── USD ground-truth snap for grasp targets ─────
-                # Replace each perception XY with the matching USD
-                # prim's centre when within snap radius. Perception
-                # imprecision (~1-3 cm at this overhead camera
-                # distance) was misaligning the gripper before
-                # realignment even started; the snap removes that
-                # error for sim-only demos. Disable for real-robot
-                # runs by setting execution.use_usd_grasp_targets
-                # false in config.yaml.
-                if exec_cfg.get("use_usd_grasp_targets", True):
-                    try:
-                        self._snap_to_usd_ground_truth(scene)
-                    except Exception as exc:
-                        log.warning(
-                            f"[USD-snap] failed: {exc} — keeping "
-                            f"raw perception coords")
 
                 if self._cancelled:
                     return self._finalize(result, "cancelled")
@@ -1050,14 +1026,9 @@ class KittingWorkflowEngine:
                         # Park before re-scan in case the arm is in an
                         # awkward post-pick pose blocking the overhead.
                         self.camera.send_command("/api/home", {})
-                        new_overhead = self.camera.capture_workspace_image()
-                        if self._looks_like_placeholder(new_overhead):
-                            raise RuntimeError(
-                                "Re-capture returned placeholder image "
-                                "(bridge unreachable). Aborting retry "
-                                "instead of feeding hallucinated parts "
-                                "into the planner.")
-                        current_overhead = new_overhead
+                        # capture_workspace_image raises if the bridge is
+                        # unreachable — no placeholder frame to screen for.
+                        current_overhead = self.camera.capture_workspace_image()
                     except Exception as e:
                         log.warning(f"Re-capture failed: {e}")
                         return self._finalize(
@@ -1111,128 +1082,36 @@ class KittingWorkflowEngine:
 
     # ─── Two-Stage VLM Analysis ────────────────────────────────
 
-    def _find_bin_region(self, scene: dict) -> Optional[tuple]:
-        """Estimate the blue bin's bounding box in normalised image coords.
 
-        Uses the VLM-detected graspable objects to infer where the bin is.
-        Returns (x_min, y_min, x_max, y_max) in normalised coords, or None.
-        """
-        xs, ys = [], []
-        for obj in scene.get("detected_objects", []):
-            if obj.get("affordance") in ("graspable", "stackable", "fragile"):
-                pos = obj.get("image_position", {})
-                if pos:
-                    xs.append(pos.get("x", 0.5))
-                    ys.append(pos.get("y", 0.5))
-        if len(xs) < 1:
-            return None
-        # Pad around detected objects (parts don't cover the full bin)
-        margin = 0.08
-        x_min = max(0.0, min(xs) - margin)
-        y_min = max(0.0, min(ys) - margin)
-        x_max = min(1.0, max(xs) + margin)
-        y_max = min(1.0, max(ys) + margin)
-        # Ensure minimum crop size (at least 20% of image per axis)
-        if x_max - x_min < 0.20:
-            cx = (x_min + x_max) / 2
-            x_min, x_max = max(0, cx - 0.10), min(1, cx + 0.10)
-        if y_max - y_min < 0.20:
-            cy = (y_min + y_max) / 2
-            y_min, y_max = max(0, cy - 0.10), min(1, cy + 0.10)
-        return (x_min, y_min, x_max, y_max)
 
-    def _crop_bin_region(self, image, bin_box: tuple,
-                         upscale_long_edge: int = 1600):
-        """Crop the bin area from a full-resolution image and LANCZOS-
-        upscale so parts occupy enough pixels for the VLM.
 
-        A bin crop from a 1920x1080 overhead is typically ~500x300 px,
-        leaving each part only ~30–50 px wide — too small for Gemma4
-        to discriminate colour / shape / holes. Upscaling to 1600 px on
-        the long edge (same preprocessing used by
-        ``diagnose_vlm_perception.py``) gives the VLM a sharper input.
-
-        Args:
-            image: PIL Image (full frame, e.g. 1920x1080)
-            bin_box: (x_min, y_min, x_max, y_max) in normalised coords
-            upscale_long_edge: target long-edge size in pixels after
-                LANCZOS upscale (set ≤0 to disable upscaling)
-        Returns:
-            Cropped + (optionally) upscaled PIL Image of just the bin area.
-        """
-        from PIL import Image as _PILImage
-        w, h = image.size
-        x_min, y_min, x_max, y_max = bin_box
-        left = int(x_min * w)
-        top = int(y_min * h)
-        right = int(x_max * w)
-        bottom = int(y_max * h)
-        cropped = image.crop((left, top, right, bottom))
-
-        if upscale_long_edge and upscale_long_edge > 0:
-            long_edge = max(cropped.size)
-            if long_edge < upscale_long_edge:
-                scale = upscale_long_edge / long_edge
-                new_size = (int(cropped.size[0] * scale),
-                            int(cropped.size[1] * scale))
-                cropped = cropped.resize(new_size, _PILImage.LANCZOS)
-                log.info(
-                    f"[Bin-zoom] LANCZOS upscaled crop → "
-                    f"{cropped.size[0]}x{cropped.size[1]} (x{scale:.2f})")
-        return cropped
-
-    @staticmethod
-    def _compute_bin_crop_box(bin_image_pos, bin_image_bbox=None,
-                              default_radius=0.18):
-        """Compute the normalised crop box for the bin from VLM landmark output.
-
-        Prefers ``bin_image_bbox`` from the VLM (tight box).  If only the
-        centre is available, falls back to a square crop of half-side
-        ``default_radius`` centred on ``bin_image_pos``.  A small padding
-        is added so the bin walls fully fit inside the crop.
-        """
-        pad = 0.02
-        if (bin_image_bbox
-                and all(k in bin_image_bbox
-                        for k in ("x_min", "y_min", "x_max", "y_max"))):
-            x_min = max(0.0, bin_image_bbox["x_min"] - pad)
-            y_min = max(0.0, bin_image_bbox["y_min"] - pad)
-            x_max = min(1.0, bin_image_bbox["x_max"] + pad)
-            y_max = min(1.0, bin_image_bbox["y_max"] + pad)
-        else:
-            cx = bin_image_pos.get("x", 0.5)
-            cy = bin_image_pos.get("y", 0.5)
-            x_min = max(0.0, cx - default_radius)
-            y_min = max(0.0, cy - default_radius)
-            x_max = min(1.0, cx + default_radius)
-            y_max = min(1.0, cy + default_radius)
-        return (x_min, y_min, x_max, y_max)
-
-    def _detect_parts_from_bin_crop(self, overhead_image, bin_crop_box,
-                                    target_parts=None, bin_top_z=None,
-                                    camera_alias: str = "rgb"):
-        """Crop the bin from the overhead image, run VLM + OWL-ViT2, project to world.
+    def _detect_parts(self, image, target_parts=None, bin_top_z=None,
+                      camera_alias: str = "rgb"):
+        """Run VLM + detector on a camera frame and project parts to world.
 
         Returns ``(scene_dict, coord_source_string)``.  ``coord_source``
         is ``"none"`` if depth projection failed.
 
+        The frame is used AS CAPTURED — no crop, no resize. Every bbox
+        therefore lives in one pixel frame from the model's output all
+        the way to depth projection, so there is no coordinate remapping
+        that can drift.
+
+        All coordinates come from camera + depth. USD annotations are
+        fetched for label cross-checking only, never for XYZ.
+
         Pipeline:
-          1. Try GT scene_annotations first — bridge returns USD-truth
-             world coords + per-camera 2D bboxes for every part.
-          2. Crop the bin region from the overhead image.
-          3. VLM identifies parts (semantic labels) in crop-local coords.
-          4. OWL-ViT2 detects tight bboxes for the same parts.
-          5. Match VLM labels → GT annotation by 2D bbox IoU (with the
-             OWL-ViT2 bbox).  When matched, use GT world XYZ directly.
-          6. Otherwise match VLM label → OWL-ViT2 bbox; use bbox centre
-             for XY and median depth across a 5×5 grid for Z.
-          7. Fall back to single-point depth projection when nothing
+          1. VLM identifies parts (semantic labels + native bboxes).
+          2. OWL-ViT2 supplies bboxes instead when the VLM can't ground.
+          3. Match VLM label → bbox; use bbox centre for XY and median
+             depth across a 5×5 patch for Z.
+          4. Fall back to single-point depth projection when nothing
              matches a VLM label.
-          8. Sanity-check each part Z against ``bin_top_z`` — if Z is
+          5. Sanity-check each part Z against ``bin_top_z`` — if Z is
              > 0.20 m below or > 0.30 m above the bin reference, replace
              with ``bin_top_z`` so IK gets a reachable target.
         """
-        # ── Step 1: pull GT annotations (bypass when bridge lacks them) ──
+        # Labels only — see _match_gt_annotation.
         gt_annotations = []
         try:
             if hasattr(self.camera, "get_scene_annotations"):
@@ -1253,29 +1132,18 @@ class KittingWorkflowEngine:
         except Exception as e:
             log.warning(f"[Bin-zoom] GT annotation fetch failed: {e}")
 
-        # Detect "no-op crop" — overhead camera tightly frames the bin
-        # so we send the full image as-is. Skip the LANCZOS upscale to
-        # avoid unnecessary work + token bloat.
-        full_frame = (
-            bin_crop_box[0] <= 1e-6 and bin_crop_box[1] <= 1e-6 and
-            bin_crop_box[2] >= 1.0 - 1e-6 and bin_crop_box[3] >= 1.0 - 1e-6
-        )
-        upscale = 0 if full_frame else 1600
-        cropped = self._crop_bin_region(
-            overhead_image, bin_crop_box, upscale_long_edge=upscale)
-        cw, ch = cropped.size
-        log.info(
-            f"[Bin-zoom] {'Full overhead frame' if full_frame else 'Cropped bin image'}"
-            f": {cw}x{ch} px (upscale={upscale})")
+        cw, ch = image.size
+        log.info(f"[Detect] Frame as captured: {cw}x{ch} px")
 
         # ── Detector mode is derived from the active VLM provider ──
         # Qwen-family VLMs are self-grounding → skip OWL-ViT2 and
         # extract bboxes directly from the VLM JSON response.
         use_vlm_grounding = self._is_self_grounding_vlm(
-            getattr(self.vlm, "provider", ""))
+            getattr(self.vlm, "provider", ""), getattr(self.vlm, "model", ""))
         detector_mode = "vlm" if use_vlm_grounding else "owlv2"
         log.info(f"[Bin-zoom] Detector mode: {detector_mode} "
-                 f"(provider={getattr(self.vlm, 'provider', '?')})")
+                 f"(provider={getattr(self.vlm, 'provider', '?')}, "
+                 f"model={getattr(self.vlm, 'model', '?')})")
 
         # Qwen-VL (8B) drowns in the full catalogue + grounding prompt
         # (3500+ tokens → emits whitespace under format=json). Use the
@@ -1283,15 +1151,8 @@ class KittingWorkflowEngine:
         # one-liners are baked into the prompt, and bbox_pixels in the
         # JSON schema gives us self-grounding without the separate suffix.
         if use_vlm_grounding:
-            # Qwen3-VL emits bboxes in a normalised 0-1000 grid that is
-            # image-size invariant. We still pre-resize the image to a
-            # 28-multiple shape (cheaper, predictable token count, no
-            # Ollama-side surprise resizes) but the prompt itself no
-            # longer depends on dimensions.
-            qw, qh = qwen_target_size(cw, ch)
             prompt = bin_zoom_prompt_qwen_minimal()
-            log.info(f"[Bin-zoom] Qwen target image size: {qw}x{qh} "
-                     f"(crop {cw}x{ch}); bbox grid = 0-1000")
+            log.info(f"[Detect] Qwen self-grounding on {cw}x{ch} as sent")
             # Deliberately DO NOT append "operator is looking for X" for
             # the Qwen path. That hint biases Qwen toward emitting only
             # that label and stopping early — we observed it returning
@@ -1309,20 +1170,11 @@ class KittingWorkflowEngine:
                 )
 
         try:
-            # Full-frame overhead → default 1024 max_size is plenty
-            # (image is already focused on the bin). For the legacy
-            # narrow-crop path we kept the 1600 ceiling so the LANCZOS
-            # upscale isn't undone.
-            vlm_max = 1024 if full_frame else 1600
-            scene = self.vlm.analyze_scene(
-                cropped, custom_prompt=prompt, max_size=vlm_max)
+            scene = self.vlm.analyze_scene(image, custom_prompt=prompt)
         except Exception as e:
             log.warning(f"[Bin-zoom] VLM analysis failed: {e}")
             return {"detected_objects": []}, "none"
 
-        x_min, y_min, x_max, y_max = bin_crop_box
-        cw_norm = x_max - x_min
-        ch_norm = y_max - y_min
         objects = scene.get("detected_objects", [])
 
         # ── Source tight bboxes: Qwen uses its own self-grounded bbox
@@ -1335,13 +1187,10 @@ class KittingWorkflowEngine:
             if obj.get("label")
         ]
         if use_vlm_grounding:
-            qwen_size = getattr(self.vlm, "_last_qwen_image_size", None)
-            detector_dets = self._extract_vlm_bboxes(
-                objects, cw, ch, qwen_size=qwen_size)
+            detector_dets = self._extract_vlm_bboxes(objects, cw, ch)
             log.info(
-                f"[Bin-zoom] Qwen self-grounding: {len(detector_dets)} "
-                f"bboxes from {len(objects)} objects "
-                f"(qwen_size={qwen_size}, crop={cw}x{ch})")
+                f"[Detect] Qwen self-grounding: {len(detector_dets)} "
+                f"bboxes from {len(objects)} objects")
         elif self._detector.is_available:
             # Build OWL queries from the FULL catalogue (always) plus any
             # extra labels Gemma4 reported that aren't catalogued. The
@@ -1374,7 +1223,7 @@ class KittingWorkflowEngine:
                             queries.append(q)
                             seen.add(q.lower().strip())
                 detector_dets = self._detector.detect_with_labels(
-                    cropped, queries)
+                    image, queries)
                 log.info(
                     f"[Bin-zoom] OWL-ViT2: {len(detector_dets)} "
                     f"bboxes from {len(queries)} queries "
@@ -1393,7 +1242,7 @@ class KittingWorkflowEngine:
         # Each bbox is used by AT MOST ONE object. Stops every
         # `large_gear_1/2/3` from collapsing to the same "best" bbox.
         bbox_assignment, used_det_idxs = self._assign_detector_bboxes(
-            objects, detector_dets, cw, ch, bin_crop_box)
+            objects, detector_dets, cw, ch)
         log.info(
             f"[Bin-zoom] Assigned {len(bbox_assignment)}/{len(objects)} "
             f"VLM objects to unique bboxes ({detector_mode})")
@@ -1431,9 +1280,6 @@ class KittingWorkflowEngine:
             except Exception:
                 query_to_canonical = {}
 
-            cx_min, cy_min, cx_max, cy_max = bin_crop_box
-            cw_norm_ = cx_max - cx_min
-            ch_norm_ = cy_max - cy_min
             synth_count = 0
             for di, det in enumerate(detector_dets):
                 if di in used_det_idxs:
@@ -1455,12 +1301,9 @@ class KittingWorkflowEngine:
                 if x2 <= x1 or y2 <= y1:
                     continue
 
-                # Crop pixels → full-image normalised
-                nx1 = cx_min + (x1 / cw) * cw_norm_
-                ny1 = cy_min + (y1 / ch) * ch_norm_
-                nx2 = cx_min + (x2 / cw) * cw_norm_
-                ny2 = cy_min + (y2 / ch) * ch_norm_
-                # Crop-relative normalised bbox centre for image_position
+                # Pixels → normalised, same frame throughout
+                nx1, ny1 = x1 / cw, y1 / ch
+                nx2, ny2 = x2 / cw, y2 / ch
                 cx_norm = ((x1 + x2) / 2.0) / max(cw, 1)
                 cy_norm = ((y1 + y2) / 2.0) / max(ch, 1)
 
@@ -1526,16 +1369,11 @@ class KittingWorkflowEngine:
                     sorted(bbox_assignment.items()))
             }
 
-        # ── Convert VLM crop-local → full-image; apply assigned bboxes ──
+        # image_position is already normalised in the captured frame.
         for i, obj in enumerate(objects):
             pos = obj.get("image_position",
                           obj.get("approximate_position", {}))
             if pos and "x" in pos and "y" in pos:
-                full_x = x_min + pos["x"] * cw_norm
-                full_y = y_min + pos["y"] * ch_norm
-                pos["x"] = full_x
-                pos["y"] = full_y
-                obj["image_position"] = pos
                 obj["affordance"] = obj.get("affordance", "graspable")
 
             bbox_full = bbox_assignment.get(i)
@@ -1566,36 +1404,6 @@ class KittingWorkflowEngine:
                     f"  [GT-label] '{obj.get('label', '?')}' ↔ "
                     f"{gt_match.get('name', '?')} "
                     f"(part_type={gt_match.get('part_type', '?')})")
-
-        # ── Optional: per-instance crop-and-zoom refinement with Qwen ──
-        # First-pass grounding can be loose when N similar parts cluster
-        # in one region (Qwen's vision tokens span 28x28 patches; a few
-        # gears within ~150 px collapse to the same patch coords). The
-        # refinement step crops a 2x area around each rough bbox and
-        # re-queries Qwen with a single-instance grounding prompt
-        # ("Outline the position of the {label}"). Qwen's RefCOCO-trained
-        # pathway is far more precise when there's exactly one target
-        # in view. Costs N extra Qwen calls per scan, so it's gated by
-        # ``perception.refine_with_crop_zoom`` (default false).
-        refine_cfg = (self.config.get("perception", {})
-                      .get("refine_with_crop_zoom", False))
-        if refine_cfg and use_vlm_grounding:
-            n_to_refine = sum(1 for o in objects
-                              if o.get("_detector_bbox_full"))
-            log.info(
-                f"[Refine] Per-instance crop-and-zoom ON; "
-                f"re-querying Qwen on {n_to_refine} parts")
-            for obj in objects:
-                bbox_full = obj.get("_detector_bbox_full")
-                if not bbox_full:
-                    continue
-                refined = self._refine_bbox_with_qwen(
-                    overhead_image, obj.get("label", ""), bbox_full)
-                if refined is not None:
-                    obj["_detector_bbox_full"] = refined
-                    cx = (refined[0] + refined[2]) / 2.0
-                    cy = (refined[1] + refined[3]) / 2.0
-                    obj["image_position"] = {"x": cx, "y": cy}
 
         # ── Optional: per-instance VLM label verification ────────────
         # Crop each detected part to a 2x region and ask the VLM "what
@@ -1732,25 +1540,11 @@ class KittingWorkflowEngine:
         coord_source = "none"
         if proj_points:
             try:
-                # Read axis-sign overrides from config so the user can
-                # mirror image axes if the overhead camera was placed
-                # in USD with a non-standard rotation. Defaults to +1.
-                perc_cfg = self.config.get("perception", {})
-                ix_sign = int(perc_cfg.get("camera_image_x_sign", 1))
-                iy_sign = int(perc_cfg.get("camera_image_y_sign", 1))
                 proj_result = self.camera.project_to_world(
-                    proj_points, camera=camera_alias,
-                    image_x_sign=ix_sign, image_y_sign=iy_sign)
+                    proj_points, camera=camera_alias)
                 wpts = proj_result.get("world_points", [])
                 method = proj_result.get("method", "?")
-                depth_used = proj_result.get("depth_buffer_used", False)
                 coord_source = f"{camera_alias}_{method}"
-                if not depth_used:
-                    log.warning(
-                        f"[Bin-zoom] Depth buffer FAILED — fell back to "
-                        f"geometric ray-plane projection (workspace_z "
-                        f"from USD). Part Z values may be wrong if the "
-                        f"bin AABB doesn't reflect the real part-floor.")
 
                 for obj, (start, count) in zip(objects, slices):
                     if count == 0:
@@ -1843,7 +1637,7 @@ class KittingWorkflowEngine:
         # the Streamlit "🎯 VLM Detections" tab.
         try:
             overlay = self._render_vlm_overlay(
-                cropped, objects, detector_dets, bin_crop_box)
+                image, objects, detector_dets)
             from utils.image_utils import save_debug_image
             save_path = save_debug_image(
                 overlay,
@@ -1923,123 +1717,6 @@ class KittingWorkflowEngine:
                 return top
         return None
 
-    def _refine_bbox_with_qwen(self, overhead_image, label: str,
-                               bbox_full: tuple,
-                               crop_margin_frac: float = 0.5):
-        """Re-query Qwen on a tightly cropped region around an existing
-        detection to get a more precise bbox.
-
-        Qwen3-VL is significantly more accurate at single-instance
-        grounding (RefCOCO-trained "outline the position of X" pathway)
-        than at multi-instance scene grounding. By cropping to a 2x
-        region around the rough bbox and asking for just one part, we
-        engage that pathway and get a tight box.
-
-        Parameters
-        ----------
-        overhead_image : PIL.Image
-            The full overhead RGB image.
-        label : str
-            The part label (e.g. ``"large_gear"``).
-        bbox_full : tuple
-            ``(nx1, ny1, nx2, ny2)`` normalised to [0, 1] in the full
-            image — the rough first-pass bbox.
-        crop_margin_frac : float
-            Margin to add on each side of the rough bbox, as a fraction
-            of the rough bbox width/height. ``0.5`` doubles the bbox
-            area, giving Qwen room to find the true edges.
-
-        Returns
-        -------
-        tuple or None
-            Refined ``(nx1, ny1, nx2, ny2)`` normalised to [0, 1] in
-            the full image, or ``None`` if refinement failed (Qwen
-            error, malformed bbox, degenerate geometry, etc.). On None
-            the caller keeps the rough bbox.
-        """
-        from PIL import Image as _PILImage
-
-        W, H = overhead_image.size
-        nx1, ny1, nx2, ny2 = bbox_full
-        rx1, ry1 = nx1 * W, ny1 * H
-        rx2, ry2 = nx2 * W, ny2 * H
-        bw, bh = rx2 - rx1, ry2 - ry1
-        if bw <= 0 or bh <= 0:
-            return None
-        cx1 = max(0, int(round(rx1 - bw * crop_margin_frac)))
-        cy1 = max(0, int(round(ry1 - bh * crop_margin_frac)))
-        cx2 = min(W, int(round(rx2 + bw * crop_margin_frac)))
-        cy2 = min(H, int(round(ry2 + bh * crop_margin_frac)))
-        crop_w_px = cx2 - cx1
-        crop_h_px = cy2 - cy1
-        if crop_w_px < 28 or crop_h_px < 28:
-            # Too small for Qwen's 28x28 vision-patch grid.
-            return None
-        crop_img = overhead_image.crop((cx1, cy1, cx2, cy2))
-
-        prompt = (
-            f"Outline the position of the {label} in this image.\n"
-            "Output ONLY this JSON (no markdown, no commentary):\n"
-            "{\"bbox_2d\": [x_min, y_min, x_max, y_max]}\n"
-            "Use your standard normalised grounding coordinates in "
-            "[0, 1000]: (0,0)=top-left, (1000,1000)=bottom-right. "
-            "Make the box TIGHT around the visible silhouette of the "
-            f"{label} only — no padding, no surrounding bin walls."
-        )
-        try:
-            result = self.vlm.analyze_raw(crop_img, prompt)
-        except Exception as e:
-            log.warning(f"[Refine] {label}: Qwen call failed: {e}")
-            return None
-
-        bb = (result.get("bbox_2d")
-              or result.get("bbox_pixels")
-              or result.get("bbox"))
-        if not (isinstance(bb, (list, tuple)) and len(bb) == 4):
-            log.warning(
-                f"[Refine] {label}: no bbox_2d in response keys="
-                f"{list(result.keys()) if isinstance(result, dict) else type(result).__name__}")
-            return None
-        try:
-            x1, y1, x2, y2 = [float(v) for v in bb]
-        except (ValueError, TypeError):
-            log.warning(f"[Refine] {label}: invalid bbox values: {bb}")
-            return None
-
-        # Decode coord frame using the same rules as _extract_vlm_bboxes.
-        mx = max(abs(x1), abs(x2), abs(y1), abs(y2))
-        if mx <= 1.5:
-            f1, g1, f2, g2 = x1, y1, x2, y2  # already 0-1 fractional
-            frame = "norm"
-        elif mx <= 1005:
-            f1, g1 = x1 / 1000.0, y1 / 1000.0
-            f2, g2 = x2 / 1000.0, y2 / 1000.0
-            frame = "qwen_1000"
-        else:
-            f1, g1 = x1 / max(crop_w_px, 1), y1 / max(crop_h_px, 1)
-            f2, g2 = x2 / max(crop_w_px, 1), y2 / max(crop_h_px, 1)
-            frame = "crop_px"
-
-        if f2 <= f1 or g2 <= g1:
-            return None
-
-        # crop-fractional → crop pixels → full-image pixels → full-image normalised
-        new_rx1 = cx1 + f1 * crop_w_px
-        new_ry1 = cy1 + g1 * crop_h_px
-        new_rx2 = cx1 + f2 * crop_w_px
-        new_ry2 = cy1 + g2 * crop_h_px
-        refined = (new_rx1 / W, new_ry1 / H,
-                   new_rx2 / W, new_ry2 / H)
-
-        log.info(
-            f"[Refine] {label}: rough_full=("
-            f"{nx1:.3f},{ny1:.3f},{nx2:.3f},{ny2:.3f}) → "
-            f"crop=({cx1},{cy1},{cx2},{cy2}) bbox_2d=("
-            f"{x1:.0f},{y1:.0f},{x2:.0f},{y2:.0f}) frame={frame} → "
-            f"refined_full=("
-            f"{refined[0]:.3f},{refined[1]:.3f},"
-            f"{refined[2]:.3f},{refined[3]:.3f})")
-        return refined
 
     def _verify_label_with_vlm(self, overhead_image, current_label: str,
                                bbox_full: tuple,
@@ -2114,23 +1791,21 @@ class KittingWorkflowEngine:
         return (new_label, conf)
 
     @staticmethod
-    def _is_self_grounding_vlm(provider: str) -> bool:
+    def _is_self_grounding_vlm(provider: str, model: str = "") -> bool:
         """Return True for VLMs that can emit tight bboxes natively
         (Qwen-family). Gemma, LLaVA, GPT-4o go through OWL-ViT2.
+
+        The model name matters as much as the provider: a backend tag
+        like ``vllm`` says nothing about which model it serves.
         """
-        if not provider:
-            return False
-        p = provider.lower()
-        return p.startswith("ollama_qwen") or "qwen" in p
+        return "qwen" in f"{provider} {model}".lower()
 
     @staticmethod
-    def _extract_vlm_bboxes(objects: list, crop_w: int,
-                            crop_h: int,
-                            qwen_size: Optional[tuple] = None) -> list:
+    def _extract_vlm_bboxes(objects: list, img_w: int,
+                            img_h: int) -> list:
         """Convert per-object bbox fields from a self-grounding VLM
-        into the same shape OWL-ViT2 returns (pixel bbox in crop frame
-        + label + confidence) so ``_assign_detector_bboxes`` is reused
-        verbatim.
+        into the same shape OWL-ViT2 returns (pixel bbox + label +
+        confidence) so ``_assign_detector_bboxes`` is reused verbatim.
 
         Bbox fields accepted (priority order):
           1. ``bbox_2d`` — Qwen3-VL native JSON-grounding field name.
@@ -2138,37 +1813,19 @@ class KittingWorkflowEngine:
           3. ``bbox_norm`` / ``bbox`` — generic legacy fields.
           4. ``mask_polygon`` / ``segmentation_polygon`` — polygon AABB.
 
-        Coordinate-frame auto-detection by magnitude:
-          * max ≤ 1.5            → 0-1 normalised within the image.
-          * max ≤ 1005           → **Qwen 0-1000 grid** (Qwen3-VL
-                                   convention; image-size invariant).
-          * max ≤ max(qw, qh)·1.05 → absolute pixels in Qwen frame
-                                     (Qwen2.5-VL convention).
-          * else                 → assume already in crop pixels.
+        Coordinate frame by magnitude. The image is sent unresized, so
+        pixel-valued output is already in the frame we drew it from and
+        needs no rescaling:
+          * max ≤ 1.5   → 0-1 normalised.
+          * max ≤ 1005  → Qwen 0-1000 grid (image-size invariant).
+          * else        → absolute pixels in the captured frame.
 
-        All branches return pixel coordinates in the **crop** frame
-        (``crop_w`` × ``crop_h``), which is what
-        ``_assign_detector_bboxes`` and ``_render_vlm_overlay`` expect.
-
-        Side effect: writes a normalised crop-relative ``image_position``
-        (bbox centre, 0-1) onto each object so the downstream loop in
-        ``_detect_parts_from_bin_crop`` always has a well-formed semantic
-        target — replacing whatever Qwen put in that field on its own.
+        Side effect: writes a normalised ``image_position`` (bbox centre,
+        0-1) onto each object so the downstream loop always has a
+        well-formed semantic target.
         """
         import re as _re
         out = []
-
-        qw = qh = None
-        if qwen_size and len(qwen_size) == 2:
-            try:
-                qw, qh = int(qwen_size[0]), int(qwen_size[1])
-                if qw <= 0 or qh <= 0:
-                    qw = qh = None
-            except (TypeError, ValueError):
-                qw = qh = None
-        # Scale factor: Qwen pixel frame → crop pixel frame.
-        sx = (crop_w / qw) if qw else 1.0
-        sy = (crop_h / qh) if qh else 1.0
 
         def _polygon_bbox(poly: list):
             xs, ys = [], []
@@ -2200,22 +1857,14 @@ class KittingWorkflowEngine:
             """
             mx = max(abs(x1), abs(x2), abs(y1), abs(y2))
             if mx <= 1.5:
-                # Normalised 0-1 within the image
-                return (x1 * crop_w, y1 * crop_h,
-                        x2 * crop_w, y2 * crop_h, "norm")
+                return (x1 * img_w, y1 * img_h,
+                        x2 * img_w, y2 * img_h, "norm")
             if mx <= 1005:
-                # Qwen 0-1000 grid (Qwen3-VL native, image-size invariant).
                 # 1005 > 1000 tolerates a slight model overshoot.
-                return (x1 / 1000.0 * crop_w, y1 / 1000.0 * crop_h,
-                        x2 / 1000.0 * crop_w, y2 / 1000.0 * crop_h,
+                return (x1 / 1000.0 * img_w, y1 / 1000.0 * img_h,
+                        x2 / 1000.0 * img_w, y2 / 1000.0 * img_h,
                         "qwen_1000")
-            if qw and qh and mx <= max(qw, qh) * 1.05:
-                # Absolute pixels in Qwen frame (Qwen2.5-VL convention)
-                # → scale to crop frame
-                return (x1 * sx, y1 * sy,
-                        x2 * sx, y2 * sy, "qwen_px")
-            # Fallback: assume already in crop pixels
-            return (x1, y1, x2, y2, "crop_px")
+            return (x1, y1, x2, y2, "image_px")
 
         for obj in objects:
             # ``bbox_2d`` is Qwen3-VL's native JSON-grounding field;
@@ -2254,9 +1903,9 @@ class KittingWorkflowEngine:
             # 1000] in the raw values means Qwen ignored the grid
             # contract. Both are kept (the assignment may still pick
             # them) but logged so unexpected drift is visible.
-            crop_area = max(crop_w * crop_h, 1)
+            img_area = max(img_w * img_h, 1)
             box_area = max((px2 - px1) * (py2 - py1), 1.0)
-            area_frac = box_area / crop_area
+            area_frac = box_area / img_area
             warn_flags = []
             if area_frac > 0.30:
                 warn_flags.append(f"LARGE({area_frac*100:.0f}% of image)")
@@ -2272,18 +1921,15 @@ class KittingWorkflowEngine:
             log.info(
                 f"[Qwen-bbox] {label}: raw={source}=({x1:.1f},"
                 f"{y1:.1f},{x2:.1f},{y2:.1f}) frame={frame} "
-                f"qwen=({qw}x{qh}) crop=({crop_w}x{crop_h}) → "
-                f"crop_px=({px1:.0f},{py1:.0f},{px2:.0f},{py2:.0f}){tag}")
+                f"image=({img_w}x{img_h}) → "
+                f"px=({px1:.0f},{py1:.0f},{px2:.0f},{py2:.0f}){tag}")
 
-            # Overwrite image_position with crop-normalised bbox centre
-            # so the downstream loop has a clean target. Qwen's own
-            # image_position is in whatever frame it felt like that
-            # turn — not trustworthy.
-            cx_px = (px1 + px2) / 2.0
-            cy_px = (py1 + py2) / 2.0
+            # Overwrite image_position with the normalised bbox centre so
+            # the downstream loop has a clean target. Qwen's own
+            # image_position is in whatever frame it felt like that turn.
             obj["image_position"] = {
-                "x": cx_px / max(crop_w, 1),
-                "y": cy_px / max(crop_h, 1),
+                "x": ((px1 + px2) / 2.0) / max(img_w, 1),
+                "y": ((py1 + py2) / 2.0) / max(img_h, 1),
             }
 
             out.append({
@@ -2295,8 +1941,7 @@ class KittingWorkflowEngine:
 
     @staticmethod
     def _assign_detector_bboxes(objects: list, detector_dets: list,
-                                crop_w: int, crop_h: int,
-                                bin_crop_box: tuple) -> dict:
+                                img_w: int, img_h: int) -> dict:
         """Greedy 1-to-1 assignment of OWL-ViT2 bboxes to VLM objects.
 
         Each VLM object (e.g. ``large_gear_1``) gets AT MOST one bbox,
@@ -2372,8 +2017,8 @@ class KittingWorkflowEngine:
                 if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
                     try:
                         x1, y1, x2, y2 = [float(v) for v in bbox]
-                        det_cx = ((x1 + x2) / 2.0) / max(crop_w, 1)
-                        det_cy = ((y1 + y2) / 2.0) / max(crop_h, 1)
+                        det_cx = ((x1 + x2) / 2.0) / max(img_w, 1)
+                        det_cy = ((y1 + y2) / 2.0) / max(img_h, 1)
                     except (TypeError, ValueError):
                         det_cx = det_cy = None
                 # Direct canonical match (self-grounding VLM path):
@@ -2464,8 +2109,8 @@ class KittingWorkflowEngine:
                     x1, y1, x2, y2 = [float(v) for v in bbox]
                 except (TypeError, ValueError):
                     continue
-                det_cx = ((x1 + x2) / 2.0) / max(crop_w, 1)
-                det_cy = ((y1 + y2) / 2.0) / max(crop_h, 1)
+                det_cx = ((x1 + x2) / 2.0) / max(img_w, 1)
+                det_cy = ((y1 + y2) / 2.0) / max(img_h, 1)
                 dist = ((obj_cx - det_cx) ** 2
                         + (obj_cy - det_cy) ** 2) ** 0.5
                 if dist < best_dist and dist <= SPATIAL_FALLBACK_MAX_DIST:
@@ -2487,84 +2132,13 @@ class KittingWorkflowEngine:
                 assigned_dets.add(best_di)
 
         # Convert assigned bboxes to full-image normalised coords
-        cx_min, cy_min, cx_max, cy_max = bin_crop_box
-        cw_norm = cx_max - cx_min
-        ch_norm = cy_max - cy_min
         out = {}
         for oi, di in assignment.items():
             x1, y1, x2, y2 = detector_dets[di]["bbox"]
-            nx1 = cx_min + (x1 / crop_w) * cw_norm
-            ny1 = cy_min + (y1 / crop_h) * ch_norm
-            nx2 = cx_min + (x2 / crop_w) * cw_norm
-            ny2 = cy_min + (y2 / crop_h) * ch_norm
-            out[oi] = (nx1, ny1, nx2, ny2)
+            out[oi] = (x1 / img_w, y1 / img_h,
+                       x2 / img_w, y2 / img_h)
         return out, set(assignment.values())
 
-    def _zoomed_bin_analysis(self, full_image, scene: dict):
-        """Stage 2: Re-analyze just the bin area at higher resolution.
-
-        Crops the bin region from the full-res image and sends it to
-        the VLM for more detailed part identification.  Merges the
-        zoomed detections back into the original scene, converting
-        crop-local coordinates to full-image coordinates.
-        """
-        bin_box = self._find_bin_region(scene)
-        if not bin_box:
-            log.info("[Zoom] Could not estimate bin region — skipping")
-            return
-
-        x_min, y_min, x_max, y_max = bin_box
-        log.info(f"[Zoom] Bin region: x=[{x_min:.2f},{x_max:.2f}] "
-                 f"y=[{y_min:.2f},{y_max:.2f}]")
-
-        cropped = self._crop_bin_region(full_image, bin_box)
-        cw, ch = cropped.size
-        log.info(f"[Zoom] Cropped bin image: {cw}x{ch} px")
-
-        # Send the cropped + LANCZOS-upscaled image to VLM at
-        # max_size=1600 so the upscale isn't undone.
-        try:
-            zoomed_scene = self.vlm.analyze_scene(
-                cropped,
-                custom_prompt=_with_catalogue(BIN_ZOOM_PROMPT),
-                max_size=1600)
-        except Exception as e:
-            log.warning(f"[Zoom] VLM analysis failed: {e}")
-            return
-
-        zoomed_objs = zoomed_scene.get("detected_objects", [])
-        if not zoomed_objs:
-            log.info("[Zoom] No objects detected in zoomed view")
-            return
-
-        log.info(f"[Zoom] Detected {len(zoomed_objs)} parts in zoomed bin")
-
-        # Convert crop-local normalised coords → full-image normalised coords
-        for obj in zoomed_objs:
-            pos = obj.get("image_position", {})
-            if pos:
-                # local (0-1) → full image (0-1)
-                pos["x"] = x_min + pos.get("x", 0.5) * (x_max - x_min)
-                pos["y"] = y_min + pos.get("y", 0.5) * (y_max - y_min)
-            obj["affordance"] = "graspable"  # everything in the bin is graspable
-            obj["_source"] = "zoomed_vlm"
-
-        # Replace the graspable objects from stage 1 with zoomed results.
-        # Keep tray / destination objects from stage 1 unchanged.
-        non_parts = [
-            obj for obj in scene.get("detected_objects", [])
-            if obj.get("affordance") == "destination"
-            or "tray" in obj.get("label", "").lower()
-        ]
-
-        # Re-number object IDs
-        for i, obj in enumerate(zoomed_objs):
-            obj["object_id"] = f"obj_{i+1:03d}"
-
-        # Combine: zoomed parts + original tray detections
-        scene["detected_objects"] = zoomed_objs + non_parts
-        log.info(f"[Zoom] Final scene: {len(zoomed_objs)} parts + "
-                 f"{len(non_parts)} non-part objects")
 
     def _filter_unreachable(self, scene: dict) -> None:
         """Remove graspable objects outside the robot's effective kinematic reach.
@@ -2789,23 +2363,6 @@ class KittingWorkflowEngine:
         except Exception:
             pass  # outside Streamlit or capture failed — ignore
 
-    @staticmethod
-    def _looks_like_placeholder(image) -> bool:
-        """Detect the bridge's 640x480 fallback image.
-
-        ``BridgeCameraInterface._placeholder_image`` returns a 640x480
-        near-black gradient when the bridge is unreachable. Sending it
-        through the perception pipeline produces hallucinated parts +
-        z=0 projections, so the workflow should bail explicitly.
-        """
-        try:
-            import numpy as _np
-            if image.size != (640, 480):
-                return False
-            arr = _np.array(image.convert("RGB"))
-            return float(arr.mean()) < 60.0
-        except Exception:
-            return False
 
     def _notify_vlm_overlay(self, overlay_image):
         """Push the latest VLM detection overlay to Streamlit so the
@@ -2818,8 +2375,7 @@ class KittingWorkflowEngine:
             pass
 
     @staticmethod
-    def _render_vlm_overlay(image, scene_objs, detector_dets,
-                            bin_crop_box):
+    def _render_vlm_overlay(image, scene_objs, detector_dets):
         """Draw the VLM-derived bboxes + labels on a copy of ``image``.
 
         Two layers:
@@ -2841,9 +2397,6 @@ class KittingWorkflowEngine:
         annotated = image.copy().convert("RGB")
         draw = ImageDraw.Draw(annotated)
         W, H = annotated.size
-        cx_min, cy_min, cx_max, cy_max = bin_crop_box
-        cw_norm = max(cx_max - cx_min, 1e-6)
-        ch_norm = max(cy_max - cy_min, 1e-6)
 
         try:
             font = ImageFont.truetype("arial.ttf", 16)
@@ -2888,10 +2441,8 @@ class KittingWorkflowEngine:
             if bbox_full and len(bbox_full) == 4:
                 # Full-image normalised → crop-local normalised → pixels
                 nx1, ny1, nx2, ny2 = bbox_full
-                lx1 = (nx1 - cx_min) / cw_norm * W
-                ly1 = (ny1 - cy_min) / ch_norm * H
-                lx2 = (nx2 - cx_min) / cw_norm * W
-                ly2 = (ny2 - cy_min) / ch_norm * H
+                lx1, ly1 = nx1 * W, ny1 * H
+                lx2, ly2 = nx2 * W, ny2 * H
                 draw.rectangle([lx1, ly1, lx2, ly2],
                                outline=(220, 30, 30), width=3)
                 _draw_centre_x((lx1 + lx2) / 2.0, (ly1 + ly2) / 2.0,
@@ -2903,8 +2454,7 @@ class KittingWorkflowEngine:
                 # No bbox — draw a crosshair at image_position
                 pos = obj.get("image_position", {})
                 if "x" in pos and "y" in pos:
-                    px = (pos["x"] - cx_min) / cw_norm * W
-                    py = (pos["y"] - cy_min) / ch_norm * H
+                    px, py = pos["x"] * W, pos["y"] * H
                     R = 8
                     draw.line([(px - R, py), (px + R, py)],
                               fill=(220, 30, 30), width=2)
@@ -3529,9 +3079,8 @@ class KittingWorkflowEngine:
         # camera_alias="wrist" tells the bridge's project_to_world to
         # use the wrist camera's USD transform + intrinsics.
         try:
-            scene, source = self._detect_parts_from_bin_crop(
+            scene, source = self._detect_parts(
                 wrist_image,
-                bin_crop_box=(0.0, 0.0, 1.0, 1.0),
                 target_parts=[target_label],
                 bin_top_z=None,
                 camera_alias="wrist",
@@ -4654,75 +4203,7 @@ class KittingWorkflowEngine:
 
         log.info(f"Detector merge: {matched}/{len(scene.get('detected_objects', []))} objects matched")
 
-    # ─── USD Fallback Matching ─────────────────────────────
 
-    @staticmethod
-    def _match_vlm_to_usd(scene: dict, usd_parts: list) -> None:
-        """Match VLM-detected labels to USD scene_parts by fuzzy name match.
-
-        Replaces normalised image coordinates (0-1) with real-world USD
-        bounding-box centres (metres) so the robot moves to the correct
-        position even when depth projection is unavailable.
-        """
-        for obj in scene.get("detected_objects", []):
-            vlm_label = obj.get("label", "").lower().replace(" ", "_")
-
-            best_match = None
-            best_score = 0
-            for part in usd_parts:
-                prim_name = part.get("name", "").lower()
-                # Simple substring match
-                if vlm_label in prim_name or prim_name in vlm_label:
-                    score = len(vlm_label)
-                    if score > best_score:
-                        best_score = score
-                        best_match = part
-                # Also try matching part type
-                part_type = part.get("type", "").lower()
-                if part_type and (vlm_label in part_type or part_type in vlm_label):
-                    score = len(part_type) + 1  # prefer type match
-                    if score > best_score:
-                        best_score = score
-                        best_match = part
-
-            if best_match:
-                pos = best_match.get("position", best_match.get("center", {}))
-                if isinstance(pos, dict):
-                    obj["approximate_position"] = {
-                        "x": pos.get("x", 0), "y": pos.get("y", 0),
-                        "z": pos.get("z", 0),
-                    }
-                elif isinstance(pos, (list, tuple)) and len(pos) >= 3:
-                    obj["approximate_position"] = {
-                        "x": pos[0], "y": pos[1], "z": pos[2],
-                    }
-                obj["_source"] = "usd_fallback"
-                obj["_usd_prim"] = best_match.get("prim_path", "")
-                log.info(
-                    f"Matched VLM '{vlm_label}' → USD '{best_match.get('name', '')}' "
-                    f"at ({obj['approximate_position']['x']:.3f}, "
-                    f"{obj['approximate_position']['y']:.3f}, "
-                    f"{obj['approximate_position']['z']:.3f})"
-                )
-
-    @staticmethod
-    def _find_place_target_usd(usd_parts: list) -> Optional[dict]:
-        """Find the kitting tray / destination box from USD parts list."""
-        for part in usd_parts:
-            name = part.get("name", "").lower()
-            if any(kw in name for kw in ("box", "tray", "kit", "destination")):
-                pos = part.get("position", part.get("center", {}))
-                if isinstance(pos, dict):
-                    return {
-                        "center_xy": [pos.get("x", 0), pos.get("y", 0)],
-                        "top_z": pos.get("z", 0),
-                    }
-                elif isinstance(pos, (list, tuple)) and len(pos) >= 3:
-                    return {
-                        "center_xy": [pos[0], pos[1]],
-                        "top_z": pos[2],
-                    }
-        return None
 
     # ─── Helpers ────────────────────────────────────────────
 
@@ -4758,22 +4239,6 @@ class KittingWorkflowEngine:
 
     # ─── Evaluation logging helpers ───────────────────────────
 
-    def _get_bin_bounds_xy(self, margin: float = 0.0
-                           ) -> Optional[tuple]:
-        """Return the bin's AABB in XY as ``(xmin, ymin, xmax, ymax)``
-        with an optional symmetric margin added (metres).
-
-        Cached from the Phase 0 ``bin_lookup`` step. Returns ``None``
-        if Phase 0 hasn't run yet (or didn't return AABB info), which
-        causes the USD-snap to fall back to "no bounds filter" — the
-        same behaviour as before this guard was added.
-        """
-        aabb = getattr(self, "_bin_aabb_xy", None)
-        if aabb is None:
-            return None
-        x_min, y_min, x_max, y_max = aabb
-        return (x_min - margin, y_min - margin,
-                x_max + margin, y_max + margin)
 
     def _close_range_rescan_xy(self, current_target: dict,
                                obj_label: str = "") -> Optional[dict]:
@@ -4928,195 +4393,6 @@ class KittingWorkflowEngine:
             if cam_to_ee_dx is not None else None,
         }
 
-    def _snap_to_usd_ground_truth(self, scene: dict) -> None:
-        """Replace each detection's grasp XY with the matching USD prim's
-        centre — eliminates the OWL-bbox / depth-projection imprecision
-        that misaligns the gripper before realignment.
-
-        Strategy:
-          1. Query the bridge's ``/api/scan_scene_parts`` for the actual
-             world position of every pickable USD prim.
-          2. For each detected object, find the USD prim of the same
-             part type (matching by name substring) whose centre is
-             closest to the detection's projected XY.
-          3. If within ``execution.usd_grasp_snap_radius`` (default 10
-             cm), overwrite ``approximate_position`` with the USD
-             ``center_xyz``. Original perception coords are stashed in
-             ``_perception_position`` for evaluation.
-          4. If no USD prim is within the radius, the detection keeps
-             its raw perception coords (graceful fallback).
-
-        Perception accuracy (raw, pre-snap) is recorded by
-        :meth:`_log_perception_metrics` BEFORE this method runs so the
-        evaluation tables report honest perception error.
-        """
-        import re as _re
-
-        # /api/scene_parts is registered as a GET endpoint on the
-        # bridge; ``send_command`` forces POST so it 404s. Use the
-        # purpose-built ``get_scene_parts`` helper (GET) when the
-        # camera interface supports it; otherwise fall back to
-        # ``send_command`` (will only work if a future bridge
-        # version adds POST support).
-        get_scene = getattr(self.camera, "get_scene_parts", None)
-        try:
-            if callable(get_scene):
-                gt = get_scene()
-            else:
-                send = getattr(self.camera, "send_command", None)
-                if not callable(send):
-                    return
-                gt = send("/api/scene_parts", {})
-        except Exception as exc:
-            log.warning(f"[USD-snap] scene_parts fetch failed: {exc}")
-            return
-        if not isinstance(gt, dict) or not gt.get("parts"):
-            log.info("[USD-snap] No USD ground-truth parts available "
-                     "— skipping snap")
-            return
-
-        usd_parts = gt["parts"]
-        snap_radius = float(
-            self.config.get("execution", {}).get(
-                "usd_grasp_snap_radius", 0.10))
-
-        # ── Bin-bounds filter ───────────────────────────────────
-        # Reject USD prims whose XY lies OUTSIDE the bin's AABB
-        # before they enter the snap candidate pool. Without this
-        # guard, a part that has fallen out of the bin (or was never
-        # spawned inside) sits at a far-away XY in USD; perception
-        # might detect a similarly-typed part inside the bin, but
-        # the snap matches it to the OUT-OF-BIN prim because it
-        # happens to be the closest one of that type. Result: the
-        # gripper is sent to wherever the lost part is now — often
-        # well outside the bin compartment, which is what the
-        # operator just observed in the screenshot.
-        #
-        # The bin AABB comes from the cached Phase-0 bin_lookup info
-        # (with a small expansion so prims sitting on the bin rim
-        # aren't excluded). If the bounds aren't available we fall
-        # back to no filter — same behaviour as before.
-        bin_bounds = self._get_bin_bounds_xy(margin=0.05)
-        if bin_bounds is not None:
-            x_min, y_min, x_max, y_max = bin_bounds
-            log.info(
-                f"[USD-snap] Bin XY bounds (with 5 cm margin): "
-                f"X=[{x_min:.3f}, {x_max:.3f}]  "
-                f"Y=[{y_min:.3f}, {y_max:.3f}]")
-            in_bin = []
-            out_of_bin = []
-            for p in usd_parts:
-                cxyz = p.get("center_xyz") or [0, 0, 0]
-                ux, uy = float(cxyz[0]), float(cxyz[1])
-                if x_min <= ux <= x_max and y_min <= uy <= y_max:
-                    in_bin.append(p)
-                else:
-                    out_of_bin.append(p)
-            if out_of_bin:
-                names = ", ".join(
-                    p.get("name", "?") for p in out_of_bin[:5])
-                log.info(
-                    f"[USD-snap] Excluded {len(out_of_bin)} USD prim(s) "
-                    f"OUTSIDE bin XY bounds (would have caused the "
-                    f"gripper to grasp parts that fell out of the "
-                    f"bin): {names}"
-                    + (" …" if len(out_of_bin) > 5 else ""))
-            usd_parts = in_bin
-        else:
-            log.info(
-                "[USD-snap] Bin AABB not available — proceeding "
-                "without bin-bounds filter (snap may pick prims "
-                "outside the bin if perception XY is closer to them)")
-
-        # Group USD prims by canonical part type (extracted from the
-        # prim name, e.g. ``large_gear_3_collidable`` → ``large_gear``).
-        # Order matters: more specific names first so a prim named
-        # ``motor_valve_3`` doesn't accidentally match the substring
-        # ``valve`` of a less-specific entry.
-        candidates = ("motor_valve", "large_gear",
-                      "black_hose", "black_plate", "black_plug",
-                      "small_tube", "silver_box", "silver_gun",
-                      "tube_with_clamps")
-        def _canonical_from_name(name: str) -> Optional[str]:
-            n = (name or "").lower()
-            for c in candidates:
-                if c in n:
-                    return c
-            return None
-
-        usd_by_type: Dict[str, List[dict]] = {}
-        for p in usd_parts:
-            ct = _canonical_from_name(p.get("name", ""))
-            if ct:
-                usd_by_type.setdefault(ct, []).append(p)
-
-        snapped = 0
-        skipped_no_match = 0
-        skipped_too_far = 0
-        for obj in scene.get("detected_objects", []):
-            label = (obj.get("label") or "").lower()
-            label_base = _re.sub(r"_\d+$", "", label).strip()
-            if label_base in ("kitting_tray", "tray", "blue_bin", "bin"):
-                continue
-            usd_pool = usd_by_type.get(label_base, [])
-            if not usd_pool:
-                skipped_no_match += 1
-                continue
-
-            pos = obj.get("approximate_position") or {}
-            try:
-                px = float(pos.get("x"))
-                py = float(pos.get("y"))
-                pz = float(pos.get("z"))
-            except (TypeError, ValueError):
-                continue
-
-            best = None
-            best_dist = float("inf")
-            for u in usd_pool:
-                cxyz = u.get("center_xyz") or [0, 0, 0]
-                ux, uy = float(cxyz[0]), float(cxyz[1])
-                d = ((ux - px) ** 2 + (uy - py) ** 2) ** 0.5
-                if d < best_dist:
-                    best_dist = d
-                    best = u
-            if best is None or best_dist > snap_radius:
-                skipped_too_far += 1
-                log.info(
-                    f"[USD-snap] '{label}' at ({px:.3f}, {py:.3f}) "
-                    f"— closest USD '{label_base}' is "
-                    f"{best_dist*100:.1f} cm away (> "
-                    f"{snap_radius*100:.0f} cm cap), keeping "
-                    f"perception coords")
-                continue
-
-            # Stash perception coords for downstream inspection,
-            # then overwrite with USD ground truth.
-            obj["_perception_position"] = {"x": px, "y": py, "z": pz}
-            usd_xyz = best["center_xyz"]
-            usd_top_z = float(best.get("top_z", usd_xyz[2]))
-            obj["approximate_position"] = {
-                "x": float(usd_xyz[0]),
-                "y": float(usd_xyz[1]),
-                # Use USD top_z as the grasp Z — it's the part's
-                # actual top surface, not the centre of mass.
-                "z": usd_top_z,
-            }
-            obj["_usd_prim_path"] = best.get("prim_path")
-            obj["_source"] = (obj.get("_source") or "") + "+usd_snap"
-            snapped += 1
-            log.info(
-                f"[USD-snap] '{label}' "
-                f"({px:.3f}, {py:.3f}, {pz:.3f}) "
-                f"→ USD '{best.get('name')}' "
-                f"({usd_xyz[0]:.3f}, {usd_xyz[1]:.3f}, {usd_top_z:.3f}) "
-                f"  shift={best_dist*100:.1f} cm")
-
-        log.info(
-            f"[USD-snap] Result: snapped={snapped}  "
-            f"skipped_no_match={skipped_no_match}  "
-            f"skipped_too_far={skipped_too_far}  "
-            f"(snap_radius={snap_radius*100:.0f} cm)")
 
     def _log_perception_metrics(self, scene: dict) -> None:
         """Compare a scene scan against USD ground truth and record metrics.

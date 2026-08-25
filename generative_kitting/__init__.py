@@ -12,5 +12,5 @@ Three-layer architecture:
     3. Execution Layer   — Deterministic robot control via Isaac Sim
 """
 
-__version__ = "0.1.0"
+__version__ = "2.0.1"
 __author__ = "Parth"

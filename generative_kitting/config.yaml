@@ -4,9 +4,9 @@
 
 simulation:
   usd_scene_path: "${PROJECT_ROOT}/AIKIDO.usd"
-  robot_prim_path: "/World"
-  ur10_base_path: "/World/gantry_home/ur10_flattened/ur10_instanceable/base_link"
-  ee_path: "/World/gantry_home/ur10_flattened/ur10_instanceable/ee_link"
+  robot_prim_path: "/World/gantry"
+  ur10_base_path: "/World/gantry/gantry_home/ur10_flattened/ur10_instanceable/base_link"
+  ee_path: "/World/gantry/gantry_home/ur10_flattened/ur10_instanceable/ee_link"
   camera_prim_path: "/World/Camera"
   depth_camera_prim_path: "/World/rsd555/Depth"
   imu_sensor_prim_path: "/World/rsd555/Imu_Sensor"
@@ -14,25 +14,30 @@ simulation:
   rendering_dt: 0.01667        # 1/60
 
   # Gantry configuration
-  gantry_x_joint: "gantry_vagn_joint"
+  gantry_x_joint: "/World/gantry/gantry_home/vagn/gantry_vagn_joint"
   gantry_x_offset: 1.27
 
-  # URDF/YAML paths for Lula IK solver. Resolved from ISAACSIM_PATH so
-  # any operator can run the project by pointing that env var at their
-  # own Isaac Sim install (see .env.example).
-  urdf_path: "${ISAACSIM_PATH}/exts/isaacsim.asset.importer.urdf/data/urdf/robots/ur10/urdf/ur10.urdf"
-  # Isaac Sim 6.0 moved motion_generation into extsDeprecated/ (the URDF
-  # importer stayed in exts/). The bridge resolves this automatically; this
-  # path is used by the in-process robot_controller fallback.
-  yaml_path: "${ISAACSIM_PATH}/extsDeprecated/isaacsim.robot_motion.motion_generation/motion_policy_configs/universal_robots/ur10/rmpflow/ur10_robot_description.yaml"
+  # ── cuMotion robot description ──────────────────────────────
+  # Directory holding the URDF + XRDF + meshes/, exported from Isaac
+  # Sim. The XRDF `cspace:` block defines the planned joints and their
+  # order, and its `geometry:` spheres are the robot's own collision
+  # model — the planner's idea of the arm comes from here, not the USD.
+  # The bridge keeps its own copy of these names (it runs standalone in
+  # the Script Editor and does not read this file).
+  robot_config_path: "${ROBOT_CONFIG_PATH}"
+  robot_urdf_filename: "AIKIDO.urdf"
+  robot_xrdf_filename: "AIKIDO.xrdf"
+  # Tool frame cuMotion plans for. Poses are converted from the TCP
+  # target using execution.gripper_tcp_offset before planning.
+  cumotion_tool_frame: "robotiq_base_link"
 
   # Gripper finger prim paths (Robotiq 2F-140)
   gripper_finger_paths:
-    - "/World/gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/left_inner_finger"
-    - "/World/gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/right_inner_finger"
-    - "/World/gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/left_outer_finger"
-    - "/World/gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/right_outer_finger"
-    - "/World/gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/robotiq_base_link"
+    - "/World/gantry/gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/left_inner_finger"
+    - "/World/gantry/gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/right_inner_finger"
+    - "/World/gantry/gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/left_outer_finger"
+    - "/World/gantry/gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/right_outer_finger"
+    - "/World/gantry/gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/robotiq_base_link"
   box_prim_path: "/World/robot_facade_full"
 
   # ── Wrist-scan pipeline (current approach) ─────────────────────
@@ -90,15 +95,13 @@ perception:
       model: "gemma4:e4b"
       base_url: "${OLLAMA_BASE_URL}"
 
-    - name: "Qwen3-VL 8B (fallback)"
-      provider: "ollama_qwen"
-      model: "qwen3-vl:8b"
-      base_url: "${OLLAMA_BASE_URL}"
-
-    - name: "Qwen3-VL 30B (fallback)"
-      provider: "ollama_qwen"
-      model: "qwen3-vl:30b"
-      base_url: "${OLLAMA_BASE_URL}"
+    # vLLM serves models under their HuggingFace repo id — this must
+    # match the --model / --served-model-name the server was started
+    # with, or the request 404s with "model not found".
+    - name: "Qwen3-VL (vLLM)"
+      provider: "vllm"
+      model: "Qwen/Qwen3-VL"
+      base_url: "${VLLM_BASE_URL}"
 
   # ── Zero-Shot Detector (precise bounding boxes — replaces VLM coord guesses) ──
   # detector_url: "${DETECTOR_BASE_URL}"  # set DETECTOR_BASE_URL in .env to use a remote detector
@@ -200,35 +203,6 @@ perception:
   # robot where USD ground truth is unavailable.
   wrist_xy_refinement_informational_only: false
 
-  # ── USD ground-truth snap for grasp targets ──
-  # The overhead RGB-D projection is internally self-consistent
-  # (round-trip pixel error <2 px) but the OWL-ViT2 bbox centre is
-  # imprecise — at the camera's typical ~5 m height a 5-10 px
-  # bbox-centring error translates to 1-3 cm world XY drift, and
-  # for parts with holes (gears, washers) the bbox centre often
-  # lands on the hole, biasing the depth median and shifting XY
-  # further. The misalignment shows up BEFORE realignment because
-  # it's baked into the Phase 2 detection.
-  #
-  # When this flag is true, the workflow looks up each detected
-  # object's actual world position from the USD scene and SNAPS
-  # the perception XY to the matching prim's centre. Perception
-  # still runs end-to-end (catalogue grounding, OWL-ViT2 bbox,
-  # depth projection) and the evaluation module continues to
-  # record raw perception accuracy as ``mean_grounding_error_mm``
-  # — the snap only changes what the GRASP uses, not what gets
-  # logged for thesis evaluation.
-  #
-  # Default true for sim-only demos. Set false to grasp from raw
-  # perception (drives bigger XY misalignment in the gripper but
-  # represents true real-robot performance).
-  use_usd_grasp_targets: true
-  # Maximum XY distance (metres) between a detected object and a
-  # USD prim of the same part type for the snap to apply. Beyond
-  # this radius the perception coords are kept (the snap might
-  # otherwise grab a wrong prim if multiple instances of the same
-  # type sit close together).
-  usd_grasp_snap_radius: 0.10
 
   # ── Realignment frame: gripper-over-part vs camera-over-part ──
   # The wrist projection returns the part's WORLD XY (already
@@ -310,43 +284,18 @@ perception:
   # abort based on the wrist VLM.
   wrist_verify_min_confidence: 0.7
 
-  # ── Per-instance Qwen crop-and-zoom refinement (Qwen-only path) ──
-  # After the first-pass scene grounding returns rough bboxes, crop a
-  # 2x area around each detection and re-query Qwen with a single-
-  # instance grounding prompt ("Outline the position of the {label}").
-  # Qwen3-VL's RefCOCO-trained pathway is far more precise when there
-  # is exactly one target in view. Costs N extra Qwen calls per scan
-  # (~30-60 s each on Ollama for 8B), so default is OFF. Enable when
-  # multi-instance grounding is loose / boxes drift / instances cluster.
-  refine_with_crop_zoom: true
 
-  # ── Depth Estimation (fallback when bridge depth buffer unavailable) ──
-  # NOTE: the bridge's /api/project_to_world reads the camera prim's
-  # actual world transform from USD on every call — these values are
-  # NO LONGER USED for production depth projection. They remain only
-  # as fallback constants for the legacy DepthEstimator class which
-  # the workflow does not currently invoke. To verify the camera
-  # height the bridge actually uses, look for the line
-  #   "[project] Camera world pos: (X, Y, Z)"
-  # in the Isaac Sim console — the Z value is what matters.
-  depth_method: "geometric"            # "geometric" (no ML) or "depth_anything" (Depth Anything V2)
-  camera_height_m: 5.10                # legacy; bridge uses USD prim transform instead
-  camera_fov_h_deg: 60.0               # legacy; bridge reads focal_length + aperture from USD
-  camera_resolution: [1920, 1080]      # overhead camera resolution
-  # Image-axis sign overrides for the bridge's depth projection.
-  # Set to -1 to flip an axis if the camera was placed in USD with a
-  # non-standard rotation that mirrors detected world coords. Default
-  # +1 = OpenGL convention. After running once, check the bridge log
-  # for "Camera basis in world:" — if `up (+Y_cam)` points OPPOSITE
-  # to world +Y when the image-up corresponds to world +Y, set
-  # camera_image_y_sign: -1.
-  camera_image_x_sign: 1               # flip image X axis (-1 to mirror)
-  camera_image_y_sign: 1               # flip image Y axis (-1 to mirror)
-  workspace_surface_z: 0.02            # Z height of bin surface where parts sit (metres)
-  tray_surface_z: 0.02                 # Z height of kitting tray surface (geometric fallback)
-                                       # Adjust if tray sits higher/lower than parts bin
-  camera_world_x: 0.0                  # camera world X position (metres)
-  camera_world_y: 0.0                  # camera world Y position (metres)
+  # ── Camera parameters ──
+  # There are none here by design. Every intrinsic and extrinsic comes
+  # from the Isaac Sim API at call time: focal length + apertures from
+  # the USD camera prim, pose from its live world transform, resolution
+  # from the render product. If the prim's optics are invalid the bridge
+  # raises instead of substituting a guess, so a misconfigured camera
+  # fails loudly rather than silently projecting to the wrong place.
+
+  # Kitting-tray surface Z (metres). Used to override the projected Z
+  # when placing, since the tray sits on a different plane to the bin.
+  tray_surface_z: 0.02
 
 # ─── Orchestration (LLM) ────────────────────────────────────
 orchestration:
@@ -358,7 +307,7 @@ orchestration:
   llm_provider: "ollama_gemma"        # Active provider (overridden by UI model selection)
   llm_model: "gemma4:e4b"             # Active model  (overridden by UI model selection)
   llm_api_key_env: "OPENAI_API_KEY"
-  llm_base_url: "${OLLAMA_BASE_URL:-http://localhost:11434}"   # Active endpoint
+  llm_base_url: "${OLLAMA_BASE_URL}"   # Active endpoint
   max_retries: 3
   temperature: 0.0                    # Zero temperature for deterministic planning
   max_tokens: 4096
@@ -372,17 +321,20 @@ orchestration:
     - name: "Gemma4 2B"
       provider: "ollama_gemma"
       model: "gemma4:e2b"
-      base_url: "${OLLAMA_BASE_URL:-http://localhost:11434}"
+      base_url: "${OLLAMA_BASE_URL}"
 
     - name: "Gemma4 4B"
       provider: "ollama_gemma"
       model: "gemma4:e4b"
-      base_url: "${OLLAMA_BASE_URL:-http://localhost:11434}"
+      base_url: "${OLLAMA_BASE_URL}"
 
-    - name: "Llama 3.1 8B (fallback)"
-      provider: "ollama_llama"
-      model: "llama3.1:8b"
-      base_url: "${OLLAMA_BASE_URL:-http://localhost:11434}"
+    # vLLM serves models under their HuggingFace repo id — this must
+    # match the --model / --served-model-name the server was started
+    # with, or the request 404s with "model not found".
+    - name: "Qwen3-VL (vLLM)"
+      provider: "vllm"
+      model: "Qwen/Qwen3-VL"
+      base_url: "${VLLM_BASE_URL}"
 
 # ─── Execution ───────────────────────────────────────────────
 execution:
@@ -510,7 +462,7 @@ execution:
   # the FULL perception pipeline (VLM + OWL-ViT2). This one uses
   # only a focused single-target VLM prompt — cheaper, simpler,
   # and shows the geometry math explicitly.
-  close_range_rescan_xy: true
+  close_range_rescan_xy: false
   # Reject rescan corrections beyond this radius (5 cm default).
   # Larger shifts almost always mean the wrist VLM picked a
   # neighbour part instead of the centre-most planned target;

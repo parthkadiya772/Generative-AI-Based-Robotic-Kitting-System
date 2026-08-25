@@ -102,21 +102,43 @@ class TestVLMParsing:
         result = VLMPerception.parse_vlm_response(f"  \n  {VALID_RAW_JSON}  \n  ")
         assert "detected_objects" in result
 
-    def test_qwen_image_prep_resizes_to_28_multiple(self):
-        """Qwen prep snaps both dims to multiples of 28 within Qwen's
-        pixel budget so smart_resize is a no-op and bbox coords land in
-        the (W, H) we sent. Long edge cap is 1260 (45 * 28)."""
-        vlm = VLMPerception({"vlm_provider": "ollama_qwen"})
+    def test_qwen_image_is_sent_unmodified(self):
+        """Qwen3-VL handles arbitrary sizes and reports bboxes against the
+        image as sent, so no resize may happen anywhere on that path.
+
+        A resize would put the returned bboxes in a different pixel frame
+        to the one the caller measured, which is exactly the coordinate
+        drift this pipeline is built to avoid.
+        """
+        vlm = VLMPerception({"vlm_provider": "vllm",
+                             "vlm_model": "Qwen/Qwen3-VL"})
+        assert vlm._is_qwen
+
+        sent = {}
+        vlm._call_vlm = lambda image, prompt: (
+            sent.update(size=image.size) or VALID_RAW_JSON)
+
         image = Image.new("RGB", (1920, 1080), color="white")
+        vlm.analyze_scene(image)
 
-        prepared = vlm._prepare_image_for_qwen(image)
+        assert sent["size"] == (1920, 1080)
 
-        w, h = prepared.size
-        assert w % 28 == 0 and h % 28 == 0
-        assert max(w, h) <= 1260
-        # Pixel budget should stay below ~1 MP for typical 16:9.
-        assert w * h <= 1_000_000
-        assert vlm._last_qwen_image_size == (w, h)
+    def test_non_qwen_image_is_capped_for_context_budget(self):
+        """Gemma / LLaVA still get the long-edge cap — they go through
+        OWL-ViT2 for boxes, so resizing costs them no coord accuracy.
+        """
+        vlm = VLMPerception({"vlm_provider": "ollama_gemma",
+                             "vlm_model": "gemma4:e4b"})
+        assert not vlm._is_qwen
+
+        sent = {}
+        vlm._call_vlm = lambda image, prompt: (
+            sent.update(size=image.size) or VALID_RAW_JSON)
+
+        vlm.analyze_scene(Image.new("RGB", (1920, 1080), color="white"),
+                          max_size=1024)
+
+        assert max(sent["size"]) <= 1024
 
 
 # ═════════════════════════════════════════════════════════════

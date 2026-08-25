@@ -6,14 +6,29 @@ API on port 8600 that the Streamlit dashboard consumes for:
 
   GET  /api/ping          → health check + capabilities list
   GET  /api/status        → robot joint positions, DOF info, sim state
-  GET  /api/camera        → live camera frame (rgb|depth) as base64 JPEG
-  GET  /api/scene_annotations → GT per-part 3D + 2D bbox seen by camera
-  GET  /api/prim_center?prim=<path> → USD bbox centre/top/height for a prim
+  GET  /api/camera        → live camera frame (rgb|depth|wrist|kit) as
+                            base64 JPEG; caches the depth buffer from the
+                            same rendered frame for /api/project_to_world
+  GET  /api/scene_annotations → USD ground truth, EVALUATION ONLY —
+                            never used for grasp coordinates
+  GET  /api/prim_center?prim=<path> → USD bbox centre/top/height for a
+                            static fixture (bin, tray). Not for parts.
+  POST /api/plan_test      → plan one pose with AND without the collision
+                            world, to prove whether the cloud blocks it
+  POST /api/jog            → nudge one joint via apply_action only (no
+                            planner, no IK) and report if it moved
+  POST /api/verify_planner → self-test: plan to the tool's own current
+                            pose; a large joint delta means the
+                            world->robot-root transform is wrong
+  POST /api/build_collision_world → rebuild the cuMotion collision world
+                            from the 4 corner cameras (structure only)
+  POST /api/wrist_obstacles → add neighbour-part obstacles from the wrist
+                            camera, carving out the target grasp point
   POST /api/execute       → execute a list of action primitives
   POST /api/joints        → set joint positions directly
   POST /api/home          → move robot to home position
   POST /api/gripper       → open / close gripper
-  POST /api/approach      → move near a world XYZ (Lula IK)
+  POST /api/approach      → move near a world XYZ (cuMotion plan)
   POST /api/realign_gantry → slide gantry to target X while the
                              arm compensates to hold the ee_link at
                              its current world position (no swing)
@@ -31,6 +46,77 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import numpy as np
 
 # ═════════════════════════════════════════════════════════════
+# ENVIRONMENT
+#
+#   This file runs inside Isaac Sim's Script Editor — a DIFFERENT
+#   process from Streamlit, which is what normally loads .env via
+#   utils.config_loader. Without this, every os.environ.get below
+#   returns "" and anything configured through .env (notably
+#   ROBOT_CONFIG_PATH for cuMotion) silently comes up unset.
+#
+#   exec(open(...).read()) leaves __file__ undefined, so the project
+#   root is discovered by walking up from whatever anchors exist.
+# ═════════════════════════════════════════════════════════════
+
+def _load_env_file():
+    """Load <project_root>/.env into os.environ. Returns the path or None.
+
+    Existing environment variables are NOT overwritten — a real shell
+    export wins over the file, matching dotenv precedence and
+    utils.config_loader's behaviour.
+    """
+    candidates = []
+    try:
+        candidates.append(os.path.dirname(os.path.abspath(__file__)))
+    except NameError:
+        pass  # exec'd from the Script Editor — no __file__
+
+    # The open USD scene (AIKIDO.usd) lives in the project root, which
+    # makes it the most reliable anchor: Isaac Sim's cwd is usually its
+    # own install directory, nowhere near this project.
+    try:
+        import omni.usd
+        stage_url = omni.usd.get_context().get_stage_url() or ""
+        if stage_url:
+            local = stage_url.replace("file:///", "").replace("file://", "")
+            candidates.append(os.path.dirname(os.path.abspath(local)))
+    except Exception:
+        pass
+
+    candidates.append(os.environ.get("KITTING_PROJECT_ROOT", ""))
+    candidates.append(os.getcwd())
+
+    for start in candidates:
+        if not start:
+            continue
+        d = os.path.abspath(start)
+        for _ in range(6):                      # walk up a few levels
+            env_path = os.path.join(d, ".env")
+            if os.path.isfile(env_path):
+                for raw in open(env_path, encoding="utf-8").read().splitlines():
+                    line = raw.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, _, value = line.partition("=")
+                    os.environ.setdefault(key.strip(), value.strip().strip('"\''))
+                return env_path
+            parent = os.path.dirname(d)
+            if parent == d:
+                break
+            d = parent
+    return None
+
+
+_ENV_FILE = _load_env_file()
+if _ENV_FILE:
+    print(f"[env] loaded {_ENV_FILE}")
+else:
+    print("[env] WARNING: no .env found — ROBOT_CONFIG_PATH and friends "
+          "must be set as real environment variables, or cuMotion will "
+          "not initialise")
+
+
+# ═════════════════════════════════════════════════════════════
 # CONFIGURATION (mirrors the constants in robot_control.py)
 # ═════════════════════════════════════════════════════════════
 
@@ -40,7 +126,7 @@ import numpy as np
 # subnet call /api/execute, so the safe default is 127.0.0.1.
 BRIDGE_HOST = os.environ.get("BRIDGE_HOST", "127.0.0.1")
 BRIDGE_PORT = int(os.environ.get("BRIDGE_PORT", "8600"))
-ROBOT_PRIM  = "/World"
+ROBOT_PRIM  = "/World/gantry"
 
 # Dual cameras
 CAMERA_RGB_PRIM   = "/World/Camera"
@@ -53,8 +139,8 @@ CAMERA_KIT_PRIM   = "/World/Camera_Kit"
 IMU_PRIM          = "/World/rsd555/Imu_Sensor"
 
 # Robot geometry
-UR10_BASE_PATH = "/World/gantry_home/ur10_flattened/ur10_instanceable/base_link"
-EE_PATH        = "/World/gantry_home/ur10_flattened/ur10_instanceable/ee_link"
+UR10_BASE_PATH = "/World/gantry/gantry_home/ur10_flattened/ur10_instanceable/base_link"
+EE_PATH        = "/World/gantry/gantry_home/ur10_flattened/ur10_instanceable/ee_link"
 PLACE_BOX_PATH = "/World/box_840"
 
 # Contact sensors — TWO of them, used for different phases.
@@ -80,35 +166,8 @@ PLACE_BOX_PATH = "/World/box_840"
 # The collider with ``CollisionAPI`` lives one level deeper on the
 # actual ``Mesh`` prims. Both sensor paths below point INTO those
 # mesh prims so the sensor finds its CollisionAPI parent.
-CONTACT_SENSOR_PRIM     = "/World/gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/left_inner_finger/Fingertip_01/Fingertip/Contact_Sensor"
+CONTACT_SENSOR_PRIM     = "/World/gantry/gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/left_inner_finger/Fingertip_01/Fingertip/Contact_Sensor"
 CONTACT_SENSOR_TIP_PRIM = CONTACT_SENSOR_PRIM
-
-# URDF / YAML for Lula IK. Resolved from the ISAACSIM_PATH env var so
-# the bridge runs on any operator's machine (Windows / Linux / Mac)
-# without editing this file. Set ISAACSIM_PATH to the root of your
-# Isaac Sim install (the directory containing `exts/`). os.path.join
-# keeps the separator OS-correct.
-_ISAACSIM_PATH = os.environ.get("ISAACSIM_PATH", "")
-
-
-def _resolve_ext_dir(ext_name):
-    """Return the ext directory for ``ext_name``, checking both ``exts``
-    and ``extsDeprecated``. Isaac Sim 6.0 moved several bundled exts (e.g.
-    ``isaacsim.robot_motion.motion_generation``) into ``extsDeprecated``."""
-    for _sub in ("exts", "extsDeprecated"):
-        _cand = os.path.join(_ISAACSIM_PATH, _sub, ext_name)
-        if os.path.isdir(_cand):
-            return _cand
-    return os.path.join(_ISAACSIM_PATH, "exts", ext_name)
-
-
-URDF_PATH = os.path.join(
-    _resolve_ext_dir("isaacsim.asset.importer.urdf"),
-    "data", "urdf", "robots", "ur10", "urdf", "ur10.urdf")
-YAML_PATH = os.path.join(
-    _resolve_ext_dir("isaacsim.robot_motion.motion_generation"),
-    "motion_policy_configs", "universal_robots", "ur10", "rmpflow",
-    "ur10_robot_description.yaml")
 
 # HOME_JOINTS is captured from the USD scene at startup (see _init_robot).
 # The robot is ceiling-mounted on the gantry — the correct rest pose depends
@@ -116,7 +175,7 @@ YAML_PATH = os.path.join(
 HOME_JOINTS = None  # set by _init_robot()
 
 # Gantry
-GANTRY_X_JOINT  = "gantry_vagn_joint"
+GANTRY_X_JOINT  = "/World/gantry/gantry_home/vagn/gantry_vagn_joint"
 GANTRY_X_OFFSET = 1.27
 
 # Gripper / finger joints
@@ -316,67 +375,1163 @@ def set_finger_joints(robot, dof_names, value, base_targets=None):
     return targets
 
 
-def ik_solve(lula_solver, frame, pos, ori, warm):
-    action, ok = lula_solver.compute_inverse_kinematics(
-        frame_name=frame, target_position=pos,
-        target_orientation=ori, warm_start=warm)
-    if ok:
-        action = _clamp_shoulder_pan(action)
-    return action, ok
-
-
-# ── Shoulder-Pan Safety Clamp (asymmetric) ─────────────────
-# The robot is ceiling-mounted on a gantry rail (along X). Lula
-# IK has no collision awareness of the gantry structure, so it
-# can find solutions where the arm swings THROUGH the red gantry
-# rail. We constrain shoulder_pan (joint 0) with an ASYMMETRIC
-# range: tight on the gantry-rail side, loose on the open side.
-# This preserves enough workspace for far-corner picks (which
-# need ~1.9 rad on the open side) while preventing rotation past
-# the rail on the gantry side.
+# ═════════════════════════════════════════════════════════════
+# COLLISION WORLD  (4-camera point cloud → cuMotion sphere colliders)
 #
-#   shoulder_pan = 0 rad → arm hangs straight down (home)
-#   shoulder_pan > 0    → arm rotates one way
-#   shoulder_pan < 0    → arm rotates the other way
+#   Four corner cameras render Replicator "pointcloud" annotators. The
+#   merged cloud is voxel-downsampled and fed to cuMotion as spheres,
+#   one per voxel, radius = voxel/2 so the set is watertight.
 #
-# >>> WHICH SIGN IS THE GANTRY SIDE? <<<
-# If the arm collides with the rail when reaching some target:
-#   1. Look at the [IK SAFETY] log line on the run that collided.
-#      If shoulder_pan was POSITIVE near +2.3562, the gantry is on
-#      the + side → swap the signs of the two constants below.
-#      If shoulder_pan was NEGATIVE near -2.3562, the gantry is on
-#      the - side → leave as-is.
-#   2. Re-run; the clamp now fires on the gantry side.
-# A wrong guess locks IK on the safe side instead — easy to spot
-# (every approach fails IK), trivial to flip.
+#   Points near known grasp targets are carved out: an obstacle sitting
+#   on the grasp point makes the pick unplannable by construction. The
+#   targets come from the perception pipeline (camera + depth), so this
+#   path involves no USD lookup at all.
 #
-# Initial guess: gantry on the NEGATIVE side. Tight = -π/2 (1.57 rad);
-# loose = +3π/4 (2.36 rad). Last week's working config was symmetric
-# ±π/2; the symmetric +3π/4 broke the guard. Asymmetric splits the
-# difference: full reach on the open side, original guard on the
-# gantry side.
+#   Local awareness of neighbouring parts comes later, from the wrist
+#   camera at standoff height — see _add_wrist_obstacles().
+# ═════════════════════════════════════════════════════════════
 
-SHOULDER_PAN_MIN = -1.5708   # tight: -π/2 (assumed gantry-side limit)
-SHOULDER_PAN_MAX =  2.3562   # loose: +3π/4 (open-side limit)
+POINTCLOUD_CAMERAS = {
+    "/World/pointcloud_view/cam1": (480, 640),
+    "/World/pointcloud_view/cam2": (480, 640),
+    "/World/pointcloud_view/cam3": (480, 640),
+    "/World/pointcloud_view/cam4": (480, 640),
+}
+
+COLLISION_VOXEL_SIZE = 0.02       # 2 cm — trades fidelity for sphere count
+COLLISION_MAX_SPHERES = 6000      # hard cap; planner cost grows with count
+COLLISION_SAFETY_MARGIN = 0.005   # 5 mm inflation on every obstacle
+# Radius of the XY cylinder cleared around each known grasp target so
+# the part being picked never becomes its own obstacle.
+TARGET_CARVE_RADIUS = 0.06
+
+_pc_annotators = {}               # cam_path -> replicator annotator
 
 
-def _clamp_shoulder_pan(ik_result):
-    """Clamp shoulder_pan joint in IK result to prevent gantry collision.
+def _voxel_downsample(points, voxel_size):
+    """Keep one point per occupied voxel."""
+    if len(points) == 0:
+        return points
+    keys = np.floor(points / voxel_size).astype(np.int64)
+    _, idx = np.unique(keys, axis=0, return_index=True)
+    return points[idx]
 
-    Logs whenever the clamp fires and records which side hit the limit
-    so the operator can confirm which sign is the gantry side.
+
+async def _capture_pointcloud(cameras=None, ticks=5):
+    """Render the corner cameras and return merged world-frame points (N,3).
+
+    Replicator's ``pointcloud`` annotator already returns WORLD-frame
+    points, so no camera transform is applied here.
     """
-    clamped = np.array(ik_result, dtype=np.float64)
-    # Joint 0 in Lula's 6-joint result is shoulder_pan
-    if len(clamped) > 0:
-        original = clamped[0]
-        clamped[0] = np.clip(clamped[0], SHOULDER_PAN_MIN, SHOULDER_PAN_MAX)
-        if abs(original - clamped[0]) > 0.01:
-            side = "MIN(gantry?)" if original < SHOULDER_PAN_MIN else "MAX(open?)"
-            print(f"  [IK SAFETY] shoulder_pan clamped: {original:.3f} → "
-                  f"{clamped[0]:.3f} rad  hit={side}  "
-                  f"limits=[{SHOULDER_PAN_MIN:+.3f}, {SHOULDER_PAN_MAX:+.3f}]")
-    return clamped
+    import omni.replicator.core as rep
+    import omni.usd
+
+    cameras = cameras or POINTCLOUD_CAMERAS
+    stage = omni.usd.get_context().get_stage()
+
+    for cam_path, res in cameras.items():
+        if cam_path in _pc_annotators:
+            continue
+        if not stage.GetPrimAtPath(cam_path).IsValid():
+            print(f"  [pcd] missing camera prim: {cam_path}")
+            continue
+        rp = rep.create.render_product(cam_path, res)
+        annot = rep.AnnotatorRegistry.get_annotator(
+            "pointcloud", init_params={"includeUnlabelled": True})
+        annot.attach(rp)
+        _pc_annotators[cam_path] = annot
+        print(f"  [pcd] attached annotator to {cam_path} @ {res}")
+
+    if not _pc_annotators:
+        return np.empty((0, 3))
+
+    for _ in range(ticks):
+        await rep.orchestrator.step_async()
+
+    clouds = []
+    for cam_path, annot in _pc_annotators.items():
+        data = annot.get_data()
+        if not data or "data" not in data or len(data["data"]) == 0:
+            print(f"  [pcd] {cam_path}: empty buffer")
+            continue
+        pts = np.asarray(data["data"]).reshape(-1, 3)
+        # Replicator emits (0,0,0) for rays that hit nothing (skybox).
+        pts = pts[np.linalg.norm(pts, axis=1) > 0.01]
+        if len(pts):
+            clouds.append(pts)
+            print(f"  [pcd] {cam_path}: {len(pts)} points")
+
+    if not clouds:
+        return np.empty((0, 3))
+    merged = np.vstack(clouds)
+    lo, hi = merged.min(axis=0), merged.max(axis=0)
+    print(f"  [pcd] merged world extent: "
+          f"x[{lo[0]:+.2f}, {hi[0]:+.2f}]  "
+          f"y[{lo[1]:+.2f}, {hi[1]:+.2f}]  "
+          f"z[{lo[2]:+.2f}, {hi[2]:+.2f}]  ({len(merged)} pts)")
+    return merged
+
+
+def _carve_around_points(points, targets, radius):
+    """Remove cloud points near known grasp targets.
+
+    Returns ``(kept, n_removed)``.
+
+    The parts we intend to pick must NOT become collision geometry — a
+    sphere sitting on the grasp point makes the pick unplannable by
+    construction. ``targets`` are the world XYZ the perception pipeline
+    already produced from camera + depth, so this needs no USD lookup
+    and no bin bounding box.
+
+    Carving is by XY cylinder rather than a sphere: the gripper descends
+    vertically, so the whole column above a part has to stay clear.
+    """
+    if len(points) == 0 or not targets:
+        return points, 0
+    tgt = np.asarray(targets, dtype=np.float64)[:, :2]
+    d = np.linalg.norm(points[:, None, :2] - tgt[None, :, :], axis=2)
+    near = (d <= radius).any(axis=1)
+    return points[~near], int(near.sum())
+
+
+def _spheres_from_points(points, prefix, radius, margin=COLLISION_SAFETY_MARGIN):
+    """Push one sphere collider per point into the cuMotion world."""
+    import warp as wp
+
+    n = len(points)
+    if n == 0:
+        return 0
+
+    prim_paths = [f"{prefix}/{i}" for i in range(n)]
+    with wp.ScopedDevice(STATE.cumotion_device):
+        radii = wp.array(np.full(n, radius, dtype=np.float32), dtype=wp.float32)
+        scales = wp.array(np.ones((n, 3), dtype=np.float32), dtype=wp.vec3)
+        tols = wp.array(np.full(n, margin, dtype=np.float32), dtype=wp.float32)
+        positions = wp.array(points.astype(np.float32), dtype=wp.vec3)
+        quats = wp.array(
+            np.tile([1.0, 0.0, 0.0, 0.0], (n, 1)).astype(np.float32), dtype=wp.vec4)
+        enabled = wp.array(np.ones(n, dtype=np.int32), dtype=wp.int32)
+
+    STATE.cumotion_world.add_spheres(
+        prim_paths=prim_paths, radii=radii, scales=scales,
+        safety_tolerances=tols, poses=(positions, quats),
+        enabled_array=enabled)
+    return n
+
+
+async def _plan_test(params=None):
+    """Plan the same pose twice: with the collision world, and without.
+
+    Answers one question directly — is the point cloud what is blocking
+    the planner? A temporary EMPTY world + planner is built for the
+    second attempt, so the live collision world is left untouched.
+
+    The usual culprit is the robot itself: the corner cameras see the
+    arm, so its geometry ends up in the cloud, and the robot's own XRDF
+    spheres then overlap those obstacles. cuMotion reports the START
+    configuration as in-collision and every plan fails, including
+    trivial ones.
+
+    Params:
+        position / orientation: target pose. Defaults to the tool's own
+            current pose lifted by ``lift`` metres.
+        lift: default 0.15
+    """
+    import omni.usd
+    from isaacsim.robot_motion.cumotion import (CumotionWorldInterface,
+                                                GraphBasedMotionPlanner)
+
+    params = params or {}
+    if not STATE.cumotion_ready:
+        return {"error": _planner_unavailable_reason()}
+
+    stage = omni.usd.get_context().get_stage()
+    tool_mat = omni.usd.get_world_transform_matrix(
+        stage.GetPrimAtPath(TOOL_FRAME_PRIM))
+    t = tool_mat.ExtractTranslation()
+    lift = float(params.get("lift", 0.15))
+
+    ori = params.get("orientation") or normalize_quat(
+        DOWNWARD_ORIENTATION).tolist()
+    ori = np.array(ori, dtype=np.float64)
+    q0 = _current_cspace()
+    tool = np.array([float(t[0]), float(t[1]), float(t[2])])
+
+    # A reachability sweep, not a single guess. This arm is ceiling
+    # mounted, so "up" heads toward the mount and runs out of envelope;
+    # the useful workspace is BELOW. Probing several offsets shows where
+    # the boundary is instead of leaving one failure ambiguous.
+    if params.get("position"):
+        probes = [("requested", np.array(params["position"], dtype=np.float64))]
+    else:
+        probes = [
+            ("current pose (no move)", tool.copy()),
+            (f"+{lift:.2f} m Z (up, toward mount)", tool + [0, 0, lift]),
+            (f"-{lift:.2f} m Z (down, into cell)", tool + [0, 0, -lift]),
+            ("-0.50 m Z (well below)", tool + [0, 0, -0.50]),
+            ("-1.00 m Z (bin height)", tool + [0, 0, -1.00]),
+        ]
+
+    print(f"  [plan-test] tool now ({tool[0]:.3f}, {tool[1]:.3f}, {tool[2]:.3f})")
+    print(f"  [plan-test] q_start = [{', '.join(f'{v:+.3f}' for v in q0)}]")
+    if STATE.collision_sphere_count == 0:
+        print("  [plan-test] NOTE: the collision world is EMPTY, so the "
+              "with/without comparison is degenerate. Call "
+              "/api/build_collision_world first to test obstacles.")
+
+    reach = []
+    for label, tgt in probes:
+        found = STATE.cumotion_planner.plan_to_pose_target(
+            q_initial=q0, position=tgt, orientation=ori) is not None
+        reach.append({"label": label,
+                      "target": [float(v) for v in tgt],
+                      "path_found": bool(found)})
+        print(f"  [plan-test]   {label:34s} z={tgt[2]:+.3f}  "
+              f"{'PATH FOUND' if found else 'NO PATH'}")
+
+    pos = np.array(probes[1][1] if len(probes) > 1 else probes[0][1],
+                   dtype=np.float64)
+
+    # A — the live world, however many spheres it holds.
+    with_world = STATE.cumotion_planner.plan_to_pose_target(
+        q_initial=q0, position=pos, orientation=ori) is not None
+    print(f"  [plan-test] WITH obstacles    "
+          f"({STATE.collision_sphere_count} spheres): "
+          f"{'PATH FOUND' if with_world else 'NO PATH'}")
+
+    # B — a throwaway empty world, so the live one is not disturbed.
+    empty_world = CumotionWorldInterface(
+        world_to_robot_base=_robot_base_pose_arrays(),
+        device=STATE.cumotion_device)
+    empty_planner = GraphBasedMotionPlanner(
+        cumotion_robot=STATE.cumotion_robot,
+        cumotion_world_interface=empty_world,
+        tool_frame=CUMOTION_TOOL_FRAME)
+    empty_world.world_view.update()
+    without_world = empty_planner.plan_to_pose_target(
+        q_initial=q0, position=pos, orientation=ori) is not None
+    print(f"  [plan-test] WITHOUT obstacles (0 spheres): "
+          f"{'PATH FOUND' if without_world else 'NO PATH'}")
+
+    if without_world and not with_world:
+        verdict = ("The collision world is blocking the planner. Almost "
+                   "certainly the robot's own body is in the point cloud "
+                   "(the corner cameras see the arm), so the START "
+                   "configuration is in collision.")
+    elif not without_world and not with_world:
+        verdict = ("Blocked even with NO obstacles — the pose is "
+                   "unreachable or the start config is invalid. Not a "
+                   "point-cloud problem.")
+    elif with_world:
+        verdict = "Planning succeeds with obstacles; the cloud is not the blocker."
+    else:
+        verdict = "Plans with obstacles but not without — unexpected."
+    print(f"  [plan-test] {verdict}")
+
+    return {"status": "ok",
+            "target": [float(v) for v in pos],
+            "reachability": reach,
+            "with_obstacles": with_world,
+            "without_obstacles": without_world,
+            "collision_spheres": STATE.collision_sphere_count,
+            "verdict": verdict}
+
+
+async def _jog_joint(params):
+    """Nudge one joint and report whether it actually moved.
+
+    Deliberately bypasses cuMotion, trajectories and IK: it reads the
+    joint positions, adds a delta to one index, calls apply_action, ticks
+    physics, and reads back. If this does not move the robot then nothing
+    else will, and the problem is in the articulation/physics setup
+    rather than anywhere in the planning stack.
+    """
+    import omni.kit.app
+    import omni.timeline
+    from isaacsim.core.utils.types import ArticulationAction
+
+    if STATE.robot is None:
+        return {"error": "robot not initialised"}
+
+    index = int(params.get("index", 1))          # default: shoulder_pan
+    delta = float(params.get("delta", 0.2))      # rad (or m for gantry)
+    frames = int(params.get("frames", 120))
+
+    timeline = omni.timeline.get_timeline_interface()
+    playing = bool(timeline.is_playing())
+
+    q0 = np.array(STATE.robot.get_joint_positions(), dtype=np.float64)
+    if not (0 <= index < len(q0)):
+        return {"error": f"index {index} out of range (0..{len(q0)-1})"}
+
+    target = q0.copy()
+    target[index] = q0[index] + delta
+
+    name = (STATE.dof_names[index]
+            if STATE.dof_names and index < len(STATE.dof_names) else "?")
+    print(f"  [jog] timeline playing = {playing}")
+    print(f"  [jog] joint[{index}] '{name}': {q0[index]:+.4f} -> "
+          f"{target[index]:+.4f} (delta {delta:+.3f})")
+
+    STATE.robot.apply_action(ArticulationAction(joint_positions=target))
+    for _ in range(frames):
+        await omni.kit.app.get_app().next_update_async()
+
+    q1 = np.array(STATE.robot.get_joint_positions(), dtype=np.float64)
+    moved = float(q1[index] - q0[index])
+    ok = abs(moved) > abs(delta) * 0.1
+
+    print(f"  [jog] result: {q1[index]:+.4f}  (moved {moved:+.4f})  "
+          f"-> {'OK' if ok else 'DID NOT MOVE'}")
+    if not ok:
+        if not playing:
+            print("  [jog] TIMELINE IS STOPPED — press Play. apply_action "
+                  "only sets drive targets; physics must be stepping.")
+        else:
+            print("  [jog] Timeline is playing, so the drive is not "
+                  "responding: check this joint's stiffness / max force "
+                  "in the Physics Inspector (0 stiffness = no motion).")
+
+    return {"status": "ok", "moved": ok,
+            "timeline_playing": playing,
+            "joint_index": index, "joint_name": name,
+            "before": float(q0[index]), "after": float(q1[index]),
+            "delta_commanded": delta, "delta_actual": moved,
+            "all_joints_before": [float(v) for v in q0],
+            "all_joints_after": [float(v) for v in q1]}
+
+
+async def _verify_planner(params=None):
+    """Plan to the tool's CURRENT pose and report how far the goal moved.
+
+    This is the one check that validates ROBOT_ROOT_PATH. The planner
+    works in robot-root coordinates, so if that transform is wrong every
+    world-frame target is offset by the same error — silently, since
+    planning still succeeds.
+
+    Asking for the pose the tool is ALREADY at must return a goal
+    configuration equal to the current one. A large delta means the
+    world->robot-root transform is wrong; check ROBOT_ROOT_PATH against
+    the URDF's root link (``gantry``).
+    """
+    import omni.usd
+
+    if not STATE.cumotion_ready:
+        return {"error": _planner_unavailable_reason()}
+
+    stage = omni.usd.get_context().get_stage()
+    for path in (ROBOT_ROOT_PATH, TOOL_FRAME_PRIM):
+        if not stage.GetPrimAtPath(path).IsValid():
+            return {"error": f"prim not found: {path}"}
+
+    # Report every plausible root so an offset between them is visible.
+    # The URDF's root link is `gantry`, so ROBOT_ROOT_PATH should be the
+    # prim matching THAT, not an intermediate grouping Xform.
+    candidates = {}
+    for cand in ("/World/gantry", "/World/gantry/gantry_home",
+                 ROBOT_ROOT_PATH):
+        prim = stage.GetPrimAtPath(cand)
+        if prim.IsValid():
+            ct = omni.usd.get_world_transform_matrix(prim).ExtractTranslation()
+            candidates[cand] = [float(ct[0]), float(ct[1]), float(ct[2])]
+    print("  [verify] candidate root prims:")
+    for k, v in candidates.items():
+        mark = "  <- ROBOT_ROOT_PATH" if k == ROBOT_ROOT_PATH else ""
+        print(f"             {k}  ({v[0]:+.3f}, {v[1]:+.3f}, {v[2]:+.3f}){mark}")
+
+    root_mat = omni.usd.get_world_transform_matrix(
+        stage.GetPrimAtPath(ROBOT_ROOT_PATH))
+    root_t = root_mat.ExtractTranslation()
+
+    tool_mat = omni.usd.get_world_transform_matrix(
+        stage.GetPrimAtPath(TOOL_FRAME_PRIM))
+    t = tool_mat.ExtractTranslation()
+    q = tool_mat.ExtractRotationQuat()
+    imag = q.GetImaginary()
+    tool_pos = [float(t[0]), float(t[1]), float(t[2])]
+    tool_quat = [float(q.GetReal()), float(imag[0]),
+                 float(imag[1]), float(imag[2])]
+
+    q_now = _current_cspace()
+
+    # Plan straight to the tool frame (no TCP offset — we want the pose
+    # cuMotion itself reasons about).
+    path_obj = STATE.cumotion_planner.plan_to_pose_target(
+        q_initial=q_now, position=np.array(tool_pos),
+        orientation=np.array(tool_quat))
+    if path_obj is None:
+        return {"error": "planner found NO PATH to the tool's own current "
+                         "pose — ROBOT_ROOT_PATH is almost certainly wrong",
+                "robot_root": ROBOT_ROOT_PATH,
+                "robot_root_world_pos": [float(v) for v in root_t],
+                "tool_world_pos": tool_pos}
+
+    traj = _path_to_trajectory(path_obj)
+    state = traj.get_target_state(float(traj.duration))
+    goal = np.asarray(state.joints.positions).flatten()
+    indices = state.joints.position_indices
+    if indices is not None and STATE.cumotion_dof_indices:
+        by_dof = {int(d): goal[s]
+                  for s, d in enumerate(np.asarray(indices).flatten())}
+        goal = np.array([by_dof.get(d, 0.0)
+                         for d in STATE.cumotion_dof_indices])
+
+    delta = np.abs(goal - q_now)
+    max_delta = float(delta.max())
+
+    # Joint delta is NOT a valid pass/fail metric for this robot. With
+    # the gantry plus 6 arm joints the arm is redundant: a whole family
+    # of configurations reaches the same tool pose, so a sampling-based
+    # planner can legitimately return a different one. What matters is
+    # whether the ACHIEVED tool pose matches the requested one, which
+    # needs forward kinematics on the goal configuration.
+    kin = getattr(STATE.cumotion_robot, "kinematics", None)
+    fk_methods = sorted(m for m in dir(kin) if not m.startswith("_")) if kin else []
+    print(f"  [verify] kinematics API: {fk_methods}")
+
+    fk_pos = None
+    for name in ("compute_forward_kinematics", "forward_kinematics",
+                 "compute_link_pose", "link_pose", "pose", "forward"):
+        fn = getattr(kin, name, None)
+        if not callable(fn):
+            continue
+        for args in ((goal,), (goal, CUMOTION_TOOL_FRAME),
+                     (CUMOTION_TOOL_FRAME, goal)):
+            try:
+                out = fn(*args)
+            except Exception:
+                continue
+            try:
+                arr = np.asarray(
+                    out.translation if hasattr(out, "translation") else out,
+                    dtype=np.float64).flatten()
+                if arr.size >= 3:
+                    fk_pos = arr[:3]
+                    print(f"  [verify] FK via kinematics.{name}")
+                    break
+            except Exception:
+                continue
+        if fk_pos is not None:
+            break
+
+    if fk_pos is not None:
+        # FK is expressed in the ROBOT-BASE frame. Rather than lifting it
+        # to world by hand (which needs the base ROTATION, not just its
+        # translation — this arm is ceiling-mounted, so ignoring rotation
+        # produces a large bogus error), convert the REQUESTED pose into
+        # the base frame using the very function the planner uses, and
+        # compare there. Same frame on both sides, no hand-rolled maths.
+        from isaacsim.robot_motion.cumotion.impl.utils import (
+            isaac_sim_to_cumotion_pose)
+
+        pos_w2b, quat_w2b = (
+            STATE.cumotion_world.get_world_to_robot_base_transform())
+        pose_base_target = isaac_sim_to_cumotion_pose(
+            position_world_to_target=np.array(tool_pos, dtype=np.float32),
+            orientation_world_to_target=np.array(tool_quat, dtype=np.float32),
+            position_world_to_base=pos_w2b,
+            orientation_world_to_base=quat_w2b)
+
+        requested_base = None
+        for attr in ("translation", "position", "t"):
+            val = getattr(pose_base_target, attr, None)
+            if val is not None:
+                try:
+                    arr = np.asarray(
+                        val.numpy() if hasattr(val, "numpy") else val,
+                        dtype=np.float64).flatten()
+                    if arr.size >= 3:
+                        requested_base = arr[:3]
+                        break
+                except Exception:
+                    continue
+
+        if requested_base is None:
+            pos_err = None
+            ok = max_delta < 0.35
+            print(f"  [verify] could not read translation from "
+                  f"{type(pose_base_target).__name__} "
+                  f"(attrs: {[a for a in dir(pose_base_target) if not a.startswith('_')]}) "
+                  f"— falling back to joint delta")
+        else:
+            # We do not know for certain whether the FK binding reports in
+            # the base frame or already in world. Measure against both and
+            # take the smaller — the frame it is actually in will match to
+            # sub-millimetre, the other will be off by the base offset.
+            err_base = float(np.linalg.norm(fk_pos - requested_base))
+            err_world = float(np.linalg.norm(fk_pos - np.array(tool_pos)))
+            frame = "base" if err_base <= err_world else "world"
+            pos_err = min(err_base, err_world)
+            ok = pos_err < 0.005
+
+            print(f"  [verify] requested (base frame)  ({requested_base[0]:+.4f}, "
+                  f"{requested_base[1]:+.4f}, {requested_base[2]:+.4f})")
+            print(f"  [verify] requested (world frame) ({tool_pos[0]:+.4f}, "
+                  f"{tool_pos[1]:+.4f}, {tool_pos[2]:+.4f})")
+            print(f"  [verify] FK of goal config       ({fk_pos[0]:+.4f}, "
+                  f"{fk_pos[1]:+.4f}, {fk_pos[2]:+.4f})")
+            print(f"  [verify] error vs base = {err_base*1000:8.2f} mm")
+            print(f"  [verify] error vs world= {err_world*1000:8.2f} mm")
+            print(f"  [verify] FK appears to report in the {frame.upper()} frame")
+            print(f"  [verify] POSITION ERROR = {pos_err*1000:.2f} mm -> "
+                  f"{'PASS' if ok else 'FAIL'}")
+    else:
+        pos_err = None
+        ok = max_delta < 0.35
+        print("  [verify] no usable FK binding; falling back to joint delta. "
+              "Redundancy makes this only a rough check.")
+
+    print(f"  [verify] robot_root={ROBOT_ROOT_PATH} at "
+          f"({root_t[0]:.3f}, {root_t[1]:.3f}, {root_t[2]:.3f})")
+    print(f"  [verify] tool world pos ({tool_pos[0]:.3f}, "
+          f"{tool_pos[1]:.3f}, {tool_pos[2]:.3f})")
+    print(f"  [verify] max |dq| = {max_delta:.4f} (informational: the arm is "
+          f"redundant, so a different config for the same pose is normal)")
+
+    return {"status": "ok", "passed": ok,
+            "position_error_m": pos_err,
+            "kinematics_api": fk_methods,
+            "max_joint_delta": max_delta,
+            "joint_delta": [float(v) for v in delta],
+            "robot_root": ROBOT_ROOT_PATH,
+            "robot_root_world_pos": [float(v) for v in root_t],
+            "root_candidates": candidates,
+            "tool_world_pos": tool_pos,
+            "collision_spheres": STATE.collision_sphere_count}
+
+
+async def _build_collision_world(params=None):
+    """Rebuild the collision world from the 4 corner cameras.
+
+    Params:
+        voxel_size: grid size for downsampling (default 2 cm)
+        exclude_points: [[x, y, z], ...] world coords of parts to be
+            picked. An XY cylinder of ``carve_radius`` is cleared around
+            each so the target never becomes its own obstacle.
+        carve_radius: cylinder radius in metres (default 6 cm)
+
+    Call once per scan cycle, after perception, before planning the pick.
+    """
+    params = params or {}
+    if STATE.cumotion_world is None and not _init_cumotion():
+        return {"error": "cuMotion not initialised"}
+
+    voxel = float(params.get("voxel_size", COLLISION_VOXEL_SIZE))
+
+    raw = await _capture_pointcloud()
+    if len(raw) == 0:
+        return {"error": "no point cloud data from any camera"}
+
+    targets = params.get("exclude_points") or []
+    carve_r = float(params.get("carve_radius", TARGET_CARVE_RADIUS))
+    kept, n_carved = _carve_around_points(raw, targets, carve_r)
+    voxels = _voxel_downsample(kept, voxel)
+
+    if len(voxels) > COLLISION_MAX_SPHERES:
+        keep = np.random.default_rng(0).choice(
+            len(voxels), COLLISION_MAX_SPHERES, replace=False)
+        print(f"  [pcd] capping {len(voxels)} → {COLLISION_MAX_SPHERES} spheres")
+        voxels = voxels[keep]
+
+    # Fresh world each rebuild — cuMotion has no per-prefix removal.
+    _reset_cumotion_world()
+    n = _spheres_from_points(voxels, "/collision/structure", voxel / 2.0)
+    STATE.cumotion_world.world_view.update()
+    STATE.collision_sphere_count = n
+
+    print(f"  [pcd] collision world: {len(raw)} raw → {n_carved} carved around "
+          f"{len(targets)} target(s) @ {carve_r*100:.0f}cm "
+          f"→ {len(voxels)} voxels @ {voxel*100:.0f}cm → {n} spheres")
+    if not targets:
+        print("  [pcd] NOTE: no exclude_points given — every part in the bin "
+              "is an obstacle, so grasp poses will not plan. Pass the "
+              "detected part coordinates.")
+    return {"status": "ok", "raw_points": int(len(raw)),
+            "carved": n_carved, "targets": len(targets),
+            "carve_radius": carve_r, "spheres": n,
+            "voxel_size": voxel}
+
+
+async def _add_wrist_obstacles(params):
+    """Add neighbour-part obstacles from the wrist camera at standoff.
+
+    Captured at ``pick_align_height`` rather than grasp height: at grasp
+    height the fingers occlude the target and the camera's offset from
+    the TCP makes the view geometrically poor.
+
+    A cylinder of ``carve_radius`` around the grasp XY is EXCLUDED, so
+    the target itself never becomes an obstacle — otherwise the descent
+    to grasp is unplannable. Everything else the wrist sees (neighbouring
+    parts, bin dividers) becomes a collider.
+    """
+    if STATE.cumotion_world is None:
+        return {"error": "cuMotion not initialised"}
+
+    grasp_xy = params.get("grasp_xy")
+    if not (isinstance(grasp_xy, (list, tuple)) and len(grasp_xy) >= 2):
+        return {"error": "grasp_xy [x, y] required"}
+    carve_r = float(params.get("carve_radius", 0.06))
+    voxel = float(params.get("voxel_size", 0.01))   # finer: wrist is close
+
+    raw = await _capture_pointcloud(
+        cameras={CAMERA_WRIST_PRIM: (480, 640)}, ticks=4)
+    if len(raw) == 0:
+        return {"error": "wrist point cloud empty"}
+
+    d_xy = np.linalg.norm(raw[:, :2] - np.array(grasp_xy[:2]), axis=1)
+    neighbours = raw[d_xy > carve_r]
+    n_carved = int((d_xy <= carve_r).sum())
+
+    voxels = _voxel_downsample(neighbours, voxel)
+    n = _spheres_from_points(voxels, "/collision/wrist_local", voxel / 2.0)
+    STATE.cumotion_world.world_view.update()
+
+    print(f"  [pcd-wrist] {len(raw)} raw → {n_carved} carved around target "
+          f"→ {n} neighbour spheres")
+    return {"status": "ok", "spheres": n, "carved": n_carved,
+            "carve_radius": carve_r}
+
+
+# ═════════════════════════════════════════════════════════════
+# CUMOTION MOTION PLANNING
+#
+#   Replaces Lula IK. Every motion is planned against the collision
+#   world above, so the arm routes AROUND the gantry and bin walls
+#   instead of through them.
+#
+#   ``ik_solve`` keeps its original ``(action, ok)`` signature so all
+#   existing call sites work unchanged — but it now plans, and stashes
+#   the resulting trajectory on ``STATE.pending_trajectory``. The very
+#   next ``_apply_interpolated`` consumes that trajectory and follows
+#   the planned path instead of interpolating straight to the goal.
+#   That coupling is what makes ~20 call sites collision-aware without
+#   rewriting each one; it is deliberate, and single-use so a stale plan
+#   can never be replayed.
+# ═════════════════════════════════════════════════════════════
+
+ROBOT_CONFIG_PATH = os.environ.get("ROBOT_CONFIG_PATH", "")
+# Exported from Isaac Sim. Mirrors simulation.robot_{urdf,xrdf}_filename
+# in config.yaml — the bridge runs standalone and cannot read that file.
+ROBOT_URDF_FILENAME = "AIKIDO.urdf"
+ROBOT_XRDF_FILENAME = "AIKIDO.xrdf"
+CUMOTION_TOOL_FRAME = "robotiq_base_link"
+# Transfer the ee_link-derived DOWNWARD_ORIENTATION into the tool frame
+# using the fixed rotation between the two, measured from USD. Set False
+# to send the raw ee_link quaternion (the old, incorrect behaviour).
+USE_MEASURED_TOOL_ORIENTATION = True
+# A measured tool->TCP distance below this is not believable: the prim
+# transforms are coincident and the gripper offset lives in mesh data,
+# so the configured GRIPPER_TCP_OFFSET is kept instead.
+MIN_CREDIBLE_TCP_OFFSET = 0.05
+
+
+def quat_mul(a, b):
+    """Hamilton product of two (w, x, y, z) quaternions."""
+    aw, ax, ay, az = a
+    bw, bx, by, bz = b
+    return np.array([
+        aw*bw - ax*bx - ay*by - az*bz,
+        aw*bx + ax*bw + ay*bz - az*by,
+        aw*by - ax*bz + ay*bw + az*bx,
+        aw*bz + ax*by - ay*bx + az*bw,
+    ])
+
+
+def quat_conj(q):
+    return np.array([q[0], -q[1], -q[2], -q[3]])
+
+
+def quat_from_axis_angle(axis, angle):
+    axis = np.asarray(axis, dtype=np.float64)
+    axis = axis / np.linalg.norm(axis)
+    h = angle / 2.0
+    return np.array([np.cos(h), *(axis * np.sin(h))])
+
+
+def derive_down_quat(tool_p, tool_q, tcp_p):
+    """Tool orientation that aims the gripper's approach axis at world -Z.
+
+    Derived from the scene rather than from a constant. The approach axis
+    is the direction from the tool frame to the authored TCP; rotating
+    that onto world -Z and applying the same rotation to the tool's
+    current orientation gives an orientation that is correct by
+    construction, whatever the gripper mount happens to be.
+
+    This replaces transferring the Lula-era DOWNWARD_ORIENTATION, which
+    described ee_link and has not been valid since the frame change.
+    """
+    approach = np.asarray(tcp_p, dtype=np.float64) - np.asarray(tool_p, dtype=np.float64)
+    norm = np.linalg.norm(approach)
+    if norm < 1e-9:
+        return None, None
+    approach = approach / norm
+    target = np.array([0.0, 0.0, -1.0])
+
+    axis = np.cross(approach, target)
+    dot = float(np.clip(np.dot(approach, target), -1.0, 1.0))
+    if np.linalg.norm(axis) < 1e-8:
+        # Parallel or anti-parallel: no unique axis, so pick any
+        # perpendicular one. Anti-parallel needs a half turn.
+        q_align = (np.array([1.0, 0.0, 0.0, 0.0]) if dot > 0
+                   else quat_from_axis_angle([1.0, 0.0, 0.0], np.pi))
+    else:
+        q_align = quat_from_axis_angle(axis, np.arccos(dot))
+
+    q = quat_mul(q_align, np.asarray(tool_q, dtype=np.float64))
+    return q / np.linalg.norm(q), approach
+
+# Fixed rail mount — the URDF root, above gantry_vagn_joint. See
+# _robot_base_pose_arrays for why this must not be base_link.
+# The URDF's root link is `gantry`, and this must be the prim that
+# matches it: the FIXED rail base. /World/gantry/gantry_home is the
+# moving carriage — verify_planner showed it sitting at x=+1.270
+# (== GANTRY_X_OFFSET) while the rail base is at x=-2.000. Using the
+# carriage double-counts gantry travel, offsetting every planned pose
+# by the current gantry position.
+ROBOT_ROOT_PATH = "/World/gantry"
+
+# USD prim for CUMOTION_TOOL_FRAME. Used only by /api/verify_planner to
+# compare cuMotion's idea of the tool pose against the scene's.
+TOOL_FRAME_PRIM = ("/World/gantry/gantry_home/ur10_flattened/"
+                   "robotiq_fixed_physics/Robotiq_2F_140_physics_edit/"
+                   "robotiq_base_link")
+
+# Per-joint limits for time-parameterising a planned path.
+# Order follows the XRDF <cspace>: gantry, pan, lift, elbow, w1, w2, w3.
+CUMOTION_MAX_VEL = np.array([0.5, 1.5, 1.5, 1.5, 2.0, 2.0, 2.0])
+CUMOTION_MAX_ACC = np.array([1.0, 2.0, 2.0, 2.0, 2.5, 2.5, 2.5])
+
+TRAJECTORY_DT = 1.0 / 60.0        # sampling step when streaming
+
+
+def _reset_cumotion_world():
+    """Drop and recreate the collision world (no per-obstacle removal API)."""
+    from isaacsim.robot_motion.cumotion import CumotionWorldInterface
+    import warp as wp
+
+    base_pos, base_quat = _robot_base_pose_arrays()
+    STATE.cumotion_world = CumotionWorldInterface(
+        world_to_robot_base=(base_pos, base_quat),
+        device=STATE.cumotion_device)
+    STATE.collision_sphere_count = 0
+    # The planner holds a reference to the world interface, so rebuild it.
+    if STATE.cumotion_robot is not None:
+        from isaacsim.robot_motion.cumotion import GraphBasedMotionPlanner
+        STATE.cumotion_planner = GraphBasedMotionPlanner(
+            cumotion_robot=STATE.cumotion_robot,
+            cumotion_world_interface=STATE.cumotion_world,
+            tool_frame=CUMOTION_TOOL_FRAME)
+
+
+def _robot_base_pose_arrays():
+    """World→robot-root transform as warp arrays.
+
+    This must be the FIXED rail mount, not ``base_link``. The XRDF cspace
+    lists ``gantry_vagn_joint`` as joint 0, so cuMotion treats the gantry
+    as part of the kinematic chain and the URDF root sits ABOVE it —
+    stationary in the world. Passing the sliding ``base_link`` here would
+    double-count the gantry travel: once in the joint value, once in the
+    base transform.
+    """
+    import omni.usd
+    import warp as wp
+
+    stage = omni.usd.get_context().get_stage()
+    mat = omni.usd.get_world_transform_matrix(
+        stage.GetPrimAtPath(ROBOT_ROOT_PATH))
+    t = mat.ExtractTranslation()
+    q = mat.ExtractRotationQuat()
+    imag = q.GetImaginary()
+    with wp.ScopedDevice(STATE.cumotion_device):
+        pos = wp.array(
+            np.array([[t[0], t[1], t[2]]], dtype=np.float32), dtype=wp.vec3)
+        quat = wp.array(
+            np.array([[q.GetReal(), imag[0], imag[1], imag[2]]],
+                     dtype=np.float32), dtype=wp.vec4)
+    return pos, quat
+
+
+# Purpose-made TCP Xform authored in the USD — the finger contact point.
+# Preferred over inferring from mesh prims, whose transforms are all
+# coincident with robotiq_base_link (the geometry offset is baked into
+# the meshes, not the prim hierarchy).
+GRIPPER_TCP_PRIM = ("/World/gantry/gantry_home/ur10_flattened/"
+                    "robotiq_fixed_physics/Robotiq_2F_140_physics_edit/"
+                    "gripper_tcp")
+FINGER_PAD_PRIM = ("/World/gantry/gantry_home/ur10_flattened/"
+                   "robotiq_fixed_physics/Robotiq_2F_140_physics_edit/"
+                   "left_inner_finger/Fingertip_01/Fingertip")
+
+
+def get_tcp_pos():
+    """World position of the finger contact pad — the actual TCP.
+
+    Motion targets are TCP points. ``ee_link`` is NOT the TCP: the pad
+    hangs roughly a gripper-length below it. Deriving a "TCP" target from
+    ``get_world_pos(EE_PATH)`` and then adding the TCP offset counts that
+    gap twice, which on this ceiling-mounted arm pushes the goal out of
+    reach. Falls back to ee_link only if the pad prim is missing.
+    """
+    import omni.usd
+    stage = omni.usd.get_context().get_stage()
+    for path in (GRIPPER_TCP_PRIM, FINGER_PAD_PRIM):
+        if stage.GetPrimAtPath(path).IsValid():
+            return get_world_pos(path)
+    return get_world_pos(EE_PATH)
+
+
+def _measure_tool_frames():
+    """Measure the tool frame from USD and correct the Lula-era constants.
+
+    ``GRIPPER_TCP_OFFSET`` and ``DOWNWARD_ORIENTATION`` were both derived
+    for ``ee_link`` when Lula planned in that frame. cuMotion plans for
+    the XRDF tool frame (``robotiq_base_link``), so both are re-measured
+    here and cached on STATE.
+    """
+    import omni.usd
+    stage = omni.usd.get_context().get_stage()
+
+    def pose(path):
+        prim = stage.GetPrimAtPath(path)
+        if not prim.IsValid():
+            return None, None
+        m = omni.usd.get_world_transform_matrix(prim)
+        t = m.ExtractTranslation()
+        q = m.ExtractRotationQuat()
+        im = q.GetImaginary()
+        return (np.array([t[0], t[1], t[2]]),
+                np.array([q.GetReal(), im[0], im[1], im[2]]))
+
+    ee_p, ee_q = pose(EE_PATH)
+    tool_p, tool_q = pose(TOOL_FRAME_PRIM)
+    tcp_p, tcp_q = pose(GRIPPER_TCP_PRIM)
+    pad_p, _ = pose(FINGER_PAD_PRIM)
+
+    print("[frames] measuring tool geometry from USD:")
+    for name, pp in (("ee_link", ee_p), (CUMOTION_TOOL_FRAME, tool_p),
+                     ("gripper_tcp", tcp_p), ("finger pad", pad_p)):
+        print(f"[frames]   {name:22s} "
+              f"{'NOT FOUND' if pp is None else f'({pp[0]:+.4f}, {pp[1]:+.4f}, {pp[2]:+.4f})'}")
+
+    if ee_q is not None and tool_q is not None:
+        d = abs(float(np.dot(ee_q, tool_q)))
+        print(f"[frames]   |dot(q_ee, q_tool)| = {d:.4f} -> "
+              f"{'aligned' if d > 0.999 else 'ROTATED: the ee_link-derived DOWNWARD_ORIENTATION is invalid for this tool frame'}")
+
+    src_p = tcp_p if tcp_p is not None else pad_p
+    src_name = "gripper_tcp" if tcp_p is not None else "finger pad"
+    if tool_p is not None and src_p is not None:
+        # Use the full 3D distance, not dz. The offset is a fixed length
+        # along the gripper's approach axis; dz only equals it when the
+        # tool happens to point straight down, which it need not at boot.
+        dist = float(np.linalg.norm(src_p - tool_p))
+        dz = float(abs(src_p[2] - tool_p[2]))
+        if dist < MIN_CREDIBLE_TCP_OFFSET:
+            STATE.tcp_offset = None
+            print(f"[frames]   tool->{src_name} = {dist:.5f} m — NOT CREDIBLE "
+                  f"(prim transforms coincide; the offset is baked into the "
+                  f"meshes). Keeping GRIPPER_TCP_OFFSET = "
+                  f"{GRIPPER_TCP_OFFSET:.5f}")
+        else:
+            STATE.tcp_offset = dist
+            print(f"[frames]   tool->{src_name} = {dist:.5f} m along the tool "
+                  f"axis (dz {dz:.5f}); configured was "
+                  f"{GRIPPER_TCP_OFFSET:.5f}")
+            if abs(dist - dz) > 0.01:
+                print(f"[frames]   note: dist != dz, so the gripper is not "
+                      f"pointing straight down right now — expected, and the "
+                      f"axial distance is the correct value to use")
+
+    # Derive "down" from the scene geometry, not from the ee_link constant.
+    if tool_p is not None and tool_q is not None and src_p is not None:
+        down_q, approach = derive_down_quat(tool_p, tool_q, src_p)
+        if down_q is not None:
+            STATE.tool_down_quat = down_q
+            facing = ("UP" if approach[2] > 0.7 else
+                      "DOWN" if approach[2] < -0.7 else "SIDEWAYS")
+            print(f"[frames]   gripper approach axis now = "
+                  f"({approach[0]:+.3f}, {approach[1]:+.3f}, "
+                  f"{approach[2]:+.3f})  -> pointing {facing}")
+            print(f"[frames]   DOWNWARD for tool (derived) = "
+                  f"({down_q[0]:+.4f}, {down_q[1]:+.4f}, "
+                  f"{down_q[2]:+.4f}, {down_q[3]:+.4f})")
+            print(f"[frames]   (stale ee_link constant was "
+                  f"{tuple(np.round(normalize_quat(DOWNWARD_ORIENTATION), 4))})")
+
+
+def _planner_unavailable_reason():
+    """Actionable message for callers when no motion can be planned."""
+    return (f"cuMotion planner unavailable: {STATE.cumotion_error}. "
+            f"Check the Isaac Sim console for [cuMotion] lines at startup.")
+
+
+def _init_cumotion():
+    """Load the cuMotion robot, collision world and planner.
+
+    Returns True on success. Raises nothing — the bridge reports the
+    failure through /api/status so a misconfigured path is visible.
+    """
+    import warp as wp
+    from isaacsim.robot_motion.cumotion import load_cumotion_robot
+
+    if not ROBOT_CONFIG_PATH:
+        STATE.cumotion_error = (
+            "ROBOT_CONFIG_PATH is not set. The bridge runs in Isaac Sim's "
+            "process, so it needs .env next to the project root (see the "
+            "[env] line above) or a real environment variable.")
+        print(f"[cuMotion] {STATE.cumotion_error}")
+        return False
+    if not os.path.isdir(ROBOT_CONFIG_PATH):
+        STATE.cumotion_error = (
+            f"ROBOT_CONFIG_PATH does not exist: {ROBOT_CONFIG_PATH}")
+        print(f"[cuMotion] {STATE.cumotion_error}")
+        return False
+
+    try:
+        STATE.cumotion_device = wp.get_device("cuda:0")
+    except Exception as e:
+        STATE.cumotion_error = f"CUDA device unavailable: {e}"
+        print(f"[cuMotion] {STATE.cumotion_error}")
+        return False
+
+    try:
+        STATE.cumotion_robot = load_cumotion_robot(
+            directory=ROBOT_CONFIG_PATH,
+            urdf_filename=ROBOT_URDF_FILENAME,
+            xrdf_filename=ROBOT_XRDF_FILENAME)
+    except Exception as e:
+        STATE.cumotion_error = f"robot load failed: {e}"
+        print(f"[cuMotion] {STATE.cumotion_error}")
+        return False
+
+    joints = list(STATE.cumotion_robot.controlled_joint_names)
+    print(f"[cuMotion] loaded robot from {ROBOT_CONFIG_PATH}")
+    print(f"[cuMotion] planned joints ({len(joints)}): {joints}")
+
+    _reset_cumotion_world()
+    STATE.cumotion_ready = STATE.cumotion_planner is not None
+
+    # Map XRDF cspace joints → articulation DOF indices, once.
+    STATE.cumotion_dof_indices = []
+    for name in joints:
+        try:
+            STATE.cumotion_dof_indices.append(STATE.dof_names.index(name))
+        except (ValueError, AttributeError):
+            print(f"[cuMotion] WARNING: joint '{name}' not in articulation DOFs")
+            STATE.cumotion_dof_indices = []
+            break
+
+    if STATE.cumotion_ready:
+        STATE.cumotion_error = None
+    elif STATE.cumotion_error == "not initialised yet":
+        STATE.cumotion_error = "planner construction returned None"
+    try:
+        _measure_tool_frames()
+    except Exception as e:
+        print(f"[frames] measurement failed: {e}")
+
+    print(f"[cuMotion] ready={STATE.cumotion_ready} "
+          f"dof_indices={STATE.cumotion_dof_indices}")
+    return STATE.cumotion_ready
+
+
+def _current_cspace():
+    """Current joint values in XRDF cspace order."""
+    q = STATE.robot.get_joint_positions()
+    if STATE.cumotion_dof_indices:
+        return np.array([float(q[i]) for i in STATE.cumotion_dof_indices],
+                        dtype=np.float64)
+    return np.array(q[:7], dtype=np.float64)
+
+
+def _tool_pose_from_tcp(tcp_pos, orientation):
+    """Convert a TCP target to the tool-frame pose cuMotion plans for.
+
+    The pipeline's targets are finger-contact (TCP) points, but the XRDF
+    tool frame is ``robotiq_base_link``, which sits GRIPPER_TCP_OFFSET
+    back along the tool axis. For the top-down grasps this pipeline uses,
+    the tool axis is world -Z, so the tool frame is that far ABOVE the
+    TCP. Planning to the raw TCP would drive the gripper body into the
+    part by the offset.
+    """
+    pos = np.array(tcp_pos, dtype=np.float64).copy()
+    pos[2] += getattr(STATE, "tcp_offset", None) or GRIPPER_TCP_OFFSET
+    ori = np.array(orientation, dtype=np.float64)
+    # The hardcoded downward quaternion describes ee_link, not this tool
+    # frame. When the measured tool orientation is available prefer it —
+    # it is achievable by construction.
+    # Only substitute when the CALLER asked for the ee_link "down"; a
+    # deliberate custom orientation is passed through untouched.
+    down = getattr(STATE, "tool_down_quat", None)
+    if down is not None and USE_MEASURED_TOOL_ORIENTATION:
+        if np.allclose(ori, normalize_quat(DOWNWARD_ORIENTATION), atol=1e-6):
+            ori = np.array(down, dtype=np.float64)
+    return pos, ori
+
+
+def _plan_pose(tcp_pos, orientation):
+    """Plan a collision-free path to a TCP pose. Returns a trajectory or None.
+
+    Logs both frames. The caller supplies a TCP (finger-contact) target;
+    cuMotion plans for the tool frame, which sits GRIPPER_TCP_OFFSET
+    above it for a top-down grasp. Printing only the tool pose made the
+    numbers look untraceable — a part detected at z=0.80 became a plan
+    for z=0.99 with nothing connecting the two.
+    """
+    tool_pos, quat = _tool_pose_from_tcp(tcp_pos, orientation)
+    q0 = _current_cspace()
+    tcp_now = get_tcp_pos()
+    offset = getattr(STATE, "tcp_offset", None) or GRIPPER_TCP_OFFSET
+
+    print(f"  [plan] TCP target  ({tcp_pos[0]:+.3f}, {tcp_pos[1]:+.3f}, "
+          f"{tcp_pos[2]:+.3f})   from TCP now "
+          f"({tcp_now[0]:+.3f}, {tcp_now[1]:+.3f}, {tcp_now[2]:+.3f})")
+    print(f"  [plan] tool target ({tool_pos[0]:+.3f}, {tool_pos[1]:+.3f}, "
+          f"{tool_pos[2]:+.3f})   (+{offset:.3f} tool offset)  "
+          f"quat ({quat[0]:+.3f}, {quat[1]:+.3f}, {quat[2]:+.3f}, {quat[3]:+.3f})")
+
+    path = STATE.cumotion_planner.plan_to_pose_target(
+        q_initial=q0, position=tool_pos, orientation=quat)
+    if path is None:
+        print(f"  [plan] NO PATH — target unreachable, in collision, or "
+              f"start in collision ({STATE.collision_sphere_count} spheres)")
+        return None
+    print("  [plan] path found")
+    return _path_to_trajectory(path)
+
+
+def _plan_cspace(q_target):
+    """Plan a collision-free path to a joint configuration."""
+    q0 = _current_cspace()
+    path = STATE.cumotion_planner.plan_to_cspace_target(
+        q_initial=q0, q_target=np.array(q_target, dtype=np.float64))
+    if path is None:
+        print(f"  [plan] NO PATH to cspace target")
+        return None
+    return _path_to_trajectory(path)
+
+
+def _path_to_trajectory(path):
+    """Time-parameterise a planned path against the joint limits."""
+    n = len(STATE.cumotion_robot.controlled_joint_names)
+    return path.to_minimal_time_joint_trajectory(
+        max_velocities=CUMOTION_MAX_VEL[:n],
+        max_accelerations=CUMOTION_MAX_ACC[:n],
+        robot_joint_space=STATE.dof_names,
+        active_joints=STATE.cumotion_robot.controlled_joint_names)
+
+
+async def _execute_trajectory(traj, finger_value=None,
+                              settle_frames=SETTLE_FRAMES):
+    """Stream a cuMotion trajectory to the articulation.
+
+    Samples at TRAJECTORY_DT and issues one apply_action per sample, so
+    the arm follows the planned (collision-free) path rather than cutting
+    the corner a straight joint interpolation would take.
+    """
+    import omni.kit.app
+    from isaacsim.core.utils.types import ArticulationAction
+
+    if traj is None:
+        return False
+
+    duration = float(traj.duration)
+    q_before = _current_cspace()
+    goal_state = traj.get_target_state(duration)
+    goal_str = "?"
+    if goal_state is not None and goal_state.joints.positions is not None:
+        gp = np.asarray(goal_state.joints.positions).flatten()
+        goal_str = ", ".join(f"{v:+.3f}" for v in gp[:7])
+    print(f"  [traj] executing {duration:.2f}s trajectory")
+    print(f"  [traj]   q_start = [{', '.join(f'{v:+.3f}' for v in q_before)}]")
+    print(f"  [traj]   q_goal  = [{goal_str}]")
+
+    t = 0.0
+    last = None
+    while t < duration:
+        state = traj.get_target_state(t)
+        if state is not None and state.joints.positions is not None:
+            targets = STATE.robot.get_joint_positions().copy()
+            positions = np.asarray(state.joints.positions).flatten()
+            indices = state.joints.position_indices
+            if indices is not None:
+                for slot, dof_idx in enumerate(np.asarray(indices).flatten()):
+                    targets[int(dof_idx)] = positions[slot]
+            else:
+                targets[:len(positions)] = positions
+            if finger_value is not None:
+                targets = set_finger_joints(
+                    STATE.robot, STATE.dof_names, finger_value, targets)
+            STATE.robot.apply_action(ArticulationAction(joint_positions=targets))
+            last = targets
+        await omni.kit.app.get_app().next_update_async()
+        t += TRAJECTORY_DT
+
+    if last is not None:
+        STATE.robot.apply_action(ArticulationAction(joint_positions=last))
+    for _ in range(settle_frames):
+        await omni.kit.app.get_app().next_update_async()
+
+    # Did the articulation actually follow? If q_end == q_start the plan
+    # is fine but the joints are not tracking — physics paused, drives
+    # disabled, or apply_action not reaching this articulation.
+    q_after = _current_cspace()
+    moved = float(np.abs(q_after - q_before).max())
+    print(f"  [traj]   q_end   = [{', '.join(f'{v:+.3f}' for v in q_after)}]")
+    print(f"  [traj]   max joint change = {moved:.4f}")
+    if moved < 1e-3:
+        print("  [traj]   *** ROBOT DID NOT MOVE — trajectory streamed but the "
+              "joints did not follow. Check the timeline is PLAYING and the "
+              "arm drives have non-zero stiffness. ***")
+    return True
+
+
+def ik_solve(pos, ori, warm=None):
+    """Plan a collision-free path to a TCP pose with cuMotion.
+
+    Keeps the name and ``(action, ok)`` return of the Lula helper it
+    replaces so the ~25 call sites read the same. ``warm`` is accepted
+    and ignored — a sampling-based planner has no warm start.
+
+    Returns ``(action, ok)`` where ``action`` is the goal joint
+    configuration in XRDF cspace order, matching what Lula used to
+    return so ``apply_arm_joints`` still works.
+
+    Side effect: the planned trajectory is stashed on
+    ``STATE.pending_trajectory`` for the next ``_apply_interpolated`` to
+    follow. Without that the caller would jump straight to the goal and
+    throw the collision-free path away.
+    """
+    if not STATE.cumotion_ready:
+        print("  [plan] cuMotion not ready")
+        return None, False
+
+    traj = _plan_pose(pos, ori)
+    if traj is None:
+        STATE.pending_trajectory = None
+        return None, False
+
+    state = traj.get_target_state(float(traj.duration))
+    if state is None or state.joints.positions is None:
+        STATE.pending_trajectory = None
+        return None, False
+
+    STATE.pending_trajectory = traj
+    goal = np.asarray(state.joints.positions).flatten()
+    indices = state.joints.position_indices
+    if indices is not None and STATE.cumotion_dof_indices:
+        by_dof = {int(d): goal[s]
+                  for s, d in enumerate(np.asarray(indices).flatten())}
+        goal = np.array([by_dof.get(d, 0.0)
+                         for d in STATE.cumotion_dof_indices])
+    # NO shoulder-pan clamp here. That guard existed because Lula had no
+    # collision awareness of the gantry rail, and it clamped index 0 —
+    # which was shoulder_pan in Lula's 6-joint result but is
+    # gantry_vagn_joint in cuMotion's 7-joint cspace. Clamping it
+    # silently truncated gantry travel. cuMotion enforces the URDF joint
+    # limits itself, and rail avoidance is the collision world's job.
+    return goal, True
+
 
 
 def _check_self_collision_risk(current_joints, target_joints):
@@ -408,66 +1563,6 @@ def _interpolate_joints(start, end, max_step=INTERP_MAX_STEP):
 
 # ── URDF / YAML Patching ────────────────────────────────────
 
-GRIPPER_TCP_LINK = """
-  <link name="gripper_tcp">
-    <inertial>
-      <mass value="0.001"/>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
-      <inertia ixx="0.0001" ixy="0" ixz="0" iyy="0.0001" iyz="0" izz="0.0001"/>
-    </inertial>
-    <collision>
-      <origin xyz="0 0 {half_tcp}" rpy="0 0 0"/>
-      <geometry><box size="{width} {width} {tcp_offset}"/></geometry>
-    </collision>
-  </link>
-  <joint name="gripper_tcp_joint" type="fixed">
-    <parent link="ee_link"/>
-    <child link="gripper_tcp"/>
-    <origin xyz="0 0 {tcp_offset}" rpy="0 0 0"/>
-  </joint>
-""".format(tcp_offset=GRIPPER_TCP_OFFSET, half_tcp=GRIPPER_TCP_OFFSET/2, width=GRIPPER_BODY_WIDTH)
-# NOTE on axis: in the standard UR10 URDF (Universal Robots'
-# convention), ``ee_link`` has its tool axis along LOCAL +Z. Lula
-# reads the URDF — not the USD — so the patched joint follows
-# the URDF convention. The earlier USD diagnostic the operator
-# ran reported the gripper_tcp Xform at LOCAL +X 219.5 mm of
-# ee_link, but that's the USD-side view: Isaac Sim's URDF
-# importer rotates the link frame so that URDF's +Z aligns with
-# USD's +X. The two views describe the same physical position;
-# the URDF patch must use URDF coords, hence ``xyz="0 0 0.220"``
-# (along URDF +Z). We tried placing the joint along +X earlier
-# to match the USD measurement directly — that broke IK because
-# Lula was then planning with a virtual gripper rotated 90° from
-# the actual physical scene, sending ee_link off-target by the
-# gripper's full length.
-
-
-def patch_urdf_and_yaml():
-    temp_dir = tempfile.gettempdir()
-    fixed_urdf = os.path.join(temp_dir, "fixed_ur10_with_gripper.urdf")
-    fixed_yaml = os.path.join(temp_dir, "fixed_ur10_with_gripper.yaml")
-
-    with open(URDF_PATH, 'r') as f:
-        urdf = f.read()
-    urdf = urdf.replace("</inertial>",
-        '<inertia ixx="0.1" ixy="0.0" ixz="0.0" iyy="0.1" iyz="0.0" izz="0.1"/></inertial>')
-    urdf = urdf.replace("0.0027000046)", "0.0027000046")
-    if "gripper_tcp" not in urdf:
-        urdf = urdf.replace("</robot>", GRIPPER_TCP_LINK + "\n</robot>")
-    with open(fixed_urdf, 'w') as f:
-        f.write(urdf)
-
-    with open(YAML_PATH, 'r') as f:
-        yaml_txt = f.read()
-    yaml_txt = yaml_txt.replace("root_link: world", "root_link: base_link")
-    if "gripper_tcp_joint" not in yaml_txt:
-        yaml_txt = yaml_txt.rstrip() + "\nee_fixed_joints:\n  - gripper_tcp_joint\n"
-    with open(fixed_yaml, 'w') as f:
-        f.write(yaml_txt)
-
-    return fixed_urdf, fixed_yaml
-
-
 # ═════════════════════════════════════════════════════════════
 # SHARED STATE
 # ═════════════════════════════════════════════════════════════
@@ -476,11 +1571,23 @@ class BridgeState:
     def __init__(self):
         self.robot = None
         self.world = None
-        self.camera_rgb = None
-        self.camera_depth = None
-        self.camera_wrist = None
-        self.camera_kit = None
-        self.lula_solver = None
+        self.cameras = {}   # alias -> Camera
+        self.frames = {}    # alias -> {"depth": ndarray, "resolution": (w, h)}
+        # ── cuMotion planning ──
+        self.cumotion_robot = None        # CumotionRobot (URDF + XRDF)
+        self.cumotion_world = None        # CumotionWorldInterface
+        self.cumotion_planner = None      # GraphBasedMotionPlanner
+        self.cumotion_device = None       # warp device (needs CUDA)
+        self.cumotion_dof_indices = []    # XRDF cspace order -> articulation DOF
+        self.cumotion_ready = False
+        self.cumotion_error = "not initialised yet"
+        self.tcp_offset = None            # measured tool -> finger pad
+        self.tool_quat = None             # measured tool orientation
+        self.tool_down_quat = None        # ee_link "down" in the tool frame
+        self.collision_sphere_count = 0
+        # Single-use handoff: set by ik_solve, consumed by the next
+        # _apply_interpolated so the planned path is actually followed.
+        self.pending_trajectory = None
         self.target_frame = "ee_link"
         self.arm_names = []
         self.dof_names = []
@@ -598,6 +1705,22 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self._handle_gripper(body)
         elif path == "/api/approach":
             self._handle_approach(body)
+        elif path == "/api/plan_test":
+            STATE.push_command({"action": "plan_test", "params": body})
+            self._send_json(STATE.pop_result(timeout=180))
+        elif path == "/api/jog":
+            STATE.push_command({"action": "jog", "params": body})
+            self._send_json(STATE.pop_result(timeout=60))
+        elif path == "/api/verify_planner":
+            STATE.push_command({"action": "verify_planner", "params": body})
+            self._send_json(STATE.pop_result(timeout=120))
+        elif path == "/api/build_collision_world":
+            STATE.push_command({"action": "build_collision_world",
+                                "params": body})
+            self._send_json(STATE.pop_result(timeout=180))
+        elif path == "/api/wrist_obstacles":
+            STATE.push_command({"action": "wrist_obstacles", "params": body})
+            self._send_json(STATE.pop_result(timeout=60))
         elif path == "/api/realign_gantry":
             self._handle_realign_gantry(body)
         elif path == "/api/pick":
@@ -635,6 +1758,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 "joint_positions": joints.tolist() if joints is not None else [],
                 "is_executing": STATE.is_executing,
                 "ik_ready": STATE.ik_ready,
+                "planner": "cumotion",
+                "cumotion_error": STATE.cumotion_error,
+                "collision_spheres": STATE.collision_sphere_count,
                 "contact_sensor_pad_ready":
                     STATE.contact_sensor is not None,
                 "contact_sensor_tip_ready":
@@ -720,7 +1846,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         self._send_json(STATE.pop_result(timeout=10))
 
     def _handle_approach(self, body):
-        """Move near a target XYZ using Lula IK."""
+        """Move near a target XYZ using a cuMotion-planned trajectory."""
         STATE.push_command({"action": "approach", "params": body})
         self._send_json(STATE.pop_result(timeout=30))
 
@@ -774,509 +1900,395 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
 
 # ═════════════════════════════════════════════════════════════
-# CAMERA CAPTURE (with black-frame fix)
+# CAMERA CAPTURE  (Isaac Sim 6.0.1 RTX sensor API)
+#
+#   RGB and depth are read from the SAME rendered frame with no app
+#   tick between them, then the depth buffer is cached per alias so
+#   /api/project_to_world projects geometry belonging to the exact
+#   image the VLM was shown.
+#
+#   CameraSensor.__init__ calls enforce_square_pixels(), which syncs
+#   verticalAperture to the resolution aspect ratio without warning.
 # ═════════════════════════════════════════════════════════════
+
+# NOTE: the RTX API uses OpenCV/NumPy resolution order — (height, width).
+CAMERA_ALIASES = {
+    "rgb":   (CAMERA_RGB_PRIM,   (1080, 1920)),
+    "depth": (CAMERA_DEPTH_PRIM, (720, 1280)),
+    "wrist": (CAMERA_WRIST_PRIM, (720, 1280)),
+    "kit":   (CAMERA_KIT_PRIM,   (720, 1280)),
+}
+CAMERA_ANNOTATORS = ["rgb", "distance_to_image_plane"]
+# The D555 depth prim is a depth-only sensor: attaching an rgb annotator
+# to it yields malformed buffers rather than a black image.
+CAMERA_ANNOTATORS_BY_ALIAS = {"depth": ["distance_to_image_plane"]}
+
+# A newly created render product needs many app updates before its
+# annotators return anything; poll rather than guess a tick count.
+_WARMUP_MAX_TICKS = 400
+
+
+def _has_annotator(sensor, name):
+    """True if this sensor was configured with the named annotator."""
+    try:
+        return name in getattr(sensor, "_annotators", {})
+    except Exception:
+        return False
+
+
+def _read_annotator(sensor, name):
+    """Fetch one annotator as a host numpy array, or None if not ready.
+
+    ``get_data`` returns warp arrays on the GPU; ``.numpy()`` pulls them
+    to host. Depth arrives as (h, w, 1) and is squeezed to (h, w).
+    """
+    data, _ = sensor.get_data(name)
+    if data is None:
+        return None
+    arr = data.numpy()
+    if arr.ndim == 3 and arr.shape[2] == 1:
+        arr = arr[:, :, 0]
+    return arr
+
+
+async def _get_camera(alias):
+    """Return (sensor, prim_path) with rgb + depth annotators attached."""
+    from isaacsim.sensors.experimental.rtx import CameraSensor
+    import omni.kit.app
+
+    stage = omni.usd.get_context().get_stage()
+
+    prim_path, resolution = CAMERA_ALIASES.get(alias, (alias, (720, 1280)))
+
+    prim = stage.GetPrimAtPath(prim_path)
+    if prim.IsValid() and not prim.HasAPI("OmniSensorAPI"):
+        prim.ApplyAPI("OmniSensorAPI")
+
+    sensor = STATE.cameras.get(alias)
+    if sensor is None:
+        annots = CAMERA_ANNOTATORS_BY_ALIAS.get(alias, CAMERA_ANNOTATORS)
+        sensor = CameraSensor(prim_path, resolution=resolution,
+                              annotators=annots)
+        STATE.cameras[alias] = sensor
+
+        app = omni.kit.app.get_app()
+        for tick in range(1, _WARMUP_MAX_TICKS + 1):
+            await app.next_update_async()
+            if tick % 20 == 0 \
+                    and _read_annotator(sensor, "rgb") is not None \
+                    and _read_annotator(sensor, "distance_to_image_plane") is not None:
+                break
+        h_res, w_res = sensor.resolution
+        print(f"  [{alias}] camera ready after {tick} ticks "
+              f"({prim_path} @ {w_res}x{h_res})")
+
+    return sensor, prim_path
+
+
+async def _render_frame(sensor, alias):
+    """Tick until the RGB frame is non-black, then snapshot rgb + depth.
+
+    The wrist RGB renderer lags the depth annotator after the robot
+    moves, so it gets more retries.
+    """
+    import omni.kit.app
+    app = omni.kit.app.get_app()
+
+    max_attempts, ticks = (8, 8) if alias == "wrist" else (3, 3)
+    rgb, mean = None, -1.0
+
+    for _ in range(max_attempts):
+        for _ in range(ticks):
+            await app.next_update_async()
+
+        rgb = _read_annotator(sensor, "rgb") if _has_annotator(sensor, "rgb") else None
+        if rgb is not None and rgb.ndim == 3 and rgb.size > 0:
+            mean = float(np.mean(rgb[:, :, :3]))
+            if mean > 3:
+                break
+
+    # Same frame, no tick in between — this pairing is the whole point.
+    depth = _read_annotator(sensor, "distance_to_image_plane")
+
+    # The D555 depth prim is a depth-only sensor: it has no colour output,
+    # so an absent/black RGB frame there is normal, not a failure.
+    if rgb is None or rgb.ndim != 3:
+        rgb = None
+    elif mean <= 3:
+        print(f"  [{alias}] WARNING: frame still dark (mean={mean:.1f})")
+
+    return rgb, depth
+
 
 async def _capture_camera(cam_type="rgb"):
     try:
-        from isaacsim.sensors.camera import Camera
-        import omni.kit.app
+        sensor, _ = await _get_camera(cam_type)
+        rgb, depth = await _render_frame(sensor, cam_type)
 
-        if cam_type == "depth":
-            if STATE.camera_depth is None:
-                STATE.camera_depth = Camera(prim_path=CAMERA_DEPTH_PRIM, resolution=(1280, 720))
-                STATE.camera_depth.initialize()
-                for _ in range(10):
-                    await omni.kit.app.get_app().next_update_async()
-            cam = STATE.camera_depth
-        elif cam_type == "wrist":
-            if STATE.camera_wrist is None:
-                STATE.camera_wrist = Camera(prim_path=CAMERA_WRIST_PRIM, resolution=(1280, 720))
-                STATE.camera_wrist.initialize()
-                for _ in range(10):
-                    await omni.kit.app.get_app().next_update_async()
-            cam = STATE.camera_wrist
-        elif cam_type == "kit":
-            if STATE.camera_kit is None:
-                STATE.camera_kit = Camera(prim_path=CAMERA_KIT_PRIM, resolution=(1280, 720))
-                STATE.camera_kit.initialize()
-                for _ in range(10):
-                    await omni.kit.app.get_app().next_update_async()
-            cam = STATE.camera_kit
-        else:
-            if STATE.camera_rgb is None:
-                STATE.camera_rgb = Camera(prim_path=CAMERA_RGB_PRIM, resolution=(1920, 1080))
-                STATE.camera_rgb.initialize()
-                for _ in range(10):
-                    await omni.kit.app.get_app().next_update_async()
-            cam = STATE.camera_rgb
-
-        # ── Black-frame fix ──────────────────────────────────
-        # The wrist RGB renderer is slower to refresh after the robot
-        # moves than the depth annotator at the same prim hierarchy
-        # (different render paths). Give it more ticks + more retries
-        # to avoid the workflow seeing a stale black frame.
-        if cam_type == "wrist":
-            max_attempts, ticks_per_attempt = 8, 8
-        else:
-            max_attempts, ticks_per_attempt = 3, 3
-
-        rgba = None
-        last_mean = -1.0
-        for attempt in range(max_attempts):
-            cam.get_current_frame()
-            for _ in range(ticks_per_attempt):
-                await omni.kit.app.get_app().next_update_async()
-
-            rgba = cam.get_rgba()
-            if rgba is not None and rgba.size > 0:
-                last_mean = float(np.mean(rgba[:, :, :3]))
-                # Frame is "valid" if it has non-trivial brightness
-                if last_mean > 3:
-                    if attempt > 0:
-                        print(f"  [{cam_type}] valid frame on attempt "
-                              f"{attempt + 1}/{max_attempts} "
-                              f"(mean={last_mean:.1f})")
-                    break
-
-        if rgba is None or rgba.size == 0:
-            return {"error": f"{cam_type} camera returned empty frame"}
-
-        if last_mean <= 3:
-            print(f"  [{cam_type}] WARNING: frame still dark after "
-                  f"{max_attempts} attempts (mean={last_mean:.1f}) — "
-                  f"renderer may not have caught up")
+        STATE.frames[cam_type] = {
+            "depth": depth,
+            "resolution": tuple(sensor.resolution),
+        }
 
         from PIL import Image
-        img = Image.fromarray(rgba[:, :, :3])
+        if rgb is not None and rgb.size:
+            img = Image.fromarray(rgb[:, :, :3])
+        elif depth is not None and depth.size:
+            # Depth-only sensor: return depth as a viewable greyscale
+            # image, normalised over its valid range.
+            valid = (depth > DEPTH_MIN_M) & (depth < DEPTH_MAX_M)
+            if not valid.any():
+                return {"error": f"{cam_type} depth frame has no valid pixels"}
+            lo = float(depth[valid].min())
+            hi = float(depth[valid].max())
+            span = max(hi - lo, 1e-6)
+            grey = np.zeros(depth.shape, dtype=np.uint8)
+            grey[valid] = (255.0 * (depth[valid] - lo) / span).astype(np.uint8)
+            img = Image.fromarray(grey).convert("RGB")
+        else:
+            return {"error": f"{cam_type} camera returned no rgb and no depth"}
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=95)
-        b64 = base64.b64encode(buf.getvalue()).decode()
         return {
-            "image_base64": b64, "width": img.width, "height": img.height,
+            "image_base64": base64.b64encode(buf.getvalue()).decode(),
+            "width": img.width, "height": img.height,
             "format": "jpeg", "camera": cam_type,
+            "depth_available": depth is not None,
         }
 
     except Exception as e:
-        return {"error": f"{cam_type} camera failed: {e}"}
+        import traceback
+        print(f"  [{cam_type}] capture failed: {type(e).__name__}: {e}")
+        traceback.print_exc()
+        return {"error": f"{cam_type} camera failed: {type(e).__name__}: {e}"}
 
 
 # ═════════════════════════════════════════════════════════════
-# DEPTH-BASED WORLD PROJECTION
+# CAMERA MODEL
 #
-#   Converts VLM normalised image coordinates (0-1) into real-world
-#   XYZ by reading the depth buffer from the same camera that took
-#   the RGB frame.  This replaces USD prim-path lookups so that
-#   coordinates come purely from vision.
+#   The RTX sensor API ships no projection helpers, so the pinhole
+#   model lives here. It mirrors what the deprecated
+#   isaacsim.sensors.camera.Camera did:
 #
-#   Pipeline:  VLM (nx,ny) → pixel (px,py) → depth d →
-#              camera intrinsics → camera-frame 3D →
-#              camera extrinsics → world-frame XYZ
+#     fx = w * focal / horizontal_aperture,  cx = w / 2
+#     view_ros = R_U_TRANSFORM @ inverse(camera_to_world)
+#
+#   R_U_TRANSFORM flips Y and Z to convert the USD camera convention
+#   (+Y up, -Z forward) into the ROS one (+Y down, +Z forward), which
+#   is what the intrinsics matrix expects. Because that flip lives in
+#   the matrix, no per-camera axis-sign overrides are needed.
 # ═════════════════════════════════════════════════════════════
 
-def _get_workspace_surface_z():
-    """Get Z height of workspace surface where parts sit (geometric
-    projection fallback).
+# USD camera frame -> ROS camera frame
+R_U_TRANSFORM = np.array([[1.0, 0.0, 0.0, 0.0],
+                          [0.0, -1.0, 0.0, 0.0],
+                          [0.0, 0.0, -1.0, 0.0],
+                          [0.0, 0.0, 0.0, 1.0]])
 
-    Reads the bin AABB and returns ``bot_z + 0.05`` — i.e. just above
-    the rack base, which is approximately where parts rest on the
-    internal compartment floor.
 
-    Earlier the function used the bin prim's PIVOT translation Z,
-    which is often 0 (e.g. when the bin's parent transform places it
-    at the world origin). That made every geometric projection emit
-    ``z = 0`` and the IK targeted points below the floor.
+def _intrinsics_matrix(prim_path, resolution):
+    """Pinhole K read from the USD camera prim.
+
+    Focal length and apertures share the same tenths-of-a-unit scaling,
+    so it cancels in the ratio — no unit conversion needed.
     """
     import omni.usd
-    try:
-        stage = omni.usd.get_context().get_stage()
-        prim = stage.GetPrimAtPath(PARTS_CONTAINER)
-        if prim.IsValid():
-            bbox = compute_bbox_geometry(stage, PARTS_CONTAINER,
-                                         label="WORKSPACE_Z")
-            surface_z = float(bbox["bot_z"]) + 0.05
-            print(f"  [workspace_z] Bin AABB bot_z={bbox['bot_z']:.4f}, "
-                  f"top_z={bbox['top_z']:.4f} → using surface_z="
-                  f"{surface_z:.4f}")
-            return surface_z
-    except Exception as e:
-        print(f"  [workspace_z] USD read failed: {e}")
-    return 0.02  # last-resort default (table-level)
+    from pxr import UsdGeom
+
+    stage = omni.usd.get_context().get_stage()
+    usd_cam = UsdGeom.Camera(stage.GetPrimAtPath(prim_path))
+    if not usd_cam:
+        raise RuntimeError(f"not a UsdGeom.Camera: {prim_path}")
+
+    focal = float(usd_cam.GetFocalLengthAttr().Get() or 0.0)
+    h_ap = float(usd_cam.GetHorizontalApertureAttr().Get() or 0.0)
+    v_ap = float(usd_cam.GetVerticalApertureAttr().Get() or 0.0)
+    if focal <= 0 or h_ap <= 0 or v_ap <= 0:
+        raise RuntimeError(
+            f"{prim_path} has invalid optics "
+            f"(focal={focal}, h_aperture={h_ap}, v_aperture={v_ap})")
+
+    h_res, w_res = resolution
+    return np.array([
+        [w_res * focal / h_ap, 0.0, w_res / 2.0],
+        [0.0, h_res * focal / v_ap, h_res / 2.0],
+        [0.0, 0.0, 1.0],
+    ])
+
+
+def _view_matrix_ros(prim_path):
+    """World -> ROS camera frame, from the prim's live world transform."""
+    import omni.usd
+    from pxr import Usd, UsdGeom
+
+    stage = omni.usd.get_context().get_stage()
+    prim = stage.GetPrimAtPath(prim_path)
+    local_to_world = UsdGeom.Imageable(prim).ComputeLocalToWorldTransform(
+        Usd.TimeCode.Default())
+    # USD matrices are row-vector major; transpose for column-vector math.
+    camera_to_world = np.array(local_to_world, dtype=np.float64).T
+    return R_U_TRANSFORM @ np.linalg.inv(camera_to_world)
+
+
+def _world_points_from_pixels(prim_path, resolution, pixels, depths):
+    """Unproject pixels + depth to world XYZ. pixels (n,2), depths (n,)."""
+    K = _intrinsics_matrix(prim_path, resolution)
+    view = _view_matrix_ros(prim_path)
+
+    uv1 = np.hstack([np.asarray(pixels, dtype=np.float64),
+                     np.ones((len(pixels), 1))])
+    cam = np.linalg.inv(K) @ (uv1.T * np.asarray(depths, dtype=np.float64))
+    cam_h = np.vstack([cam, np.ones((1, cam.shape[1]))])
+    return (np.linalg.inv(view) @ cam_h)[:3].T
+
+
+def _pixels_from_world_points(prim_path, resolution, points):
+    """Project world XYZ to pixel coords. points (n,3) -> (n,2)."""
+    K = _intrinsics_matrix(prim_path, resolution)
+    view = _view_matrix_ros(prim_path)
+
+    pts = np.asarray(points, dtype=np.float64)
+    homogeneous = np.hstack([pts, np.ones((len(pts), 1))])
+    projected = (K @ view[:3, :]) @ homogeneous.T
+    projected[:2, :] /= projected[2, :]
+    return projected[:2, :].T
+
+
+def _camera_frame_z(prim_path, point):
+    """Depth along the optical axis. Non-positive means behind the lens."""
+    view = _view_matrix_ros(prim_path)
+    p = np.asarray([*point, 1.0], dtype=np.float64)
+    return float((view @ p)[2])
+
+
+# ═════════════════════════════════════════════════════════════
+# WORLD PROJECTION
+#
+#   Pixel + depth -> world XYZ. Coordinates come purely from vision;
+#   no USD prim lookups for parts.
+#
+#   Depth is the cached buffer from the frame /api/camera returned. If
+#   no depth is available the request fails rather than guessing a
+#   surface plane.
+# ═════════════════════════════════════════════════════════════
+
+DEPTH_MIN_M = 0.01
+DEPTH_MAX_M = 100.0
+DEPTH_PATCH_RADIUS = 2          # 5x5 median, robust to edge noise
+
+
+def _sample_depth(depth_buf, px, py):
+    """Median of valid depths in a small patch around (px, py)."""
+    h, w = depth_buf.shape[:2]
+    ix = int(np.clip(round(px), 0, w - 1))
+    iy = int(np.clip(round(py), 0, h - 1))
+    r = DEPTH_PATCH_RADIUS
+    patch = depth_buf[max(0, iy - r):min(h, iy + r + 1),
+                      max(0, ix - r):min(w, ix + r + 1)]
+    valid = patch[(patch > DEPTH_MIN_M) & (patch < DEPTH_MAX_M)]
+    return float(np.median(valid)) if valid.size else None
 
 
 async def _project_to_world(params):
     """Project normalised image coordinates to world XYZ.
 
-    Two methods (automatic fallback):
-      1. **Depth buffer** — per-pixel depth from Isaac Sim camera.
-         Most accurate; gives true Z for each object.
-      2. **Geometric ray-plane** — intersect camera ray with the
-         workspace surface plane (Z = bin surface).  No depth buffer
-         needed; assumes objects sit on a flat surface.
-
-    Args (in params dict):
-        points: list of {x, y} with values in [0, 1].
-                Each point may include an optional "surface_z" to override
-                the default workspace Z for geometric fallback (useful for
-                objects on different surfaces, e.g. kitting tray vs. bin).
-        camera: prim path or alias ("rgb", "depth") — default "rgb"
+    Args (params dict):
+        points: list of {x, y} with values in [0, 1]
+        camera: alias ("rgb", "wrist", "kit", "depth") or a prim path
+        fresh_depth: True to re-render instead of using the cached frame
 
     Returns:
-        {status, world_points: [{x, y, z, depth_m, method}, ...]}
+        {status, world_points: [{x, y, z, depth_m}, ...], camera, ...}
+        or {error} when no usable depth exists.
     """
-    import omni.kit.app, omni.usd
-    from isaacsim.sensors.camera import Camera
-    from pxr import UsdGeom, Gf
-    import math
+    import omni.usd
 
     points = params.get("points", [])
-    cam_alias = params.get("camera", "rgb")
-    force_method = params.get("method", None)  # "geometric" to skip depth buffer
-    # Optional axis-sign overrides — useful when the camera was placed
-    # in USD with a non-standard rotation that mirrors detected coords.
-    img_x_sign = float(params.get("image_x_sign", 1))
-    img_y_sign = float(params.get("image_y_sign", 1))
-    if img_x_sign != 1 or img_y_sign != 1:
-        print(f"  [project] Axis sign overrides: "
-              f"x={img_x_sign:+.0f}, y={img_y_sign:+.0f}")
+    alias = params.get("camera", "rgb")
 
-    # Resolve alias → prim path
-    if cam_alias == "rgb":
-        cam_path = CAMERA_RGB_PRIM
-        res = (1920, 1080)
-    elif cam_alias == "depth":
-        cam_path = CAMERA_DEPTH_PRIM
-        res = (1280, 720)
-    elif cam_alias == "wrist":
-        cam_path = CAMERA_WRIST_PRIM
-        res = (1280, 720)
-    elif cam_alias == "kit":
-        cam_path = CAMERA_KIT_PRIM
-        res = (1280, 720)
-    else:
-        cam_path = cam_alias
-        res = (1280, 720)
+    sensor, cam_path = await _get_camera(alias)
+    resolution = tuple(sensor.resolution)
+    h_res, w_res = resolution
 
-    # ── Initialise camera ──────────────────────────────────────
-    if cam_alias == "rgb" and STATE.camera_rgb is not None:
-        cam = STATE.camera_rgb
-    elif cam_alias == "depth" and STATE.camera_depth is not None:
-        cam = STATE.camera_depth
-    elif cam_alias == "wrist" and STATE.camera_wrist is not None:
-        cam = STATE.camera_wrist
-    elif cam_alias == "kit" and STATE.camera_kit is not None:
-        cam = STATE.camera_kit
-    else:
-        cam = Camera(prim_path=cam_path, resolution=res)
-        cam.initialize()
-        for _ in range(10):
-            await omni.kit.app.get_app().next_update_async()
+    # Prefer the depth captured alongside the RGB frame the caller saw.
+    cached = STATE.frames.get(alias) or {}
+    depth_buf = None if params.get("fresh_depth") else cached.get("depth")
+    depth_source = "cached frame"
+    if depth_buf is None:
+        _, depth_buf = await _render_frame(sensor, alias)
+        depth_source = "fresh render"
 
-    # Attach depth annotator if not already present — required for get_depth()
-    try:
-        cam.add_distance_to_image_plane_to_frame()
-        print(f"  [project] Depth annotator attached to {cam_path}")
-        for _ in range(10):
-            await omni.kit.app.get_app().next_update_async()
-    except Exception:
-        pass  # may already be attached or unsupported
+    if depth_buf is None or depth_buf.size == 0:
+        return {"error": f"{alias} depth buffer unavailable — cannot project",
+                "camera": cam_path}
 
-    # ── Camera intrinsics ──────────────────────────────────────
-    # Pinhole model from USD camera attributes:
-    #     fx = w_res * focal_length / horizontal_aperture
-    #     fy = h_res * focal_length / vertical_aperture
-    #     cx, cy = principal point (image centre for an unshifted lens)
-    # Reading focal_length + aperture directly from the USD prim is
-    # more reliable than `cam.get_intrinsics_matrix()` which can be
-    # stale or unset after camera repositioning. We fall back to the
-    # API method, then to a 60° HFOV estimate.
-    w_res, h_res = res
-    fx = fy = cx = cy = None
-    intr_source = "?"
-    try:
-        from pxr import UsdGeom
-        intrinsics_stage = omni.usd.get_context().get_stage()
-        usd_cam = UsdGeom.Camera(intrinsics_stage.GetPrimAtPath(cam_path))
-        if usd_cam:
-            focal_mm = float(usd_cam.GetFocalLengthAttr().Get() or 0.0)
-            h_aperture = float(
-                usd_cam.GetHorizontalApertureAttr().Get() or 0.0)
-            v_aperture = float(
-                usd_cam.GetVerticalApertureAttr().Get() or 0.0)
-            focus_distance = None
-            try:
-                focus_distance = float(
-                    usd_cam.GetFocusDistanceAttr().Get() or 0.0)
-            except Exception:
-                pass
-            if focal_mm > 0 and h_aperture > 0 and v_aperture > 0:
-                fx = w_res * focal_mm / h_aperture
-                fy = h_res * focal_mm / v_aperture
-                cx, cy = w_res / 2.0, h_res / 2.0
-                intr_source = (
-                    f"USD attrs (focal={focal_mm:.2f}mm, "
-                    f"H={h_aperture:.2f}mm, V={v_aperture:.2f}mm"
-                    f"{', focus=' + format(focus_distance, '.2f') + 'm' if focus_distance else ''})")
-    except Exception as e:
-        print(f"  [project] USD camera attr read failed: {e}")
+    valid_mask = (depth_buf > DEPTH_MIN_M) & (depth_buf < DEPTH_MAX_M)
+    n_valid = int(valid_mask.sum())
+    if n_valid < depth_buf.size * 0.01:
+        return {"error": f"{alias} depth buffer has {n_valid} valid pixels "
+                         f"of {depth_buf.size} — cannot project",
+                "camera": cam_path}
 
-    if fx is None:
-        try:
-            intrinsics = cam.get_intrinsics_matrix()
-            fx, fy = float(intrinsics[0, 0]), float(intrinsics[1, 1])
-            cx, cy = float(intrinsics[0, 2]), float(intrinsics[1, 2])
-            intr_source = "Camera.get_intrinsics_matrix()"
-        except Exception:
-            hfov_rad = math.radians(60)
-            fx = fy = (w_res / 2.0) / math.tan(hfov_rad / 2.0)
-            cx, cy = w_res / 2.0, h_res / 2.0
-            intr_source = "60° HFOV estimate"
-    print(f"  [project] Intrinsics: fx={fx:.1f} fy={fy:.1f} "
-          f"cx={cx:.1f} cy={cy:.1f}  ← {intr_source}")
+    h_depth, w_depth = depth_buf.shape[:2]
+    print(f"  [project] {alias} @ {w_res}x{h_res} | depth {w_depth}x{h_depth} "
+          f"({depth_source}, {100*n_valid/depth_buf.size:.1f}% valid) | "
+          f"{len(points)} points")
+    if (h_depth, w_depth) != resolution:
+        print(f"  [project] WARNING: depth resolution != camera resolution")
 
-    # ── Camera extrinsics (world transform) ────────────────────
-    stage = omni.usd.get_context().get_stage()
-    cam_prim = stage.GetPrimAtPath(cam_path)
-    cam_world_mat = omni.usd.get_world_transform_matrix(cam_prim)
-
-    cam_pos = cam_world_mat.GetRow(3)
-    # Camera's local axes mapped to world frame — diagnoses sign /
-    # axis-flip issues when projection puts parts on the wrong side.
-    # In OpenGL convention the camera looks down its -Z, +X is image
-    # right, +Y is image up. After applying the camera's USD world
-    # transform we expect:
-    #   right_world  ≈ horizontal (any direction in the world XY plane)
-    #   up_world     ≈ pointing roughly opposite to the look direction's
-    #                  vertical drop (image-up = world-up if camera
-    #                  is roll-free)
-    #   fwd_world    ≈ from camera toward what it's pointed at
-    right_world = cam_world_mat.TransformDir(Gf.Vec3d(1.0, 0.0, 0.0))
-    up_world    = cam_world_mat.TransformDir(Gf.Vec3d(0.0, 1.0, 0.0))
-    fwd_world   = cam_world_mat.TransformDir(Gf.Vec3d(0.0, 0.0, -1.0))
-    print(f"  [project] Camera world pos: ({cam_pos[0]:.3f}, "
-          f"{cam_pos[1]:.3f}, {cam_pos[2]:.3f})")
-    print(f"  [project] Camera basis in world:")
-    print(f"             right (+X_cam) = ({right_world[0]:+.3f}, "
-          f"{right_world[1]:+.3f}, {right_world[2]:+.3f})")
-    print(f"             up    (+Y_cam) = ({up_world[0]:+.3f}, "
-          f"{up_world[1]:+.3f}, {up_world[2]:+.3f})")
-    print(f"             fwd   (-Z_cam) = ({fwd_world[0]:+.3f}, "
-          f"{fwd_world[1]:+.3f}, {fwd_world[2]:+.3f})")
-
-    # ── Try depth buffer ───────────────────────────────────────
-    has_depth = False
-    depth_buf = None
-
-    # Warm up camera for depth
-    for _ in range(8):
-        cam.get_current_frame()
-        await omni.kit.app.get_app().next_update_async()
-
-    try:
-        depth_buf = cam.get_depth()
-        if depth_buf is not None and depth_buf.size > 0:
-            valid_mask = (depth_buf > 0.01) & (depth_buf < 100.0)
-            valid_count = int(valid_mask.sum())
-            total_pixels = depth_buf.size
-            print(f"  [project] Depth buffer: {depth_buf.shape}, "
-                  f"{valid_count}/{total_pixels} valid pixels "
-                  f"({100*valid_count/total_pixels:.1f}%), "
-                  f"range=[{depth_buf[valid_mask].min():.3f}, {depth_buf[valid_mask].max():.3f}]"
-                  if valid_count > 0 else f"  [project] Depth buffer: {depth_buf.shape}, 0 valid pixels")
-            if valid_count > total_pixels * 0.01:  # at least 1% valid
-                has_depth = True
-                h_depth, w_depth = depth_buf.shape[:2]
-            else:
-                print(f"  [project] WARNING: depth buffer has too few valid pixels — using geometric fallback")
-        else:
-            print(f"  [project] Depth buffer empty or None")
-    except Exception as e:
-        print(f"  [project] Depth buffer read failed: {e}")
-
-    # ── Workspace surface Z for geometric fallback ─────────────
-    workspace_z = _get_workspace_surface_z()
-
-    if force_method == "geometric":
-        method_used = "geometric (forced)"
-    else:
-        method_used = "depth" if has_depth else "geometric"
-    print(f"  [project] Method: {method_used} | {len(points)} points to project")
-
-    # ── Inverse projection: world point → image pixel ──────────
-    # Uses the SAME camera intrinsics + extrinsics we already read
-    # above (fx, fy, cx, cy, cam_world_mat, img_*_sign). No external
-    # references — purely the camera prim's own data. Used for the
-    # round-trip self-consistency log below.
-    def _world_to_pixel(wx, wy, wz):
-        # World → camera frame: invert the camera world transform.
-        cam_inv = cam_world_mat.GetInverse()
-        cam_pt = cam_inv.Transform(Gf.Vec3d(float(wx), float(wy), float(wz)))
-        cx_f, cy_f, cz_f = cam_pt[0], cam_pt[1], cam_pt[2]
-        # OpenGL convention: camera looks down -Z, points in front have
-        # cz_f < 0. Distance from camera = -cz_f.
-        if cz_f >= -1e-6:
-            return None  # behind the camera or on the lens plane
-        # Pinhole projection (inverse of the unprojection formulas above).
-        # Solve cam_x = sign_x * (px - cx) * d / fx for px, with d = -cz_f.
-        d = -cz_f
-        px_f = (cx_f * fx) / (img_x_sign * d) + cx
-        py_f = -(cy_f * fy) / (img_y_sign * d) + cy
-        return (px_f, py_f)
-
-    # ── Project each point ─────────────────────────────────────
-    world_points = []
+    # ── Pixel coords: nx*w, matching the cx = w/2 intrinsics convention
+    pixels, depths, misses = [], [], []
     for i, pt in enumerate(points):
         nx = float(pt.get("x", 0.5))
         ny = float(pt.get("y", 0.5))
+        px = min(nx * w_depth, w_depth - 1e-3)
+        py = min(ny * h_depth, h_depth - 1e-3)
 
-        point_method = None
+        d = _sample_depth(depth_buf, px, py)
+        if d is None:
+            misses.append(i)
+            continue
+        pixels.append([px, py])
+        depths.append(d)
 
-        # ── Method 1: Depth buffer projection ──────────────────
-        if has_depth and force_method != "geometric":
-            px = min(int(nx * (w_depth - 1)), w_depth - 1)
-            py = min(int(ny * (h_depth - 1)), h_depth - 1)
+    if not pixels:
+        return {"error": f"no valid depth at any of the {len(points)} "
+                         f"requested pixels", "camera": cam_path}
 
-            # Sample depth in 5×5 neighbourhood (robust to noise/edges)
-            r = 2
-            y0, y1 = max(0, py - r), min(h_depth, py + r + 1)
-            x0, x1 = max(0, px - r), min(w_depth, px + r + 1)
-            patch = depth_buf[y0:y1, x0:x1]
-            valid = patch[(patch > 0.01) & (patch < 100.0)]
+    world = _world_points_from_pixels(cam_path, (h_depth, w_depth),
+                                      pixels, depths)
 
-            if valid.size > 0:
-                d = float(np.median(valid))
+    world_points, k = [], 0
+    for i in range(len(points)):
+        if i in misses:
+            world_points.append({"error": "no valid depth at pixel"})
+            continue
+        wx, wy, wz = (float(v) for v in world[k])
+        world_points.append({"x": wx, "y": wy, "z": wz,
+                             "depth_m": depths[k]})
+        print(f"  [{i}] px({pixels[k][0]:.1f},{pixels[k][1]:.1f}) "
+              f"d={depths[k]:.3f} -> world({wx:.3f}, {wy:.3f}, {wz:.3f})")
+        k += 1
 
-                # Unproject pixel → camera frame (OpenGL: +X right, +Y up, -Z forward)
-                cam_x = img_x_sign * (px - cx) * d / fx
-                cam_y = img_y_sign * -(py - cy) * d / fy
-                cam_z = -d
+    if misses:
+        print(f"  [project] {len(misses)} point(s) had no valid depth: {misses}")
 
-                # Transform camera-frame point to world using USD canonical method
-                # (GetTranspose() * Vec4d is ambiguous in pxr bindings — Transform() is correct)
-                world_pt = cam_world_mat.Transform(Gf.Vec3d(cam_x, cam_y, cam_z))
-
-                world_points.append({
-                    "x": float(world_pt[0]),
-                    "y": float(world_pt[1]),
-                    "z": float(world_pt[2]),
-                    "depth_m": d,
-                    "method": "depth",
-                })
-                point_method = "depth"
-
-        # ── Method 2: Geometric ray-plane intersection ─────────
-        if point_method is None:
-            px = min(int(nx * (w_res - 1)), w_res - 1)
-            py = min(int(ny * (h_res - 1)), h_res - 1)
-
-            # Per-point surface Z override (e.g. tray on different surface)
-            point_z = float(pt.get("surface_z", workspace_z))
-
-            # Ray direction in camera frame → world frame
-            # TransformDir() transforms directions (ignores translation),
-            # unlike Transform() which transforms points.
-            ray_world = cam_world_mat.TransformDir(Gf.Vec3d(
-                img_x_sign * (px - cx) / fx,
-                img_y_sign * -(py - cy) / fy,
-                -1.0,
-            ))
-
-            dz = ray_world[2]
-            if abs(dz) < 1e-6:
-                world_points.append({
-                    "x": 0, "y": 0, "z": point_z, "depth_m": -1,
-                    "error": "ray parallel to plane", "method": "geometric",
-                })
-                continue
-
-            # Intersect ray with Z = point_z plane
-            t = (point_z - cam_pos[2]) / dz
-            world_x = cam_pos[0] + t * ray_world[0]
-            world_y = cam_pos[1] + t * ray_world[1]
-
-            world_points.append({
-                "x": float(world_x),
-                "y": float(world_y),
-                "z": float(point_z),
-                "depth_m": float(abs(cam_pos[2] - point_z)),
-                "method": "geometric",
-            })
-            point_method = "geometric"
-
-        wp = world_points[-1]
-        # ── Round-trip self-consistency check ──
-        # Project the resulting world point BACK through the camera to
-        # a pixel using the same intrinsics + extrinsics. If the result
-        # matches the input pixel within ~1-2 px, the camera math is
-        # internally consistent (any remaining error is downstream:
-        # bbox-centring / depth-sample location). If it doesn't match,
-        # the camera math itself is broken (most often an axis-sign
-        # mismatch in camera_image_x_sign / camera_image_y_sign).
-        # NOTE the input pixel uses w_res×h_res (RGB resolution) for
-        # the geometric branch and w_depth×h_depth for the depth branch
-        # — we compare against whichever resolution this point was
-        # projected from.
-        if point_method == "depth":
-            in_w, in_h = w_depth, h_depth
-        else:
-            in_w, in_h = w_res, h_res
-        in_px = nx * (in_w - 1)
-        in_py = ny * (in_h - 1)
-        rt = _world_to_pixel(wp.get("x", 0), wp.get("y", 0), wp.get("z", 0))
-        if rt is None:
-            rt_str = "BEHIND-CAMERA"
-        else:
-            rt_px, rt_py = rt
-            dpx = rt_px - in_px
-            dpy = rt_py - in_py
-            err = (dpx * dpx + dpy * dpy) ** 0.5
-            tag = "OK" if err < 2.0 else ("DRIFT" if err < 10.0 else "BROKEN")
-            rt_str = (f"round-trip pixel=({rt_px:.1f},{rt_py:.1f}) "
-                      f"err=({dpx:+.1f},{dpy:+.1f}) |err|={err:.1f}px [{tag}]")
-        print(f"  [{i}] image({nx:.2f},{ny:.2f})→({in_px:.0f},{in_py:.0f}) "
-              f"→ world({wp['x']:.3f}, {wp['y']:.3f}, {wp['z']:.3f}) "
-              f"[{point_method}]  {rt_str}")
-
-    # Augment the response with the actual world positions of the
-    # camera that took the image AND the robot's ee_link, so the
-    # caller can see the geometry that backed the projection.
-    # The wrist RealSense has TWO sensor prims (RGB + pseudo-depth)
-    # mounted with a small physical offset; if the caller wants to
-    # verify how their assumed-aligned coords actually relate to
-    # ee_link, they need both numbers.
-    extra: dict = {}
+    # Camera + ee_link world positions let the caller sanity-check the
+    # geometry that backed the projection.
+    extra = {}
+    cam_pos = omni.usd.get_world_transform_matrix(
+        omni.usd.get_context().get_stage().GetPrimAtPath(cam_path)).GetRow(3)
+    extra["camera_pos"] = [float(cam_pos[0]), float(cam_pos[1]),
+                           float(cam_pos[2])]
     try:
-        ee_pos = get_world_pos(EE_PATH)
-        extra["ee_link_pos"] = [float(ee_pos[0]),
-                                float(ee_pos[1]),
-                                float(ee_pos[2])]
+        ee = get_world_pos(EE_PATH)
+        extra["ee_link_pos"] = [float(ee[0]), float(ee[1]), float(ee[2])]
     except Exception:
         pass
-    try:
-        extra["camera_pos"] = [float(cam_pos[0]),
-                                float(cam_pos[1]),
-                                float(cam_pos[2])]
-    except Exception:
-        pass
-    # When projecting from the wrist colour camera, ALSO expose the
-    # depth camera's world transform — they are sibling prims on the
-    # RSD455 mount with different translations, and any caller doing
-    # depth alignment math needs both.
-    if cam_alias == "wrist":
-        try:
-            stage_d = omni.usd.get_context().get_stage()
-            d_prim = stage_d.GetPrimAtPath(CAMERA_DEPTH_PRIM)
-            if d_prim and d_prim.IsValid():
-                d_mat = omni.usd.get_world_transform_matrix(d_prim)
-                d_pos = d_mat.GetRow(3)
-                extra["wrist_depth_camera_pos"] = [
-                    float(d_pos[0]), float(d_pos[1]), float(d_pos[2])]
-        except Exception:
-            pass
+
     return {"status": "ok", "world_points": world_points,
-            "camera": cam_path, "method": method_used,
-            "depth_buffer_used": has_depth,
-            **extra}
+            "camera": cam_path, "method": "depth",
+            "depth_source": depth_source, **extra}
 
 
 # ═════════════════════════════════════════════════════════════
@@ -1455,78 +2467,16 @@ async def _get_scene_annotations(camera="rgb"):
       * visibility flag (depth buffer matches projected Z within 5cm)
       * occluded flag (centre pixel hidden by other geometry)
 
-    The workflow uses the world coords as ground truth and the 2D
-    bbox to match VLM / OWL-ViT2 detections to the right entry.
+    EVALUATION ONLY. The grasp pipeline never reads world coords from
+    here — it uses camera + depth via /api/project_to_world. These
+    annotations exist so perception error can be measured against a
+    known reference.
     """
-    import omni.usd
-    from pxr import Gf
-    from isaacsim.sensors.camera import Camera
-    import omni.kit.app
+    sensor, cam_path = await _get_camera(camera)
+    resolution = tuple(sensor.resolution)
+    h_res, w_res = resolution
 
-    # Map camera alias → prim path + resolution (mirror _capture_camera)
-    if camera == "rgb":
-        cam_path, res = CAMERA_RGB_PRIM, (1920, 1080)
-    elif camera == "depth":
-        cam_path, res = CAMERA_DEPTH_PRIM, (1280, 720)
-    elif camera == "wrist":
-        cam_path, res = CAMERA_WRIST_PRIM, (1280, 720)
-    elif camera == "kit":
-        cam_path, res = CAMERA_KIT_PRIM, (1280, 720)
-    else:
-        cam_path, res = camera, (1280, 720)
-
-    # Reuse cached cameras to avoid re-init + black frame on first call
-    if camera == "rgb" and STATE.camera_rgb is not None:
-        cam = STATE.camera_rgb
-    elif camera == "depth" and STATE.camera_depth is not None:
-        cam = STATE.camera_depth
-    elif camera == "wrist" and STATE.camera_wrist is not None:
-        cam = STATE.camera_wrist
-    elif camera == "kit" and STATE.camera_kit is not None:
-        cam = STATE.camera_kit
-    else:
-        cam = Camera(prim_path=cam_path, resolution=res)
-        cam.initialize()
-        for _ in range(10):
-            await omni.kit.app.get_app().next_update_async()
-
-    # Make sure the depth annotator is attached for visibility check
-    try:
-        cam.add_distance_to_image_plane_to_frame()
-        for _ in range(5):
-            await omni.kit.app.get_app().next_update_async()
-    except Exception:
-        pass
-
-    # Intrinsics
-    w_res, h_res = res
-    try:
-        K = cam.get_intrinsics_matrix()
-        fx, fy = float(K[0, 0]), float(K[1, 1])
-        cx, cy = float(K[0, 2]), float(K[1, 2])
-    except Exception:
-        import math
-        hfov = math.radians(60)
-        fx = fy = (w_res / 2.0) / math.tan(hfov / 2.0)
-        cx, cy = w_res / 2.0, h_res / 2.0
-
-    # Extrinsics: cam→world matrix and its inverse (world→cam)
-    stage = omni.usd.get_context().get_stage()
-    cam_prim = stage.GetPrimAtPath(cam_path)
-    cam_world_mat = omni.usd.get_world_transform_matrix(cam_prim)
-    world_to_cam = cam_world_mat.GetInverse()
-
-    # Optional depth buffer for visibility check (best-effort)
-    depth_buf = None
-    try:
-        for _ in range(5):
-            cam.get_current_frame()
-            await omni.kit.app.get_app().next_update_async()
-        d = cam.get_depth()
-        if d is not None and d.size > 0:
-            depth_buf = d
-    except Exception:
-        depth_buf = None
+    _, depth_buf = await _render_frame(sensor, camera)
 
     # Pull GT parts from existing scanner
     scan = await _scan_scene_parts()
@@ -1535,16 +2485,13 @@ async def _get_scene_annotations(camera="rgb"):
     parts = scan.get("parts", [])
 
     def _project_world_to_pixel(wx, wy, wz):
-        """world XYZ → (px, py, depth_to_cam_plane) or None if behind cam."""
-        cam_pt = world_to_cam.Transform(Gf.Vec3d(float(wx), float(wy), float(wz)))
-        cx_, cy_, cz_ = float(cam_pt[0]), float(cam_pt[1]), float(cam_pt[2])
-        # OpenGL camera: forward = -Z. Point in front of camera ⇒ cz_ < 0.
-        if cz_ >= -1e-3:
+        """world XYZ → (px, py, depth_to_image_plane) or None if behind cam."""
+        z_cam = _camera_frame_z(cam_path, (wx, wy, wz))
+        if z_cam <= 1e-3:
             return None
-        d = -cz_
-        px = cx_ * fx / d + cx
-        py = -cy_ * fy / d + cy
-        return px, py, d
+        px, py = _pixels_from_world_points(cam_path, resolution,
+                                           [(wx, wy, wz)])[0]
+        return float(px), float(py), z_cam
 
     annotations = []
     for part in parts:
@@ -1587,20 +2534,15 @@ async def _get_scene_annotations(camera="rgb"):
         occlusion_pct = 0.0
         if depth_buf is not None and c_depth > 0:
             h_d, w_d = depth_buf.shape[:2]
-            ipx = int(min(max(cpx, 0), w_res - 1) * (w_d - 1) / max(w_res - 1, 1))
-            ipy = int(min(max(cpy, 0), h_res - 1) * (h_d - 1) / max(h_res - 1, 1))
-            r = 2
-            patch = depth_buf[max(0, ipy - r):ipy + r + 1,
-                              max(0, ipx - r):ipx + r + 1]
-            valid = patch[(patch > 0.01) & (patch < 100.0)]
-            if valid.size > 0:
-                measured_d = float(np.median(valid))
-                # If measured depth is much closer than the part's projected
-                # depth, something is in front of it → occluded
-                if measured_d < c_depth - 0.05:
-                    visible = False
-                    occlusion_pct = max(0.0, min(1.0,
-                        (c_depth - measured_d) / c_depth))
+            measured_d = _sample_depth(depth_buf,
+                                       cpx * w_d / w_res,
+                                       cpy * h_d / h_res)
+            # Measured depth much closer than the part's projected depth
+            # means something is in front of it → occluded.
+            if measured_d is not None and measured_d < c_depth - 0.05:
+                visible = False
+                occlusion_pct = max(0.0, min(1.0,
+                                            (c_depth - measured_d) / c_depth))
 
         # Identify part type by name match
         name_lower = part["name"].lower()
@@ -1668,13 +2610,25 @@ async def _move_home():
 
     # If IK is ready, first retract to a safe height to avoid collisions
     if STATE.ik_ready:
-        ee_pos = get_world_pos(EE_PATH)
-        safe_z = ee_pos[2] + TRANSIT_SAFE_HEIGHT
-        locked_ori = normalize_quat(DOWNWARD_ORIENTATION)
-        warm = _get_warm_start()
-        action, ok = ik_solve(STATE.lula_solver, STATE.target_frame,
-                              np.array([ee_pos[0], ee_pos[1], safe_z]),
-                              locked_ori, warm)
+        # Retract from the TCP, not ee_link. Passing an ee_link height as
+        # a TCP target made _tool_pose_from_tcp add the gripper length a
+        # second time, putting the goal ~0.38 m too high — unreachable on
+        # a ceiling-mounted arm that is already parked near the top.
+        tcp_pos = get_tcp_pos()
+        safe_z = tcp_pos[2] + TRANSIT_SAFE_HEIGHT
+        # Only worth retracting if the tool is actually low. The point of
+        # this step is to lift clear of the bin before travelling; when
+        # the arm is already parked high, adding more height just asks for
+        # a pose above the ceiling mount that cannot be reached.
+        base_z = get_world_pos(ROBOT_ROOT_PATH)[2]
+        if tcp_pos[2] >= base_z:
+            print(f"  [home] TCP z={tcp_pos[2]:.3f} already at/above the "
+                  f"mount z={base_z:.3f} — skipping the retract")
+            ok = False
+        else:
+            locked_ori = normalize_quat(DOWNWARD_ORIENTATION)
+            action, ok = ik_solve(np.array([tcp_pos[0], tcp_pos[1], safe_z]),
+                                  locked_ori)
         if ok:
             targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, action)
             await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES)
@@ -1789,7 +2743,8 @@ async def _verify_grasp():
 # ═════════════════════════════════════════════════════════════
 
 def _get_warm_start():
-    """Build a Lula-compatible warm-start from current joint positions."""
+    """Legacy warm-start builder. cuMotion is sampling-based and ignores
+    it; kept only because call sites still pass one through."""
     current = STATE.robot.get_joint_positions()
     warm = np.zeros(len(STATE.arm_names))
     for i, lula_name in enumerate(STATE.arm_names):
@@ -1824,16 +2779,17 @@ def _get_home_warm_start():
 
 
 def _update_base_pose():
-    """Update Lula solver with current arm base transform."""
-    import omni.usd
-    from isaacsim.core.utils.prims import get_prim_at_path
-    base_prim = get_prim_at_path(UR10_BASE_PATH)
-    base_matrix = omni.usd.get_world_transform_matrix(base_prim)
-    base_pos = np.array(base_matrix.ExtractTranslation())
-    rot = base_matrix.ExtractRotation().GetQuat()
-    base_rot = np.array([rot.real, rot.imaginary[0], rot.imaginary[1], rot.imaginary[2]])
-    STATE.lula_solver.set_robot_base_pose(base_pos, base_rot)
-    return base_pos
+    """Refresh cuMotion's world→robot-root transform.
+
+    Rarely needed: the root is the fixed rail mount and the gantry is a
+    planned joint, so this only matters if the whole rig is repositioned
+    in the scene.
+    """
+    if STATE.cumotion_world is None:
+        return None
+    pos, quat = _robot_base_pose_arrays()
+    STATE.cumotion_world.update_world_to_robot_root_transforms(poses=(pos, quat))
+    return pos.numpy()[0]
 
 
 async def _apply_interpolated(target_joints, settle_frames=SETTLE_FRAMES, finger_value=None):
@@ -1849,6 +2805,17 @@ async def _apply_interpolated(target_joints, settle_frames=SETTLE_FRAMES, finger
     """
     import omni.kit.app
     from isaacsim.core.utils.types import ArticulationAction
+
+    # If a cuMotion plan is waiting, follow it — the planned path routes
+    # around obstacles, whereas the joint interpolation below would cut
+    # straight to the goal and potentially through them. Consumed once so
+    # a stale plan can never be replayed on a later, unrelated move.
+    traj = STATE.pending_trajectory
+    STATE.pending_trajectory = None
+    if traj is not None:
+        if await _execute_trajectory(traj, finger_value=finger_value,
+                                    settle_frames=settle_frames):
+            return
 
     current_joints = STATE.robot.get_joint_positions()
 
@@ -1871,23 +2838,45 @@ async def _apply_interpolated(target_joints, settle_frames=SETTLE_FRAMES, finger
 
 
 async def _ik_move_to(target_xyz, orientation=None, settle_frames=SETTLE_FRAMES):
-    """Move end-effector to XYZ using Lula IK with smooth streaming motion."""
+    """Move end-effector to XYZ along a cuMotion-planned trajectory."""
     if not STATE.ik_ready:
-        return {"error": "IK solver not initialised"}
+        return {"error": _planner_unavailable_reason()}
 
     target_pos = np.array(target_xyz, dtype=np.float64)
     ori = orientation if orientation is not None else normalize_quat(DOWNWARD_ORIENTATION)
 
     warm = _get_warm_start()
-    action, ok = ik_solve(STATE.lula_solver, STATE.target_frame, target_pos, ori, warm)
+    action, ok = ik_solve(target_pos, ori, warm)
     if not ok:
         return {"error": f"IK failed for target {target_xyz}"}
 
     target_joints = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, action)
+    tcp_before = get_tcp_pos()
     await _apply_interpolated(target_joints, settle_frames=settle_frames)
 
+    # Verify the move actually happened. A plan can succeed and the
+    # trajectory can stream while the joints never follow — reporting
+    # "ok" then sends the rest of the pipeline (wrist VLM, descend) to
+    # look for a part the gripper is nowhere near.
+    tcp_after = get_tcp_pos()
+    moved = float(np.linalg.norm(tcp_after - tcp_before))
+    err = float(np.linalg.norm(tcp_after - target_pos))
+    print(f"  [move] TCP {np.round(tcp_before, 3).tolist()} -> "
+          f"{np.round(tcp_after, 3).tolist()}")
+    print(f"  [move] travelled {moved:.4f} m; {err:.4f} m from the "
+          f"requested target")
+    if moved < 1e-3:
+        print("  [move] *** TCP DID NOT MOVE — the plan was executed but the "
+              "joints did not follow ***")
+    elif err > 0.05:
+        print(f"  [move] *** TCP ended {err:.3f} m from target — the arm "
+              f"moved, but not to where it was asked ***")
+
     ee_pos = get_world_pos(EE_PATH)
-    return {"status": "ok", "target": list(target_xyz), "ee_position": ee_pos.tolist()}
+    return {"status": "ok", "target": list(target_xyz),
+            "ee_position": ee_pos.tolist(),
+            "tcp_position": tcp_after.tolist(),
+            "tcp_travelled": moved, "tcp_error": err}
 
 
 async def _cartesian_pose_move(target_pos, target_ori, step_size=0.04,
@@ -1921,8 +2910,7 @@ async def _cartesian_pose_move(target_pos, target_ori, step_size=0.04,
     for step in range(1, n_steps + 1):
         frac = step / n_steps
         step_pos = current_ee + delta * frac
-        action, ok = ik_solve(STATE.lula_solver, STATE.target_frame,
-                              step_pos, target_ori, warm)
+        action, ok = ik_solve(step_pos, target_ori, warm)
         if not ok:
             print(f"  [CART_POSE] IK failed at step {step}/{n_steps} "
                   f"pos={step_pos.tolist()} — stopping here")
@@ -1936,8 +2924,7 @@ async def _cartesian_pose_move(target_pos, target_ori, step_size=0.04,
         last_action = action
 
     # Final settle at exact target
-    final_action, final_ok = ik_solve(STATE.lula_solver, STATE.target_frame,
-                                       target_pos, target_ori, warm)
+    final_action, final_ok = ik_solve(target_pos, target_ori, warm)
     if final_ok:
         targets = apply_arm_joints(STATE.robot, STATE.dof_names,
                                     STATE.arm_names, final_action)
@@ -2024,8 +3011,7 @@ async def _descend_with_contact_stop(target_z, x, y, locked_ori,
         z_step = current_z + (target_z - current_z) * frac
         step_pos = np.array([x, y, z_step])
 
-        action, ok = ik_solve(STATE.lula_solver, STATE.target_frame,
-                              step_pos, locked_ori, warm)
+        action, ok = ik_solve(step_pos, locked_ori, warm)
         if not ok:
             print(f"  [DESCEND-CONTACT] IK failed at step {step}/{n_steps} "
                   f"z={z_step:.3f} — stopping here")
@@ -2067,9 +3053,7 @@ async def _descend_with_contact_stop(target_z, x, y, locked_ori,
             if contact_lift_back > 0:
                 lift_z = last_z + contact_lift_back
                 lift_pos = np.array([x, y, lift_z])
-                lift_action, lift_ok = ik_solve(
-                    STATE.lula_solver, STATE.target_frame,
-                    lift_pos, locked_ori, warm)
+                lift_action, lift_ok = ik_solve(lift_pos, locked_ori, warm)
                 if lift_ok:
                     targets = apply_arm_joints(
                         STATE.robot, STATE.dof_names,
@@ -2167,8 +3151,7 @@ async def _cartesian_lateral_move(target_x, target_y, z, locked_ori,
         y_step = current_y + dy * frac
         step_pos = np.array([x_step, y_step, z])
 
-        action, ok = ik_solve(STATE.lula_solver, STATE.target_frame,
-                              step_pos, locked_ori, warm)
+        action, ok = ik_solve(step_pos, locked_ori, warm)
         if not ok:
             print(f"  [CARTESIAN_LATERAL] IK failed at step {step}/"
                   f"{n_steps} ({x_step:.3f}, {y_step:.3f}, {z:.3f}) "
@@ -2188,9 +3171,7 @@ async def _cartesian_lateral_move(target_x, target_y, z, locked_ori,
 
     # Final settle at the exact (target_x, target_y, z).
     final_pos = np.array([target_x, target_y, z])
-    final_action, final_ok = ik_solve(
-        STATE.lula_solver, STATE.target_frame,
-        final_pos, locked_ori, warm)
+    final_action, final_ok = ik_solve(final_pos, locked_ori, warm)
     if final_ok:
         targets = apply_arm_joints(STATE.robot, STATE.dof_names,
                                    STATE.arm_names, final_action)
@@ -2247,8 +3228,7 @@ async def _retract_cartesian_up(target_z, x, y, locked_ori,
         z_step   = current_z + (target_z - current_z) * frac
         step_pos = np.array([x, y, z_step])
 
-        action, ok = ik_solve(STATE.lula_solver, STATE.target_frame,
-                               step_pos, locked_ori, warm)
+        action, ok = ik_solve(step_pos, locked_ori, warm)
         if not ok:
             direction = "up" if target_z > current_z else "down"
             print(f"  [CARTESIAN_{direction.upper()}] IK failed at step {step}/{n_steps} z={z_step:.3f} — stopping here")
@@ -2266,8 +3246,7 @@ async def _retract_cartesian_up(target_z, x, y, locked_ori,
 
     # Final settle at the exact target position
     final_pos    = np.array([x, y, target_z])
-    final_action, final_ok = ik_solve(STATE.lula_solver, STATE.target_frame,
-                                       final_pos, locked_ori, warm)
+    final_action, final_ok = ik_solve(final_pos, locked_ori, warm)
     if final_ok:
         targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, final_action)
         if finger_value is not None:
@@ -2302,8 +3281,7 @@ async def _smooth_joint_retract(safe_pos, locked_ori, finger_value=None):
 
     grasp_warm = _get_warm_start()
 
-    target_action, ok = ik_solve(STATE.lula_solver, STATE.target_frame,
-                                  safe_pos, locked_ori, grasp_warm)
+    target_action, ok = ik_solve(safe_pos, locked_ori, grasp_warm)
     if not ok:
         print("  [SMOOTH_RETRACT] IK failed — falling back to micro-steps")
         return await _retract_cartesian_up(
@@ -2379,66 +3357,33 @@ async def _move_gantry_x(target_x, finger_hold=None, hold_ee_pos=None):
     # simultaneously.  X,Y are locked tight; Z has slight flexibility
     # so IK has room to find valid solutions.
     if hold_ee_pos is not None and STATE.ik_ready and abs(gantry_delta) > 0.005:
-        import omni.usd
-        from isaacsim.core.utils.prims import get_prim_at_path
-
+        # The gantry is joint 0 of the XRDF cspace, so ONE pose plan
+        # covers "slide the rail while the tool stays put" — cuMotion
+        # coordinates gantry and arm itself. The old code had to predict
+        # the base pose per step and re-solve because Lula treated the
+        # gantry as an external base shift.
         ee_lock = np.array(hold_ee_pos, dtype=np.float64)
         locked_ori = normalize_quat(DOWNWARD_ORIENTATION)
-        n_steps = max(4, int(abs(gantry_delta) / 0.02))  # ~0.02m per step
-
-        # Read initial base pose (position + rotation) once — rotation
-        # doesn't change during a prismatic slide, only X translates.
-        base_prim = get_prim_at_path(UR10_BASE_PATH)
-        base_matrix = omni.usd.get_world_transform_matrix(base_prim)
-        initial_base_pos = np.array(base_matrix.ExtractTranslation())
-        rot = base_matrix.ExtractRotation().GetQuat()
-        base_rot = np.array([rot.real, rot.imaginary[0],
-                             rot.imaginary[1], rot.imaginary[2]])
-
-        print(f"  [GANTRY] EE-hold slide: {gantry_current:.3f} → {gantry_target:.3f} "
-              f"({n_steps} steps), holding EE at "
+        print(f"  [GANTRY] EE-hold slide: {gantry_current:.3f} → "
+              f"{gantry_target:.3f}, holding EE at "
               f"({ee_lock[0]:.3f}, {ee_lock[1]:.3f}, {ee_lock[2]:.3f})")
 
-        for step in range(1, n_steps + 1):
-            frac = step / n_steps
-            intermediate = gantry_current + frac * gantry_delta
-            delta_from_start = intermediate - gantry_current
-
-            # 1. Predict where base_link WILL be after gantry moves
-            predicted_base = initial_base_pos.copy()
-            predicted_base[0] += delta_from_start  # prismatic along X
-
-            # 2. Tell Lula the predicted base pose
-            STATE.lula_solver.set_robot_base_pose(predicted_base, base_rot)
-
-            # 3. Solve IK for locked EE X,Y — allow Z to flex slightly
-            #    so the solver has more room for valid configurations
-            warm = _get_warm_start()
-            action, ok = ik_solve(STATE.lula_solver, STATE.target_frame,
-                                  ee_lock, locked_ori, warm)
-
-            # 4. Apply gantry + arm joints SIMULTANEOUSLY — no drift gap
-            if ok:
-                targets = apply_arm_joints(
-                    STATE.robot, STATE.dof_names, STATE.arm_names, action)
-            else:
-                targets = STATE.robot.get_joint_positions()
-            targets[gantry_idx] = intermediate
+        q_goal = _current_cspace().copy()
+        q_goal[0] = gantry_target          # cspace joint 0 == gantry
+        traj = _plan_cspace(q_goal)
+        if traj is not None:
+            await _execute_trajectory(traj, finger_value=finger_hold)
+        else:
+            print("  [GANTRY] plan failed — falling back to direct joint move")
+            targets = STATE.robot.get_joint_positions().copy()
+            targets[gantry_idx] = gantry_target
             if finger_hold is not None:
                 targets = set_finger_joints(
                     STATE.robot, STATE.dof_names, finger_hold, targets)
             STATE.robot.apply_action(ArticulationAction(joint_positions=targets))
-
-            # 5. Step physics — both gantry + arm move together
-            for _ in range(4):
+            for _ in range(SETTLE_FRAMES):
                 await omni.kit.app.get_app().next_update_async()
 
-        # Final settle
-        for _ in range(SETTLE_FRAMES):
-            await omni.kit.app.get_app().next_update_async()
-
-        # Sync Lula base pose with actual USD state after the full slide
-        _update_base_pose()
         ee_final = get_world_pos(EE_PATH)
         drift_xy = np.linalg.norm(ee_final[:2] - ee_lock[:2])
         drift_z = abs(ee_final[2] - ee_lock[2])
@@ -2456,7 +3401,6 @@ async def _move_gantry_x(target_x, finger_hold=None, hold_ee_pos=None):
     for _ in range(SETTLE_FRAMES):
         await omni.kit.app.get_app().next_update_async()
 
-    _update_base_pose()
     return {"status": "ok", "gantry_x": float(gantry_target)}
 
 
@@ -2544,7 +3488,7 @@ async def _realign_gantry_hold_ee(params):
     if not STATE.is_ready:
         return {"error": "Not ready"}
     if not STATE.ik_ready:
-        return {"error": "IK solver not initialised"}
+        return {"error": _planner_unavailable_reason()}
 
     target_x = params.get("x")
     if target_x is None:
@@ -2611,7 +3555,7 @@ async def _pick_descend(params):
     from isaacsim.core.utils.types import ArticulationAction
 
     if not STATE.ik_ready:
-        return {"error": "IK solver not initialised"}
+        return {"error": _planner_unavailable_reason()}
 
     x = params.get("x", 0.3)
     y = params.get("y", 0.0)
@@ -2661,9 +3605,7 @@ async def _pick_descend(params):
             print(f"  [DESCEND] XY correction: drift={xy_error:.4f}m, "
                   f"snapping EE to ({x:.3f}, {y:.3f}, {current_ee[2]:.3f})")
             correct_warm = _get_warm_start()
-            correct_action, correct_ok = ik_solve(
-                STATE.lula_solver, STATE.target_frame,
-                correct_pos, locked_ori, correct_warm)
+            correct_action, correct_ok = ik_solve(correct_pos, locked_ori, correct_warm)
             if correct_ok:
                 targets = apply_arm_joints(
                     STATE.robot, STATE.dof_names, STATE.arm_names, correct_action)
@@ -2686,8 +3628,7 @@ async def _pick_descend(params):
             steps.append({"phase": "safe_retract", "status": "ok"})
             warm = _get_warm_start()
 
-        p1_action, p1_ok = ik_solve(STATE.lula_solver, STATE.target_frame,
-                                     safe_pos, locked_ori, warm)
+        p1_action, p1_ok = ik_solve(safe_pos, locked_ori, warm)
         if not p1_ok:
             return {"error": f"IK safe failed {safe_pos.tolist()}", "steps": steps}
         targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, p1_action)
@@ -2696,14 +3637,12 @@ async def _pick_descend(params):
 
         # 4. Re-solve seed
         settled_warm = _get_warm_start()
-        p2_action, p2_ok = ik_solve(STATE.lula_solver, STATE.target_frame,
-                                     safe_pos, locked_ori, settled_warm)
+        p2_action, p2_ok = ik_solve(safe_pos, locked_ori, settled_warm)
         if not p2_ok:
             p2_action = p1_action
 
         # 5. Entry — just inside box rim
-        entry_action, entry_ok = ik_solve(STATE.lula_solver, STATE.target_frame,
-                                           entry_pos, locked_ori, p2_action)
+        entry_action, entry_ok = ik_solve(entry_pos, locked_ori, p2_action)
         if entry_ok:
             targets = apply_arm_joints(
                 STATE.robot, STATE.dof_names, STATE.arm_names, entry_action)
@@ -2712,8 +3651,7 @@ async def _pick_descend(params):
             p2_action = entry_action
 
         # 6. Hover — above part
-        hover_action, hover_ok = ik_solve(STATE.lula_solver, STATE.target_frame,
-                                           hover_pos, locked_ori, p2_action)
+        hover_action, hover_ok = ik_solve(hover_pos, locked_ori, p2_action)
         if not hover_ok:
             return {"error": f"IK hover failed {hover_pos.tolist()}", "steps": steps}
         targets = apply_arm_joints(
@@ -2734,9 +3672,7 @@ async def _pick_descend(params):
             repose_target = np.array([x, y, float(hover_ee[2])])
             print(f"  [DESCEND] Re-posing EE to ({x:.3f}, {y:.3f}, {hover_ee[2]:.3f})")
             repose_warm = _get_warm_start()
-            repose_action, repose_ok = ik_solve(
-                STATE.lula_solver, STATE.target_frame,
-                repose_target, locked_ori, repose_warm)
+            repose_action, repose_ok = ik_solve(repose_target, locked_ori, repose_warm)
             if repose_ok:
                 targets = apply_arm_joints(
                     STATE.robot, STATE.dof_names, STATE.arm_names, repose_action)
@@ -2847,9 +3783,7 @@ async def _pick_descend(params):
                   f"({x:.4f}, {y:.4f}) at z={float(actual_ee[2]):.4f}")
             snap_pos = np.array([x, y, float(actual_ee[2])])
             snap_warm = STATE.robot.get_joint_positions()[:6]
-            snap_action, snap_ok = ik_solve(
-                STATE.lula_solver, STATE.target_frame,
-                snap_pos, locked_ori, snap_warm)
+            snap_action, snap_ok = ik_solve(snap_pos, locked_ori, snap_warm)
             if snap_ok:
                 snap_targets = apply_arm_joints(
                     STATE.robot, STATE.dof_names,
@@ -3120,7 +4054,7 @@ async def _pick_retract(params):
     from isaacsim.core.utils.types import ArticulationAction
 
     if not STATE.ik_ready:
-        return {"error": "IK solver not initialised"}
+        return {"error": _planner_unavailable_reason()}
 
     x = params.get("x", 0.3)
     y = params.get("y", 0.0)
@@ -3154,9 +4088,7 @@ async def _pick_retract(params):
         # IK call so finger force is preserved across the jumps.
         print(f"  [RETRACT] Single-IK lift to safe_z={safe_pos[2]:.3f}")
         retract_warm = _get_warm_start()
-        retract_action, retract_ok = ik_solve(
-            STATE.lula_solver, STATE.target_frame,
-            safe_pos, locked_ori, retract_warm)
+        retract_action, retract_ok = ik_solve(safe_pos, locked_ori, retract_warm)
         if retract_ok:
             targets = apply_arm_joints(STATE.robot, STATE.dof_names,
                                        STATE.arm_names, retract_action)
@@ -3174,9 +4106,7 @@ async def _pick_retract(params):
         # Transit to clear-height — also single IK with grip re-enforced.
         print(f"  [RETRACT] Single-IK transit to z={transit_pos[2]:.3f}")
         transit_warm = _get_warm_start()
-        transit_action, transit_ok = ik_solve(
-            STATE.lula_solver, STATE.target_frame,
-            transit_pos, locked_ori, transit_warm)
+        transit_action, transit_ok = ik_solve(transit_pos, locked_ori, transit_warm)
         if transit_ok:
             targets = apply_arm_joints(STATE.robot, STATE.dof_names,
                                        STATE.arm_names, transit_action)
@@ -3252,7 +4182,7 @@ async def _place_object_ik(params):
     from isaacsim.core.utils.types import ArticulationAction
 
     if not STATE.ik_ready:
-        return {"error": "IK solver not initialised"}
+        return {"error": _planner_unavailable_reason()}
 
     x = params.get("x", 0.5)
     y = params.get("y", 0.0)
@@ -3317,9 +4247,7 @@ async def _place_object_ik(params):
         transit_up_z = current_ee[2] + TRANSIT_SAFE_HEIGHT + transit_clearance
         transit_up_pos = np.array([current_ee[0], current_ee[1], transit_up_z])
         transit_up_warm = _get_warm_start()
-        transit_up_action, transit_up_ok = ik_solve(
-            STATE.lula_solver, STATE.target_frame,
-            transit_up_pos, locked_ori, transit_up_warm)
+        transit_up_action, transit_up_ok = ik_solve(transit_up_pos, locked_ori, transit_up_warm)
         if transit_up_ok:
             targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, transit_up_action)
             targets = set_finger_joints(STATE.robot, STATE.dof_names, grip_hold, targets)
@@ -3353,9 +4281,7 @@ async def _place_object_ik(params):
                 float(current_ee[0]), float(current_ee[1]),
                 float(current_ee[2])])
             reset_warm = _get_home_warm_start()
-            reset_action, reset_ok = ik_solve(
-                STATE.lula_solver, STATE.target_frame,
-                reset_pos, locked_ori, reset_warm)
+            reset_action, reset_ok = ik_solve(reset_pos, locked_ori, reset_warm)
             if reset_ok:
                 targets = apply_arm_joints(
                     STATE.robot, STATE.dof_names, STATE.arm_names,
@@ -3412,9 +4338,7 @@ async def _place_object_ik(params):
         if xy_drift > 0.005:  # >5 mm
             snap_pos = np.array([dest_x, dest_y, float(ee_at_transit[2])])
             snap_warm = _get_warm_start()
-            snap_action, snap_ok = ik_solve(
-                STATE.lula_solver, STATE.target_frame,
-                snap_pos, locked_ori, snap_warm)
+            snap_action, snap_ok = ik_solve(snap_pos, locked_ori, snap_warm)
             if snap_ok:
                 targets = apply_arm_joints(STATE.robot, STATE.dof_names,
                                            STATE.arm_names, snap_action)
@@ -3455,8 +4379,7 @@ async def _place_object_ik(params):
 
         # 9. Retract — interpolated (no finger hold, part released)
         retract_warm = _get_warm_start()
-        retract_action, retract_ok = ik_solve(STATE.lula_solver, STATE.target_frame,
-                                               retract_pos, locked_ori, retract_warm)
+        retract_action, retract_ok = ik_solve(retract_pos, locked_ori, retract_warm)
         if retract_ok:
             targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, retract_action)
             await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES)
@@ -3466,8 +4389,7 @@ async def _place_object_ik(params):
         retract_transit_warm = _get_warm_start()
         retract_transit_z = retract_z + TRANSIT_SAFE_HEIGHT
         retract_transit_pos = np.array([dest_x, dest_y, retract_transit_z])
-        rt_action, rt_ok = ik_solve(STATE.lula_solver, STATE.target_frame,
-                                     retract_transit_pos, locked_ori, retract_transit_warm)
+        rt_action, rt_ok = ik_solve(retract_transit_pos, locked_ori, retract_transit_warm)
         if rt_ok:
             targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, rt_action)
             await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES)
@@ -3583,10 +4505,14 @@ def _shutdown_bridge(reason="simulation stopped"):
     STATE.is_ready = False
     STATE.ik_ready = False
     STATE.is_executing = False
-    STATE.camera_rgb = None
-    STATE.camera_depth = None
-    STATE.camera_wrist = None
-    STATE.lula_solver = None
+    STATE.cameras.clear()
+    STATE.frames.clear()
+    STATE.cumotion_robot = None
+    STATE.cumotion_world = None
+    STATE.cumotion_planner = None
+    STATE.cumotion_ready = False
+    STATE.pending_trajectory = None
+    STATE.collision_sphere_count = 0
 
     # Drain any pending commands/results so they don't leak into next session
     with STATE._lock:
@@ -3645,7 +4571,7 @@ async def start_bridge():
     STATE.num_dof = robot.num_dof
     STATE.dof_names = robot.dof_names
     STATE.is_ready = True
-
+    """
     # Moderately boost finger joint stiffness so the PD controller holds
     # parts during arm motion without generating destructive contact forces.
     # 2000 N·m/rad is ~5-20x the URDF default — firm grip, not explosive.
@@ -3660,7 +4586,7 @@ async def start_bridge():
         print("[OK] Finger joint stiffness set (Kp=2000, Kd=200)")
     except Exception as e:
         print(f"[WARN] Could not set finger gains: {e}")
-
+    """
     # Hold current pose at startup — tell the PD controller "stay here"
     # BEFORE physics advances, so the boosted Kp=2000 fingers don't snap
     # closed and the arm doesn't jerk to default zero targets.
@@ -3678,40 +4604,26 @@ async def start_bridge():
     print(f"[OK] Robot ready — {STATE.num_dof} DOFs")
     print(f"[OK] Home joints captured: {[f'{j:.3f}' for j in HOME_JOINTS]}")
 
-    # ── Lula IK Solver ───────────────────────────────────────
+    # ── cuMotion motion planning ─────────────────────────────
+    # The XRDF cspace includes gantry_vagn_joint, so the gantry is a
+    # planned joint rather than a base shift — no set_robot_base_pose
+    # bookkeeping, and the planner can trade gantry travel against arm
+    # reach to route around obstacles.
     try:
-        from isaacsim.robot_motion.motion_generation import LulaKinematicsSolver
-
-        fixed_urdf, fixed_yaml = patch_urdf_and_yaml()
-        print(f"[OK] URDF patched: {fixed_urdf}")
-
-        lula_solver = LulaKinematicsSolver(
-            robot_description_path=fixed_yaml, urdf_path=fixed_urdf)
-
-        # Determine target frame
-        target_frame = "ee_link"
-        try:
-            test_pos = np.array([0.0, -0.5, 1.2])
-            test_ori = normalize_quat(DOWNWARD_ORIENTATION)
-            _, test_ok = lula_solver.compute_inverse_kinematics(
-                frame_name="gripper_tcp", target_position=test_pos,
-                target_orientation=test_ori, warm_start=np.zeros(6))
-            if test_ok:
-                target_frame = "gripper_tcp"
-        except Exception:
-            pass
-
-        STATE.lula_solver = lula_solver
-        STATE.target_frame = target_frame
-        STATE.arm_names = lula_solver.get_joint_names()
-        STATE.ik_ready = True
-
-        # Set initial base pose
-        _update_base_pose()
-
-        print(f"[OK] Lula IK ready — frame='{target_frame}', joints={STATE.arm_names}")
+        if _init_cumotion():
+            STATE.arm_names = list(
+                STATE.cumotion_robot.controlled_joint_names)
+            STATE.target_frame = CUMOTION_TOOL_FRAME
+            STATE.ik_ready = True
+            print(f"[OK] cuMotion ready — tool_frame='{CUMOTION_TOOL_FRAME}', "
+                  f"joints={STATE.arm_names}")
+            print("[..] Collision world is EMPTY until "
+                  "/api/build_collision_world is called")
+        else:
+            STATE.ik_ready = False
+            print("[WARN] cuMotion init failed — motion will use set_joints")
     except Exception as e:
-        print(f"[WARN] Lula IK init failed (motion will use set_joints): {e}")
+        print(f"[WARN] cuMotion init failed: {e}")
         STATE.ik_ready = False
 
     # ── Subscribe to timeline events (stop/pause → shutdown) ─
@@ -3725,37 +4637,8 @@ async def start_bridge():
     _timeline_sub = stream.create_subscription_to_pop(_on_timeline_event)
     print("[OK] Timeline subscription active — bridge will auto-stop on sim stop")
 
-    # ── Contact Sensors ──────────────────────────────────────
-    # Two independent sensors — one on the inner finger pad (used by
-    # the adaptive gripper-close motion) and one on the fingertip
-    # bottom (used by the contact-aware descent to detect floor / part
-    # top before the gripper jams into the surface).
-    #
-    # ``ContactSensor`` lives in two different namespaces depending on
-    # Isaac Sim version:
-    #   * Newer (4.5+):  isaacsim.sensors.contact_sensor.ContactSensor
-    #   * Older (≤ 4.4): omni.isaac.sensor.ContactSensor
-    # Try the new path first, fall back to the legacy path so the
-    # bridge works across both. The ``Camera`` class in this file
-    # already uses the legacy ``omni.isaac.sensor`` path successfully,
-    # which tells us the legacy namespace is available on this build.
-    # Isaac Sim 6.0.1: ContactSensor lives in ``isaacsim.sensors.physics``.
-    # Older names (``isaacsim.sensors.contact_sensor`` on 4.5-5.x,
-    # ``omni.isaac.sensor`` on <=4.4) are kept as fallbacks for older installs.
-    ContactSensor = None
-    _cs_namespace = None
-    for _cs_mod in ("isaacsim.sensors.physics",
-                    "isaacsim.sensors.contact_sensor",
-                    "omni.isaac.sensor"):
-        try:
-            import importlib as _importlib
-            ContactSensor = getattr(
-                _importlib.import_module(_cs_mod), "ContactSensor")
-            _cs_namespace = _cs_mod
-            break
-        except (ImportError, AttributeError):
-            continue
-
+    # ── Contact Sensors ──────────────────────────────────────    
+    from isaacsim.sensors.experimental.physics import ContactSensor
     if ContactSensor is None:
         STATE.contact_sensor = None
         STATE.contact_sensor_tip = None
@@ -3764,11 +4647,9 @@ async def start_bridge():
               "'omni.isaac.sensor'. Descent will run blind and the "
               "adaptive gripper close will use the open-loop fallback.")
     else:
-        print(f"[OK] ContactSensor class loaded from "
-              f"'{_cs_namespace}'")
+        print(f"[OK] ContactSensor class loaded")
         try:
-            cs_pad = ContactSensor(prim_path=CONTACT_SENSOR_PRIM)
-            cs_pad.initialize()
+            cs_pad = ContactSensor(CONTACT_SENSOR_PRIM)
             for _ in range(10):
                 await omni.kit.app.get_app().next_update_async()
             STATE.contact_sensor = cs_pad
@@ -3779,8 +4660,7 @@ async def start_bridge():
                   f"(preset gripper mode): {e}")
 
         try:
-            cs_tip = ContactSensor(prim_path=CONTACT_SENSOR_TIP_PRIM)
-            cs_tip.initialize()
+            cs_tip = ContactSensor(CONTACT_SENSOR_TIP_PRIM)
             for _ in range(10):
                 await omni.kit.app.get_app().next_update_async()
             STATE.contact_sensor_tip = cs_tip
@@ -3797,7 +4677,7 @@ async def start_bridge():
 
     def serve():
         print(f"[OK] Bridge v2 on http://{BRIDGE_HOST}:{BRIDGE_PORT}")
-        print(f"     IK: {'Lula ({})'.format(STATE.target_frame) if STATE.ik_ready else 'DISABLED'}")
+        print(f"     Planner: {'cuMotion ({})'.format(STATE.target_frame) if STATE.ik_ready else 'DISABLED — ' + str(STATE.cumotion_error)}")
         print(f"     Cameras: RGB={CAMERA_RGB_PRIM}")
         print(f"              Depth={CAMERA_DEPTH_PRIM}")
         print(f"              Wrist={CAMERA_WRIST_PRIM}")
@@ -3842,6 +4722,16 @@ async def _process_commands_loop():
                 result = await _get_scene_annotations(cmd.get("camera", "rgb"))
             elif action == "compute_prim_center":
                 result = await _compute_prim_center(cmd.get("prim_path", ""))
+            elif action == "plan_test":
+                result = await _plan_test(cmd.get("params", {}))
+            elif action == "jog":
+                result = await _jog_joint(cmd.get("params", {}))
+            elif action == "verify_planner":
+                result = await _verify_planner(cmd.get("params", {}))
+            elif action == "build_collision_world":
+                result = await _build_collision_world(cmd.get("params", {}))
+            elif action == "wrist_obstacles":
+                result = await _add_wrist_obstacles(cmd.get("params", {}))
             elif action == "approach":
                 result = await _approach_target(cmd.get("params", {}))
             elif action == "realign_gantry_hold_ee":

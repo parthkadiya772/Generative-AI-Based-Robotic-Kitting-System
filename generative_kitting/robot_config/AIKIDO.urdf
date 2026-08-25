@@ -1,0 +1,939 @@
+<?xml version="1.0" encoding="utf-8"?>
+<robot name="gantry">
+  <link name="gantry">
+    <inertial>
+      <mass value="1000"/>
+      <inertia ixx="0" ixy="0" ixz="0" iyy="0" iyz="0" izz="0"/>
+    </inertial>
+    <visual name="gantry">
+      <geometry>
+        <mesh filename="./meshes/gantry.obj"/>
+      </geometry>
+    </visual>
+    <visual name="vagn">
+      <geometry>
+        <mesh filename="./meshes/vagn.obj"/>
+      </geometry>
+    </visual>
+    <visual name="ID125_001">
+      <geometry>
+        <mesh filename="./meshes/ID125_001.obj"/>
+      </geometry>
+    </visual>
+    <visual name="ID125_001fa3">
+      <geometry>
+        <mesh filename="./meshes/ID125_001fa3.obj"/>
+      </geometry>
+    </visual>
+    <visual name="ID461_001">
+      <geometry>
+        <mesh filename="./meshes/ID461_001.obj"/>
+      </geometry>
+    </visual>
+    <visual name="ID461_001fa3">
+      <geometry>
+        <mesh filename="./meshes/ID461_001fa3.obj"/>
+      </geometry>
+    </visual>
+    <visual name="ID461_001SVM">
+      <geometry>
+        <mesh filename="./meshes/ID461_001SVM.obj"/>
+      </geometry>
+    </visual>
+    <visual name="ID461_001ORK">
+      <geometry>
+        <mesh filename="./meshes/ID461_001ORK.obj"/>
+      </geometry>
+    </visual>
+    <visual name="ID251_001">
+      <geometry>
+        <mesh filename="./meshes/ID251_001.obj"/>
+      </geometry>
+    </visual>
+    <visual name="ID251_001fa3">
+      <geometry>
+        <mesh filename="./meshes/ID251_001fa3.obj"/>
+      </geometry>
+    </visual>
+    <visual name="ID251_001SVM">
+      <geometry>
+        <mesh filename="./meshes/ID251_001SVM.obj"/>
+      </geometry>
+    </visual>
+    <visual name="ID251_001ORK">
+      <geometry>
+        <mesh filename="./meshes/ID251_001ORK.obj"/>
+      </geometry>
+    </visual>
+    <visual name="ID251_001P1u">
+      <geometry>
+        <mesh filename="./meshes/ID251_001P1u.obj"/>
+      </geometry>
+    </visual>
+    <visual name="ID71_001">
+      <geometry>
+        <mesh filename="./meshes/ID71_001.obj"/>
+      </geometry>
+    </visual>
+    <visual name="ID71_001fa3">
+      <geometry>
+        <mesh filename="./meshes/ID71_001fa3.obj"/>
+      </geometry>
+    </visual>
+    <visual name="ID71_001SVM">
+      <geometry>
+        <mesh filename="./meshes/ID71_001SVM.obj"/>
+      </geometry>
+    </visual>
+    <visual name="ID71_001ORK">
+      <geometry>
+        <mesh filename="./meshes/ID71_001ORK.obj"/>
+      </geometry>
+    </visual>
+    <visual name="ID71_001P1u">
+      <geometry>
+        <mesh filename="./meshes/ID71_001P1u.obj"/>
+      </geometry>
+    </visual>
+    <visual name="ID239_001">
+      <geometry>
+        <mesh filename="./meshes/ID239_001.obj"/>
+      </geometry>
+    </visual>
+    <visual name="ID239_001fa3">
+      <geometry>
+        <mesh filename="./meshes/ID239_001fa3.obj"/>
+      </geometry>
+    </visual>
+    <visual name="ID239_001SVM">
+      <geometry>
+        <mesh filename="./meshes/ID239_001SVM.obj"/>
+      </geometry>
+    </visual>
+    <visual name="ID347_001">
+      <geometry>
+        <mesh filename="./meshes/ID347_001.obj"/>
+      </geometry>
+    </visual>
+    <visual name="ID347_001fa3">
+      <geometry>
+        <mesh filename="./meshes/ID347_001fa3.obj"/>
+      </geometry>
+    </visual>
+    <visual name="ID347_001SVM">
+      <geometry>
+        <mesh filename="./meshes/ID347_001SVM.obj"/>
+      </geometry>
+    </visual>
+    <visual name="ID347_001ORK">
+      <geometry>
+        <mesh filename="./meshes/ID347_001ORK.obj"/>
+      </geometry>
+    </visual>
+    <visual name="ID275_001">
+      <geometry>
+        <mesh filename="./meshes/ID275_001.obj"/>
+      </geometry>
+    </visual>
+    <visual name="ID275_001fa3">
+      <geometry>
+        <mesh filename="./meshes/ID275_001fa3.obj"/>
+      </geometry>
+    </visual>
+    <visual name="Finger1">
+      <geometry>
+        <mesh filename="./meshes/Finger1.obj"/>
+      </geometry>
+    </visual>
+    <visual name="Finger2">
+      <geometry>
+        <mesh filename="./meshes/Finger2.obj"/>
+      </geometry>
+    </visual>
+    <visual name="Fingertip">
+      <geometry>
+        <mesh filename="./meshes/Fingertip.obj"/>
+      </geometry>
+    </visual>
+    <visual name="Finger4">
+      <geometry>
+        <mesh filename="./meshes/Finger4.obj"/>
+      </geometry>
+    </visual>
+    <visual name="Finger3">
+      <geometry>
+        <mesh filename="./meshes/Finger3.obj"/>
+      </geometry>
+    </visual>
+    <visual name="Finger1">
+      <geometry>
+        <mesh filename="./meshes/Finger1_1.obj"/>
+      </geometry>
+    </visual>
+    <visual name="Finger2">
+      <geometry>
+        <mesh filename="./meshes/Finger2_1.obj"/>
+      </geometry>
+    </visual>
+    <visual name="Finger4">
+      <geometry>
+        <mesh filename="./meshes/Finger4_1.obj"/>
+      </geometry>
+    </visual>
+    <visual name="Fingertip">
+      <geometry>
+        <mesh filename="./meshes/Fingertip_1.obj"/>
+      </geometry>
+    </visual>
+    <visual name="Finger3">
+      <geometry>
+        <mesh filename="./meshes/Finger3_1.obj"/>
+      </geometry>
+    </visual>
+    <visual name="_F_Body">
+      <geometry>
+        <mesh filename="./meshes/_F_Body.obj"/>
+      </geometry>
+    </visual>
+    <collision name="vagn">
+      <geometry>
+        <mesh filename="./meshes/vagn.obj"/>
+      </geometry>
+    </collision>
+    <collision name="cylinder">
+      <origin xyz="3.26999994 -0.29500012 0.18" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.075" length="0.03"/>
+      </geometry>
+    </collision>
+    <collision name="cylinder">
+      <origin xyz="3.26999994 -0.29500014 0.2899999" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.075" length="0.17"/>
+      </geometry>
+    </collision>
+    <collision name="cylinder_0">
+      <origin xyz="3.26999994 -0.25250014 0.28799991" rpy="1.57079612 0 0"/>
+      <geometry>
+        <cylinder radius="0.075" length="0.085"/>
+      </geometry>
+    </collision>
+    <collision name="cylinder">
+      <origin xyz="3.26999994 -0.11900012 0.288" rpy="1.57079612 0.00000047 0"/>
+      <geometry>
+        <cylinder radius="0.075" length="0.175"/>
+      </geometry>
+    </collision>
+    <collision name="cylinder_0">
+      <origin xyz="3.57599992 -0.11900012 0.28799986" rpy="0 1.57079606 0"/>
+      <geometry>
+        <cylinder radius="0.06" length="0.61199996"/>
+      </geometry>
+    </collision>
+    <collision name="cylinder_1">
+      <origin xyz="3.88199991 -0.11900012 0.28799971" rpy="1.57079612 0.00000047 0"/>
+      <geometry>
+        <cylinder radius="0.06" length="0.136"/>
+      </geometry>
+    </collision>
+    <collision name="cylinder">
+      <origin xyz="3.88199983 -0.25011013 0.28799999" rpy="1.57079612 0.00000047 0"/>
+      <geometry>
+        <cylinder radius="0.06" length="0.126"/>
+      </geometry>
+    </collision>
+    <collision name="cylinder_0">
+      <origin xyz="4.16799983 -0.24700013 0.28799986" rpy="0 1.57079606 0"/>
+      <geometry>
+        <cylinder radius="0.047" length="0.57200003"/>
+      </geometry>
+    </collision>
+    <collision name="cylinder_1">
+      <origin xyz="4.45399984 -0.24420013 0.28799973" rpy="1.57079612 0.00000047 0"/>
+      <geometry>
+        <cylinder radius="0.047" length="0.118"/>
+      </geometry>
+    </collision>
+    <collision name="cylinder">
+      <origin xyz="4.45399997 -0.15850013 0.288" rpy="1.57079612 0 0"/>
+      <geometry>
+        <cylinder radius="0.047" length="0.055"/>
+      </geometry>
+    </collision>
+    <collision name="cylinder_0">
+      <origin xyz="4.45399997 -0.13100013 0.2852" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.047" length="0.118"/>
+      </geometry>
+    </collision>
+    <collision name="cylinder">
+      <origin xyz="4.45399997 -0.13100013 0.19900001" rpy="0 0 -0.00000003"/>
+      <geometry>
+        <cylinder radius="0.047" length="0.054"/>
+      </geometry>
+    </collision>
+    <collision name="cylinder_0">
+      <origin xyz="4.45399997 -0.12820013 0.17200001" rpy="1.57079612 0 -0"/>
+      <geometry>
+        <cylinder radius="0.047" length="0.118"/>
+      </geometry>
+    </collision>
+    <collision name="cylinder">
+      <origin xyz="4.45399997 -0.05400014 0.17200001" rpy="1.57079612 0 0"/>
+      <geometry>
+        <cylinder radius="0.047" length="0.03"/>
+      </geometry>
+    </collision>
+    <collision name="Finger1">
+      <geometry>
+        <mesh filename="./meshes/Finger1.obj"/>
+      </geometry>
+    </collision>
+    <collision name="Finger2">
+      <geometry>
+        <mesh filename="./meshes/Finger2.obj"/>
+      </geometry>
+    </collision>
+    <collision name="Fingertip">
+      <geometry>
+        <mesh filename="./meshes/Fingertip.obj"/>
+      </geometry>
+    </collision>
+    <collision name="Finger4">
+      <geometry>
+        <mesh filename="./meshes/Finger4.obj"/>
+      </geometry>
+    </collision>
+    <collision name="Finger3">
+      <geometry>
+        <mesh filename="./meshes/Finger3.obj"/>
+      </geometry>
+    </collision>
+    <collision name="Finger1">
+      <geometry>
+        <mesh filename="./meshes/Finger1_1.obj"/>
+      </geometry>
+    </collision>
+    <collision name="Finger2">
+      <geometry>
+        <mesh filename="./meshes/Finger2_1.obj"/>
+      </geometry>
+    </collision>
+    <collision name="Finger4">
+      <geometry>
+        <mesh filename="./meshes/Finger4_1.obj"/>
+      </geometry>
+    </collision>
+    <collision name="Fingertip">
+      <geometry>
+        <mesh filename="./meshes/Fingertip_1.obj"/>
+      </geometry>
+    </collision>
+    <collision name="Finger3">
+      <geometry>
+        <mesh filename="./meshes/Finger3_1.obj"/>
+      </geometry>
+    </collision>
+    <collision name="_F_Body">
+      <geometry>
+        <mesh filename="./meshes/_F_Body.obj"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="vagn">
+    <visual name="vagn">
+      <geometry>
+        <mesh filename="./meshes/vagn.obj"/>
+      </geometry>
+    </visual>
+    <collision name="vagn">
+      <geometry>
+        <mesh filename="./meshes/vagn.obj"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="base_link">
+    <inertial>
+      <mass value="200"/>
+      <inertia ixx="0" ixy="0" ixz="0" iyy="0" iyz="0" izz="0"/>
+    </inertial>
+    <visual name="ID125_001">
+      <geometry>
+        <mesh filename="./meshes/ID125_001.obj"/>
+      </geometry>
+    </visual>
+    <visual name="ID125_001fa3">
+      <geometry>
+        <mesh filename="./meshes/ID125_001fa3.obj"/>
+      </geometry>
+    </visual>
+    <collision name="cylinder">
+      <origin xyz="0.00011887 0.00011927 0.02" rpy="0.00000007 0 0"/>
+      <geometry>
+        <cylinder radius="0.075" length="0.03"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="shoulder_link">
+    <inertial>
+      <mass value="7.0999999"/>
+      <inertia ixx="0" ixy="0" ixz="0" iyy="0" iyz="0" izz="0"/>
+    </inertial>
+    <visual name="ID461_001">
+      <geometry>
+        <mesh filename="./meshes/ID461_001.obj"/>
+      </geometry>
+    </visual>
+    <visual name="ID461_001fa3">
+      <geometry>
+        <mesh filename="./meshes/ID461_001fa3.obj"/>
+      </geometry>
+    </visual>
+    <visual name="ID461_001SVM">
+      <geometry>
+        <mesh filename="./meshes/ID461_001SVM.obj"/>
+      </geometry>
+    </visual>
+    <visual name="ID461_001ORK">
+      <geometry>
+        <mesh filename="./meshes/ID461_001ORK.obj"/>
+      </geometry>
+    </visual>
+    <collision name="cylinder">
+      <origin xyz="0.0026999 -0.00000002 0" rpy="0 1.57079627 0"/>
+      <geometry>
+        <cylinder radius="0.075" length="0.17"/>
+      </geometry>
+    </collision>
+    <collision name="cylinder_0">
+      <origin xyz="0.00069992 0.04249998 0" rpy="0 1.57079627 -1.57079612"/>
+      <geometry>
+        <cylinder radius="0.075" length="0.085"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="upper_arm_link">
+    <inertial>
+      <mass value="12.69999981"/>
+      <inertia ixx="0" ixy="0" ixz="0" iyy="0" iyz="0" izz="0"/>
+    </inertial>
+    <visual name="ID251_001">
+      <geometry>
+        <mesh filename="./meshes/ID251_001.obj"/>
+      </geometry>
+    </visual>
+    <visual name="ID251_001fa3">
+      <geometry>
+        <mesh filename="./meshes/ID251_001fa3.obj"/>
+      </geometry>
+    </visual>
+    <visual name="ID251_001SVM">
+      <geometry>
+        <mesh filename="./meshes/ID251_001SVM.obj"/>
+      </geometry>
+    </visual>
+    <visual name="ID251_001ORK">
+      <geometry>
+        <mesh filename="./meshes/ID251_001ORK.obj"/>
+      </geometry>
+    </visual>
+    <visual name="ID251_001P1u">
+      <geometry>
+        <mesh filename="./meshes/ID251_001P1u.obj"/>
+      </geometry>
+    </visual>
+    <collision name="cylinder">
+      <origin xyz="0.04494099 0.00070001 -0" rpy="0 1.57079586 0.0000002"/>
+      <geometry>
+        <cylinder radius="0.075" length="0.175"/>
+      </geometry>
+    </collision>
+    <collision name="cylinder_0">
+      <origin xyz="0.04494099 0.00069986 -0.30599999" rpy="-3.14159265 -0.00000027 -1.57079633"/>
+      <geometry>
+        <cylinder radius="0.06" length="0.61199996"/>
+      </geometry>
+    </collision>
+    <collision name="cylinder_1">
+      <origin xyz="0.04494099 0.00069972 -0.61199998" rpy="0 1.57079586 0.0000002"/>
+      <geometry>
+        <cylinder radius="0.06" length="0.136"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="forearm_link">
+    <inertial>
+      <mass value="4.26999998"/>
+      <inertia ixx="0" ixy="0" ixz="0" iyy="0" iyz="0" izz="0"/>
+    </inertial>
+    <visual name="ID71_001">
+      <geometry>
+        <mesh filename="./meshes/ID71_001.obj"/>
+      </geometry>
+    </visual>
+    <visual name="ID71_001fa3">
+      <geometry>
+        <mesh filename="./meshes/ID71_001fa3.obj"/>
+      </geometry>
+    </visual>
+    <visual name="ID71_001SVM">
+      <geometry>
+        <mesh filename="./meshes/ID71_001SVM.obj"/>
+      </geometry>
+    </visual>
+    <visual name="ID71_001ORK">
+      <geometry>
+        <mesh filename="./meshes/ID71_001ORK.obj"/>
+      </geometry>
+    </visual>
+    <visual name="ID71_001P1u">
+      <geometry>
+        <mesh filename="./meshes/ID71_001P1u.obj"/>
+      </geometry>
+    </visual>
+    <collision name="cylinder">
+      <origin xyz="-0.00415101 0.00070012 -0.0000001" rpy="0 -1.57079606 -0.00000002"/>
+      <geometry>
+        <cylinder radius="0.06" length="0.126"/>
+      </geometry>
+    </collision>
+    <collision name="cylinder_0">
+      <origin xyz="-0.00104101 0.00070005 0.28599991" rpy="0 0.00000006 -1.57079615"/>
+      <geometry>
+        <cylinder radius="0.047" length="0.57200003"/>
+      </geometry>
+    </collision>
+    <collision name="cylinder_1">
+      <origin xyz="0.00175899 0.00069997 0.57199992" rpy="0 -1.57079606 -0.00000002"/>
+      <geometry>
+        <cylinder radius="0.047" length="0.118"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="wrist_1_link">
+    <inertial>
+      <mass value="1"/>
+      <inertia ixx="0" ixy="0" ixz="0" iyy="0" iyz="0" izz="0"/>
+    </inertial>
+    <visual name="ID239_001">
+      <geometry>
+        <mesh filename="./meshes/ID239_001.obj"/>
+      </geometry>
+    </visual>
+    <visual name="ID239_001fa3">
+      <geometry>
+        <mesh filename="./meshes/ID239_001fa3.obj"/>
+      </geometry>
+    </visual>
+    <visual name="ID239_001SVM">
+      <geometry>
+        <mesh filename="./meshes/ID239_001SVM.obj"/>
+      </geometry>
+    </visual>
+    <collision name="cylinder">
+      <origin xyz="-0.08745896 -0.00029985 0.00070016" rpy="1.57079612 -0.0000002 1.57079633"/>
+      <geometry>
+        <cylinder radius="0.047" length="0.055"/>
+      </geometry>
+    </collision>
+    <collision name="cylinder_0">
+      <origin xyz="-0.11495896 -0.00029985 -0.00209984" rpy="0 -0.0000002 1.57079633"/>
+      <geometry>
+        <cylinder radius="0.047" length="0.118"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="wrist_2_link">
+    <inertial>
+      <mass value="1"/>
+      <inertia ixx="0" ixy="0" ixz="0" iyy="0" iyz="0" izz="0"/>
+    </inertial>
+    <visual name="ID347_001">
+      <geometry>
+        <mesh filename="./meshes/ID347_001.obj"/>
+      </geometry>
+    </visual>
+    <visual name="ID347_001fa3">
+      <geometry>
+        <mesh filename="./meshes/ID347_001fa3.obj"/>
+      </geometry>
+    </visual>
+    <visual name="ID347_001SVM">
+      <geometry>
+        <mesh filename="./meshes/ID347_001SVM.obj"/>
+      </geometry>
+    </visual>
+    <visual name="ID347_001ORK">
+      <geometry>
+        <mesh filename="./meshes/ID347_001ORK.obj"/>
+      </geometry>
+    </visual>
+    <collision name="cylinder">
+      <origin xyz="0.08829993 0.00005912 -0.00029991" rpy="0 -1.57079627 0"/>
+      <geometry>
+        <cylinder radius="0.047" length="0.054"/>
+      </geometry>
+    </collision>
+    <collision name="cylinder_0">
+      <origin xyz="0.11529993 0.00285912 -0.0002999" rpy="0 -1.57079627 1.57079612"/>
+      <geometry>
+        <cylinder radius="0.047" length="0.118"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="wrist_3_link">
+    <inertial>
+      <mass value="0.36500001"/>
+      <inertia ixx="0" ixy="0" ixz="0" iyy="0" iyz="0" izz="0"/>
+    </inertial>
+    <visual name="ID275_001">
+      <geometry>
+        <mesh filename="./meshes/ID275_001.obj"/>
+      </geometry>
+    </visual>
+    <visual name="ID275_001fa3">
+      <geometry>
+        <mesh filename="./meshes/ID275_001fa3.obj"/>
+      </geometry>
+    </visual>
+    <collision name="cylinder">
+      <origin xyz="0.07705899 -0.0002999 -0.00040014" rpy="-1.57079653 0 1.5707965"/>
+      <geometry>
+        <cylinder radius="0.047" length="0.03"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="ee_link">
+    <inertial>
+      <mass value="0.01"/>
+      <inertia ixx="0" ixy="0" ixz="0" iyy="0" iyz="0" izz="0"/>
+    </inertial>
+  </link>
+  <link name="robotiq_base_link">
+    <visual name="_F_Body">
+      <geometry>
+        <mesh filename="./meshes/_F_Body.obj"/>
+      </geometry>
+    </visual>
+    <collision name="_F_Body">
+      <geometry>
+        <mesh filename="./meshes/_F_Body.obj"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="left_outer_knuckle">
+    <inertial>
+      <origin xyz="-0.05289377 0.05318338 0" rpy="0 0 0"/>
+      <mass value="0.00916329"/>
+      <inertia ixx="0.00000021" ixy="0" ixz="0" iyy="0.00000067" iyz="0" izz="0.00000075"/>
+    </inertial>
+    <visual name="Finger1">
+      <geometry>
+        <mesh filename="./meshes/Finger1.obj"/>
+      </geometry>
+    </visual>
+    <collision name="Finger1">
+      <geometry>
+        <mesh filename="./meshes/Finger1.obj"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="right_outer_knuckle">
+    <inertial>
+      <origin xyz="-0.05289377 0.05318338 0" rpy="0 0 0"/>
+      <mass value="0.00916329"/>
+      <inertia ixx="0.00000021" ixy="0" ixz="0" iyy="0.00000067" iyz="0" izz="0.00000075"/>
+    </inertial>
+    <visual name="Finger1">
+      <geometry>
+        <mesh filename="./meshes/Finger1_1.obj"/>
+      </geometry>
+    </visual>
+    <collision name="Finger1">
+      <geometry>
+        <mesh filename="./meshes/Finger1_1.obj"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="left_outer_finger">
+    <inertial>
+      <origin xyz="-0.07670802 0.0845727 0.00000306" rpy="0 0 0"/>
+      <mass value="0.07706425"/>
+      <inertia ixx="0.00004225" ixy="0" ixz="0.00002001" iyy="0.00005757" iyz="0" izz="0.00001811"/>
+    </inertial>
+    <visual name="Finger2">
+      <geometry>
+        <mesh filename="./meshes/Finger2.obj"/>
+      </geometry>
+    </visual>
+    <collision name="Finger2">
+      <geometry>
+        <mesh filename="./meshes/Finger2.obj"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="right_outer_finger">
+    <inertial>
+      <origin xyz="-0.07670802 0.0845727 0.00000306" rpy="0 0 0"/>
+      <mass value="0.07706425"/>
+      <inertia ixx="0.00004225" ixy="0" ixz="0.00002001" iyy="0.00005757" iyz="0" izz="0.00001811"/>
+    </inertial>
+    <visual name="Finger2">
+      <geometry>
+        <mesh filename="./meshes/Finger2_1.obj"/>
+      </geometry>
+    </visual>
+    <collision name="Finger2">
+      <geometry>
+        <mesh filename="./meshes/Finger2_1.obj"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="left_inner_finger">
+    <inertial>
+      <origin xyz="0.16089 0.08148 -0.00000148" rpy="0 0 0"/>
+      <mass value="0.04983438"/>
+      <inertia ixx="0.00000379" ixy="-0.00000337" ixz="-0.00000002" iyy="0.00001837" iyz="-0" izz="0.00001713"/>
+    </inertial>
+    <visual name="Fingertip">
+      <geometry>
+        <mesh filename="./meshes/Fingertip.obj"/>
+      </geometry>
+    </visual>
+    <visual name="Finger4">
+      <geometry>
+        <mesh filename="./meshes/Finger4.obj"/>
+      </geometry>
+    </visual>
+    <collision name="Fingertip">
+      <geometry>
+        <mesh filename="./meshes/Fingertip.obj"/>
+      </geometry>
+    </collision>
+    <collision name="Finger4">
+      <geometry>
+        <mesh filename="./meshes/Finger4.obj"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="right_inner_finger">
+    <inertial>
+      <origin xyz="0.16088824 -0.08147714 -0.00000148" rpy="0 0 0"/>
+      <mass value="0.04983438"/>
+      <inertia ixx="0.00000379" ixy="0.00000337" ixz="-0.00000001" iyy="0.00001837" iyz="0.00000001" izz="0.00001713"/>
+    </inertial>
+    <visual name="Finger4">
+      <geometry>
+        <mesh filename="./meshes/Finger4_1.obj"/>
+      </geometry>
+    </visual>
+    <visual name="Fingertip">
+      <geometry>
+        <mesh filename="./meshes/Fingertip_1.obj"/>
+      </geometry>
+    </visual>
+    <collision name="Finger4">
+      <geometry>
+        <mesh filename="./meshes/Finger4_1.obj"/>
+      </geometry>
+    </collision>
+    <collision name="Fingertip">
+      <geometry>
+        <mesh filename="./meshes/Fingertip_1.obj"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="left_inner_knuckle">
+    <inertial>
+      <origin xyz="-0.04825798 0.10101169 -0" rpy="0 0 0"/>
+      <mass value="0.06811222"/>
+      <inertia ixx="0.00002953" ixy="0.00000014" ixz="-0.00001877" iyy="0.00005109" iyz="0.00000021" izz="0.00002317"/>
+    </inertial>
+    <visual name="Finger3">
+      <geometry>
+        <mesh filename="./meshes/Finger3.obj"/>
+      </geometry>
+    </visual>
+    <collision name="Finger3">
+      <geometry>
+        <mesh filename="./meshes/Finger3.obj"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="right_inner_knuckle">
+    <inertial>
+      <origin xyz="-0.04825798 0.10101169 -0" rpy="0 0 0"/>
+      <mass value="0.06811222"/>
+      <inertia ixx="0.00002953" ixy="0.00000014" ixz="-0.00001877" iyy="0.00005109" iyz="0.00000021" izz="0.00002317"/>
+    </inertial>
+    <visual name="Finger3">
+      <geometry>
+        <mesh filename="./meshes/Finger3_1.obj"/>
+      </geometry>
+    </visual>
+    <collision name="Finger3">
+      <geometry>
+        <mesh filename="./meshes/Finger3_1.obj"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="gantry_vagn_joint" type="prismatic">
+    <origin xyz="3.26999998 -0.29492626 0.15999369" rpy="0.0000001 0 0"/>
+    <parent link="gantry"/>
+    <child link="vagn"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-3.0999999" upper="0" velocity="0.02617994"/>
+    <dynamics friction="0"/>
+    <!-- isaac:source_drive {"armature": 0.0, "drive": {"damping": 10000.0, "max_force": Infinity, "stiffness": 10000.0, "target_position": 0.0}, "instance": "linear", "source": "physx"} -->
+  </joint>
+  <joint name="vagn_robot_joint" type="fixed">
+    <origin xyz="-0.00011892 -0.00019313 0.00000631" rpy="-0.00000017 0 0"/>
+    <parent link="vagn"/>
+    <child link="base_link"/>
+  </joint>
+  <joint name="shoulder_pan_joint" type="revolute">
+    <origin xyz="0.00011887 0.00011926 0.12729999" rpy="0 -1.57079624 0"/>
+    <parent link="base_link"/>
+    <child link="shoulder_link"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-6.28318051" upper="6.28318051" velocity="2.09400016"/>
+    <dynamics friction="0"/>
+    <!-- isaac:source_drive {"armature": 0.0, "drive": {"damping": 34.906585693359375, "max_force": 1979.9998779296875, "stiffness": 349.06585693359375, "target_position": 0.0}, "instance": "angular", "source": "physx"} -->
+  </joint>
+  <joint name="shoulder_lift_joint" type="revolute">
+    <origin xyz="0 0.22094099 0" rpy="0.00000006 0 -1.57079633"/>
+    <parent link="shoulder_link"/>
+    <child link="upper_arm_link"/>
+    <axis xyz="-1 0 0"/>
+    <limit lower="-6.28318051" upper="6.28318051" velocity="2.09400016"/>
+    <dynamics friction="0"/>
+    <!-- isaac:source_drive {"armature": 0.0, "drive": {"damping": 34.906585693359375, "max_force": 1979.9998779296875, "stiffness": 349.06585693359375, "target_position": 0.0}, "instance": "angular", "source": "physx"} -->
+  </joint>
+  <joint name="elbow_joint" type="revolute">
+    <origin xyz="0.17189999 -0.00000012 -0.61199999" rpy="-3.14159245 0 -3.14159247"/>
+    <parent link="upper_arm_link"/>
+    <child link="forearm_link"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-6.28318051" upper="6.28318051" velocity="3.14200012"/>
+    <dynamics friction="0"/>
+    <!-- isaac:source_drive {"armature": 0.0, "drive": {"damping": 34.906585693359375, "max_force": 899.9999389648438, "stiffness": 349.06585693359375, "target_position": 0.0}, "instance": "angular", "source": "physx"} -->
+  </joint>
+  <joint name="wrist_1_joint" type="revolute">
+    <origin xyz="0.00000003 0.00000008 0.5722999" rpy="1.57079633 0 -3.14159247"/>
+    <parent link="forearm_link"/>
+    <child link="wrist_1_link"/>
+    <axis xyz="-1 0 0"/>
+    <limit lower="-6.28318051" upper="6.28318051" velocity="3.14200012"/>
+    <dynamics friction="0"/>
+    <!-- isaac:source_drive {"armature": 0.0, "drive": {"damping": 34.906585693359375, "max_force": 336.0, "stiffness": 349.06585693359375, "target_position": 0.0}, "instance": "angular", "source": "physx"} -->
+  </joint>
+  <joint name="wrist_2_joint" type="revolute">
+    <origin xyz="-0.11489984 0.00000006 0.0000001" rpy="0 1.57079618 1.57079633"/>
+    <parent link="wrist_1_link"/>
+    <child link="wrist_2_link"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-6.28318051" upper="6.28318051" velocity="3.14200012"/>
+    <dynamics friction="0"/>
+    <!-- isaac:source_drive {"armature": 0.0, "drive": {"damping": 34.906585693359375, "max_force": 336.0, "stiffness": 349.06585693359375, "target_position": 0.0}, "instance": "angular", "source": "physx"} -->
+  </joint>
+  <joint name="wrist_3_joint" type="revolute">
+    <origin xyz="0.11570007 0.00000012 0.00000001" rpy="1.57079627 0.00000018 1.57079633"/>
+    <parent link="wrist_2_link"/>
+    <child link="wrist_3_link"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-6.28318051" upper="6.28318051" velocity="3.14200012"/>
+    <dynamics friction="0"/>
+    <!-- isaac:source_drive {"armature": 0.0, "drive": {"damping": 34.906585693359375, "max_force": 336.0, "stiffness": 349.06585693359375, "target_position": 0.0}, "instance": "angular", "source": "physx"} -->
+  </joint>
+  <joint name="ee_joint" type="fixed">
+    <origin xyz="0 0 -0.00000007" rpy="0 0 -1.57079615"/>
+    <parent link="wrist_3_link"/>
+    <child link="ee_link"/>
+  </joint>
+  <joint name="FixedJoint" type="fixed">
+    <origin xyz="-0.0000001 0.09219988 0.00000011" rpy="0 -1.57079633 -1.57079633"/>
+    <parent link="ee_link"/>
+    <child link="robotiq_base_link"/>
+  </joint>
+  <joint name="finger_joint" type="revolute">
+    <origin xyz="0.00000001 -0.030601 0.05466251" rpy="-1.57079633 0 -1.57079633"/>
+    <parent link="robotiq_base_link"/>
+    <child link="left_outer_knuckle"/>
+    <axis xyz="0 0 -1"/>
+    <limit lower="0" upper="0.78539816" velocity="2.26892803"/>
+    <dynamics friction="0"/>
+    <!-- isaac:source_drive {"armature": 0.0, "drive": {"damping": 200.0, "max_force": 1000.0, "stiffness": 2000.0, "target_position": 0.0}, "instance": "angular", "source": "physx"} -->
+  </joint>
+  <joint name="right_outer_knuckle_joint" type="revolute">
+    <origin xyz="0.00000001 0.03060129 0.05466251" rpy="-1.57079633 0 1.57079633"/>
+    <parent link="robotiq_base_link"/>
+    <child link="right_outer_knuckle"/>
+    <axis xyz="0 0 -1"/>
+    <limit lower="-0.78539816" upper="0" velocity="2.26892803"/>
+    <dynamics friction="0"/>
+    <mimic joint="finger_joint" multiplier="-1" offset="0"/>
+    <!-- isaac:source_drive {"armature": 0.0, "drive": {"damping": 0.0, "max_force": Infinity, "stiffness": 0.0, "target_position": 0.0}, "instance": "angular", "source": "physx"} -->
+  </joint>
+  <joint name="left_outer_finger_joint" type="revolute">
+    <origin xyz="0.03142485 0.00453223 0" rpy="0 0 -3.14159265"/>
+    <parent link="left_outer_knuckle"/>
+    <child link="left_outer_finger"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="0" upper="3.14159265" velocity="17453.29251994"/>
+    <dynamics friction="0"/>
+    <!-- isaac:source_drive {"armature": 0.0, "drive": {"damping": 200.0, "max_force": 1000.0, "stiffness": 2000.0, "target_position": 0.0}, "instance": "angular", "source": "physx"} -->
+  </joint>
+  <joint name="right_outer_finger_joint" type="revolute">
+    <origin xyz="0.03142485 0.00453223 0" rpy="0 0 3.14159265"/>
+    <parent link="right_outer_knuckle"/>
+    <child link="right_outer_finger"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="0" upper="3.14159265" velocity="17453.29251994"/>
+    <dynamics friction="0"/>
+    <!-- isaac:source_drive {"armature": 0.0, "drive": {"damping": 200.0, "max_force": 1000.0, "stiffness": 2000.0, "target_position": 0.0}, "instance": "angular", "source": "physx"} -->
+  </joint>
+  <joint name="left_inner_finger_joint" type="revolute">
+    <origin xyz="-0.03543023 0.07889888 0" rpy="0 0 0"/>
+    <parent link="left_outer_finger"/>
+    <child link="left_inner_finger"/>
+    <axis xyz="0 0 -1"/>
+    <limit lower="0" upper="3.14159265" velocity="17453.29251994"/>
+    <dynamics friction="0"/>
+    <!-- isaac:source_drive {"armature": 0.0, "drive": {"damping": 200.0, "max_force": 1000.0, "stiffness": 2000.0, "target_position": 0.0}, "instance": "angular", "source": "physx"} -->
+  </joint>
+  <joint name="right_inner_finger_joint" type="revolute">
+    <origin xyz="-0.03543023 0.07889888 0" rpy="-3.14159265 0 0"/>
+    <parent link="right_outer_finger"/>
+    <child link="right_inner_finger"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="0" upper="3.14159265" velocity="17453.29251994"/>
+    <dynamics friction="0"/>
+    <!-- isaac:source_drive {"armature": 0.0, "drive": {"damping": 200.0, "max_force": 1000.0, "stiffness": 2000.0, "target_position": 0.0}, "instance": "angular", "source": "physx"} -->
+  </joint>
+  <joint name="left_inner_finger_pad_joint" type="revolute">
+    <origin xyz="0.01790114 0.00651548 0" rpy="0 0 0"/>
+    <parent link="left_inner_finger"/>
+    <child link="left_inner_knuckle"/>
+    <axis xyz="0 0 -1"/>
+    <limit lower="-0.78539816" upper="0.78539816" velocity="17453.29251994"/>
+    <dynamics friction="0"/>
+    <!-- isaac:source_drive {"armature": 0.0, "drive": {"damping": 0.0, "max_force": Infinity, "stiffness": 0.0, "target_position": 0.0}, "instance": "angular", "source": "physx"} -->
+  </joint>
+  <joint name="right_inner_finger_pad_joint" type="revolute">
+    <origin xyz="0.01790114 -0.00651548 0" rpy="3.14159265 0 -0.00000006"/>
+    <parent link="right_inner_finger"/>
+    <child link="right_inner_knuckle"/>
+    <axis xyz="0 0 -1"/>
+    <limit lower="-0.78539816" upper="0.78539816" velocity="17453.29251994"/>
+    <dynamics friction="0"/>
+    <!-- isaac:source_drive {"armature": 0.0, "drive": {"damping": 0.0, "max_force": Infinity, "stiffness": 0.0, "target_position": 0.0}, "instance": "angular", "source": "physx"} -->
+  </joint>
+  <loop_joint name="left_inner_knuckle_joint" type="revolute">
+    <link1 link="robotiq_base_link" xyz="0 -0.0127 0.061178" rpy="-1.57079633 0 1.57079633"/>
+    <link2 link="left_inner_knuckle" xyz="-0.0127 0.06142 0" rpy="3.14159265 0 0"/>
+  </loop_joint>
+  <loop_joint name="right_inner_knuckle_joint" type="revolute">
+    <link1 link="robotiq_base_link" xyz="0 0.0127 0.061178" rpy="-1.57079633 0 1.57079633"/>
+    <link2 link="right_inner_knuckle" xyz="-0.0127 0.06142 0" rpy="0 0 3.14159265"/>
+  </loop_joint>
+</robot>

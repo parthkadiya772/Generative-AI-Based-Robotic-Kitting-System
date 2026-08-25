@@ -83,28 +83,6 @@ def _default_prompt_with_catalogue() -> str:
 # a coordinate frame we never observed — causing constant pixel offsets.
 # Pre-resizing here makes smart_resize a no-op so the bbox lives in the
 # exact (W, H) we sent.
-def qwen_target_size(width: int, height: int,
-                     long_edge_cap: int = 1260,
-                     patch: int = 28) -> tuple:
-    """Compute the (W, H) Qwen-VL will see for an image of size (width, height).
-
-    long_edge_cap=1260 (45 * patch) keeps the pixel budget under
-    ~1 MP for typical 16:9 aspect ratios (1260×700 = 882k px), staying
-    within Qwen's default token budget while giving ~28% more pixels
-    than the conservative 1120 cap. More pixels = finer patch density
-    over each part = tighter grounded bboxes.
-    """
-    w, h = int(width), int(height)
-    long_edge = max(w, h)
-    if long_edge > long_edge_cap:
-        scale = long_edge_cap / float(long_edge)
-        w = int(round(w * scale))
-        h = int(round(h * scale))
-    w = max(patch, int(round(w / patch)) * patch)
-    h = max(patch, int(round(h / patch)) * patch)
-    return (w, h)
-
-
 class VLMPerception:
     """
     Vision-Language Model perception interface.
@@ -137,15 +115,20 @@ class VLMPerception:
             config.get("vlm_api_key_env", "OPENAI_API_KEY"), ""
         )
 
-        # Set by `_prepare_image_for_qwen` so callers (e.g.
-        # workflow_engine._extract_vlm_bboxes) can scale Qwen's pixel
-        # bbox output back to crop-relative coords.
-        self._last_qwen_image_size: Optional[tuple] = None
-
         log.info(
             f"VLMPerception initialised — provider={self.provider}, "
             f"model={self.model}, base_url={self.base_url}"
         )
+
+    @property
+    def _is_qwen(self) -> bool:
+        """True for Qwen-VL models on any backend.
+
+        Qwen needs the 28-multiple image resize and emits native bboxes,
+        and it can be served by Ollama or vLLM — so the check has to look
+        at the model name, not just the provider tag.
+        """
+        return "qwen" in f"{self.provider} {self.model}".lower()
 
     # ─── Public API ──────────────────────────────────────────
 
@@ -186,12 +169,10 @@ class VLMPerception:
         # so labels stay grounded to the known vocabulary.
         base_prompt = custom_prompt or _default_prompt_with_catalogue()
         prompt = base_prompt
-        # Skip resize_for_vlm for Qwen — _prepare_image_for_qwen in
-        # _call_ollama handles sizing AND snaps to 28-multiples (its
-        # vision-patch grid). Downsampling here first would force an
-        # upscale-back-up later, introducing interpolation artifacts
-        # that make Qwen emit garbage like "this this this this".
-        if self.provider != "ollama_qwen":
+        # Qwen gets the image untouched. Gemma / LLaVA still need the
+        # cap to stay inside their context budget; they go through
+        # OWL-ViT2 for boxes so resizing costs them no coord accuracy.
+        if not self._is_qwen:
             image = resize_for_vlm(image, max_size=max_size)
 
         last_error = None
@@ -404,8 +385,9 @@ class VLMPerception:
         """Route to the appropriate VLM backend."""
         if self.provider == "openai":
             return self._call_openai(image, prompt)
-        elif self.provider in ("ollama_qwen", "ollama_llava", "ollama_gemma",
-                               "ollama_llama"):
+        elif self.provider == "vllm":
+            return self._call_vllm(image, prompt)
+        elif self.provider.startswith("ollama"):
             return self._call_ollama(image, prompt)
         elif self.provider == "huggingface":
             return self._call_huggingface(image, prompt)
@@ -413,11 +395,43 @@ class VLMPerception:
             raise ValueError(f"Unknown VLM provider: {self.provider}")
 
     def _call_openai(self, image: Image.Image, prompt: str) -> str:
-        """Send image + prompt to OpenAI GPT-4o Vision API."""
+        """Send image + prompt to OpenAI's hosted vision API."""
+        return self._call_openai_compatible(image, prompt)
+
+    def _call_vllm(self, image: Image.Image, prompt: str) -> str:
+        """Send image + prompt to a self-hosted vLLM server.
+
+        vLLM exposes the OpenAI chat-completions schema, so the only
+        differences from the hosted path are the base URL and the
+        placeholder key (vLLM ignores it unless started with
+        ``--api-key``). Qwen models get the 28-multiple resize so their
+        bbox output lands in a known pixel frame.
+        """
+        return self._call_openai_compatible(
+            image, prompt,
+            base_url=self.base_url.rstrip("/"),
+            api_key=self.api_key or "EMPTY",
+        )
+
+    def _call_openai_compatible(self, image: Image.Image, prompt: str,
+                                base_url: Optional[str] = None,
+                                api_key: Optional[str] = None) -> str:
+        """Chat-completions call with an inline base64 image.
+
+        Serves both OpenAI and any OpenAI-compatible server (vLLM,
+        llama.cpp, TGI). ``base_url=None`` targets api.openai.com.
+        """
         from openai import OpenAI
 
-        client = OpenAI(api_key=self.api_key)
-        b64_image = encode_image_base64(image, fmt="PNG")
+        # Qwen3-VL handles arbitrary sizes natively and reports bboxes
+        # against the image as sent, so no resize — that keeps the coords
+        # in the frame the caller already knows.
+        img_for_send = image
+        img_fmt = "JPEG" if self._is_qwen else "PNG"
+        mime = "jpeg" if img_fmt == "JPEG" else "png"
+        b64_image = encode_image_base64(img_for_send, fmt=img_fmt)
+
+        client = OpenAI(api_key=api_key or self.api_key, base_url=base_url)
 
         response = client.chat.completions.create(
             model=self.model,
@@ -429,34 +443,17 @@ class VLMPerception:
                         {
                             "type": "image_url",
                             "image_url": {
-                                "url": f"data:image/png;base64,{b64_image}"
+                                "url": f"data:image/{mime};base64,{b64_image}"
                             },
                         },
                     ],
                 }
             ],
             temperature=self.temperature,
-            max_tokens=4096,
+            max_tokens=self.config.get("vlm_num_predict", 4096),
+            response_format={"type": "json_object"},
         )
-        return response.choices[0].message.content
-
-    def _prepare_image_for_qwen(self, image: Image.Image) -> Image.Image:
-        """Resize to Qwen's vision-patch grid so its bbox pixels live in
-        a known (W, H) frame.
-
-        Qwen-VL's preprocessor smart-resizes inputs to multiples of 28
-        and emits bbox coordinates in those resized pixels. By
-        pre-resizing here to a 28-multiple shape inside Qwen's pixel
-        budget, smart_resize is a no-op and the bbox coords we get back
-        are in *exactly* the dimensions we sent. The size is stashed on
-        ``self._last_qwen_image_size`` so the caller can scale bbox
-        pixels → crop-normalised coords.
-        """
-        target = qwen_target_size(*image.size)
-        if target != image.size:
-            image = image.resize(target, Image.LANCZOS)
-        self._last_qwen_image_size = target
-        return image
+        return response.choices[0].message.content or ""
 
     def _call_ollama(self, image: Image.Image, prompt: str) -> str:
         """Send image + prompt to a local/VPN Ollama instance.
@@ -479,13 +476,9 @@ class VLMPerception:
 
         client = ollama.Client(host=self.base_url)
 
+        # Sent unmodified — see _call_openai_compatible.
         img_for_send = image
-        if self.provider == "ollama_qwen":
-            img_for_send = self._prepare_image_for_qwen(image)
-
-        # JPEG for Qwen (smaller payload, fewer Ollama-side decode
-        # quirks); PNG for everything else (lossless, Gemma/LLaVA-friendly).
-        img_fmt = "JPEG" if self.provider == "ollama_qwen" else "PNG"
+        img_fmt = "JPEG" if self._is_qwen else "PNG"
         b64_image = encode_image_base64(img_for_send, fmt=img_fmt)
 
         # Qwen2.5-VL on Ollama produces empty / "this this this..."
@@ -494,7 +487,7 @@ class VLMPerception:
         # still being close to deterministic. Other models keep the
         # configured temperature.
         temp = float(self.temperature)
-        if self.provider == "ollama_qwen" and temp < 0.05:
+        if self._is_qwen and temp < 0.05:
             temp = 0.05
         options = {"temperature": temp}
         # Bigger context for any Ollama VLM call — the catalogue-grounded
@@ -528,7 +521,7 @@ class VLMPerception:
         response = None
         content = ""
         attempted_json_mode = False
-        for include_json_mode in (self.provider == "ollama_qwen", False):
+        for include_json_mode in (self._is_qwen, False):
             if include_json_mode:
                 chat_kwargs["format"] = "json"
                 attempted_json_mode = True
