@@ -404,8 +404,8 @@ class VLMPerception:
         """Route to the appropriate VLM backend."""
         if self.provider == "openai":
             return self._call_openai(image, prompt)
-        elif self.provider in ("ollama_qwen", "ollama_llava", "ollama_gemma",
-                               "ollama_llama"):
+        elif self.provider in ("ollama", "ollama_qwen", "ollama_llava",
+                       "ollama_gemma", "ollama_llama"):
             return self._call_ollama(image, prompt)
         elif self.provider == "huggingface":
             return self._call_huggingface(image, prompt)

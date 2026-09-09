@@ -86,9 +86,23 @@ Copy the template and fill in what applies to you:
 cp .env.example .env
 ```
 
-Open `.env` and pick **one of the two options** for the model server:
+Open `.env` and choose the model-server mode that matches how you are
+running the application:
 
-### Option A — Local Ollama (recommended, no VPN required)
+### Option A — Docker Ollama (recommended for the full stack)
+
+When using `docker compose`, Ollama runs in the `ollama` container. Set only
+the model name:
+
+```env
+OLLAMA_BASE_URL=http://ollama:11434
+OLLAMA_MODEL=gemma4:e2b
+```
+
+The Compose `ollama-init` service pulls that model automatically. No Ollama
+installation on the host is required.
+
+### Option B — Local host Ollama
 
 1. Install Ollama on your own machine: <https://ollama.com/download>
 2. Pull the models you want to use:
@@ -104,16 +118,18 @@ Open `.env` and pick **one of the two options** for the model server:
    ```
 4. Leave `OLLAMA_BASE_URL` in `.env` set to the localhost default — no
    change needed:
-   ```env
-   OLLAMA_BASE_URL=http://localhost:11434
-   ```
+  ```env
+  OLLAMA_BASE_URL=http://localhost:11434
+  OLLAMA_MODEL=gemma4:e2b
+  ```
 
-### Option B — Remote / VPN Ollama server
+### Option C — Remote / VPN Ollama server
 
 If your lab runs a shared GPU box, point at it directly:
 
 ```env
 OLLAMA_BASE_URL=http://<your-server-host>:11434
+OLLAMA_MODEL=gemma4:e2b
 ```
 
 The Streamlit dashboard's model dropdown will list whatever models are
@@ -125,7 +141,7 @@ loaded on whichever server `OLLAMA_BASE_URL` resolves to at startup.
 # Loopback by default — change only if you knowingly want LAN clients
 # to call /api/execute on the Isaac Sim bridge (the bridge has no auth).
 BRIDGE_HOST=127.0.0.1
-BRIDGE_PORT=8600
+BRIDGE_PORT=8200
 
 # Required only when you want to run the simulator-attached bridge.
 # Set to the directory containing Isaac Sim's `exts/` folder.
@@ -164,7 +180,115 @@ Key packages: `streamlit`, `transformers`, `torch`, `ollama`, `openai`,
 
 ---
 
-## 4. Run
+## 4. Run with Docker
+
+The Docker stack runs four services:
+
+- `ollama` — local Ollama server with NVIDIA GPU access
+- `ollama-init` — pulls the model selected by `OLLAMA_MODEL`
+- `isaacsim` — headless Isaac Sim 5.1.0 with WebRTC streaming
+- `app` — Streamlit dashboard and robot workflow
+
+The Isaac Sim image requires a Linux host with an NVIDIA GPU, compatible
+drivers, NVIDIA Container Toolkit, and access to the NVIDIA Isaac Sim
+container registry. Ollama is part of the Compose stack; it is not taken from
+the host system.
+
+Copy the environment template and choose the model to pull:
+
+```bash
+cp .env.example .env
+```
+
+```env
+OLLAMA_MODEL=gemma4:e2b
+```
+
+`OLLAMA_MODEL` is the single model setting used by both the VLM and LLM. To
+use another Ollama model, change this value before starting the stack. Models
+are stored in the persistent `ollama_models` Docker volume, so an already
+downloaded model is reused.
+
+Authenticate to NGC if required, then build and start the stack:
+
+```bash
+docker login nvcr.io
+docker compose build
+docker compose up -d
+```
+
+Check the services and model pull:
+
+```bash
+docker compose ps
+docker compose logs -f ollama-init
+docker compose exec ollama ollama list
+```
+
+The model initializer must finish with `success` before the Streamlit app is
+started. If `OLLAMA_MODEL` changes, recreate the initializer and app:
+
+```bash
+docker compose up -d --force-recreate ollama-init app
+```
+
+Open the operator dashboard at <http://localhost:8501>. The app connects to
+Ollama at `http://ollama:11434` and to the Isaac Sim bridge at
+`http://isaacsim:8200` inside the Compose network.
+
+### View Docker Isaac Sim through WebRTC
+
+The Docker Isaac Sim service is headless. It is visualized with the Isaac Sim
+WebRTC Streaming Client, not with a local Isaac Sim GUI.
+
+The Compose stack publishes:
+
+- TCP `49100` — WebRTC signaling
+- UDP `47998` — WebRTC media
+- TCP `8200` — the application bridge, used internally by `app`
+
+Set `LIVESTREAM_PUBLIC_IP` in `.env` to an address reachable from the WebRTC
+client. For a client on the same LAN, use the host's LAN address. For a VPN
+client, use the host's VPN address. Do not use the Docker service name or the
+container IP in the WebRTC client.
+
+Start the simulator and wait for the ready message:
+
+```bash
+docker compose logs -f isaacsim
+```
+
+Continue only after the log contains:
+
+```text
+Isaac Sim Full Streaming App is loaded.
+```
+
+Open the Isaac Sim WebRTC Streaming Client on the local or remote workstation,
+enter the same `LIVESTREAM_PUBLIC_IP`, and click **Connect**. Only one client
+can connect to one Isaac Sim instance at a time.
+
+For remote clients, allow TCP `49100` and UDP `47998` through the host
+firewall. For Internet access, forward both ports from the router to the
+Docker host. A TCP connection failure indicates that Isaac Sim is not ready
+or TCP `49100` is blocked; a blank window or timeout usually indicates that
+UDP `47998` is blocked or the advertised IP is not routable.
+
+### View a local workstation Isaac Sim
+
+If Isaac Sim is installed directly on the workstation rather than in Docker,
+open `AIKIDO.usd` in the local Isaac Sim application and run
+`generative_kitting/kitting_bridge_server.py` from the Script Editor. The
+bridge listens on TCP `8200`.
+
+For this mode, run the Streamlit app outside Docker with
+`generative_kitting/run_ui.sh` or `generative_kitting/run_ui.bat`, because the
+Docker app is configured to reach the Docker service name `isaacsim`.
+
+The local workstation and Docker modes are alternatives. Do not run both
+Isaac Sim instances against the same workflow at the same time.
+
+## 5. Run
 
 The project has four entry points. Pick the one that matches what you
 want to do.
@@ -240,19 +364,19 @@ Useful for testing perception + planning end-to-end on a fixed scene.
 3. In Isaac Sim open **Script Editor** (`Window → Script Editor`),
    open `generative_kitting/kitting_bridge_server.py`, and click
    **Run**.
-4. You should see `[OK] Bridge v2 on http://127.0.0.1:8600` in the
+4. You should see `[OK] Bridge v2 on http://127.0.0.1:8200` in the
    Isaac Sim console.
 5. In another terminal, launch the Streamlit UI (option A above). It
    will detect the bridge automatically.
 
 The bridge exposes a small HTTP API (`/api/ping`, `/api/status`,
 `/api/camera`, `/api/execute`, `/api/pick`, `/api/place`, …) on port
-8600. It binds to loopback by default; change `BRIDGE_HOST` only if
+8200. It binds to loopback by default; change `BRIDGE_HOST` only if
 you knowingly want LAN access (there is no authentication).
 
 ---
 
-## 5. Seed / reset the parts database
+## 6. Seed / reset the parts database
 
 The parts database (`generative_kitting/knowledge/kitting.db`) is
 auto-seeded on first run. To re-seed manually:
@@ -291,6 +415,12 @@ robot_in_air/
 ├── README.md                 # this file
 ├── usd_meshes                # other usd meshes
 ├── resources                 # image and video clip of the simulation
+├── .dockerignore             # files and folders to ignore while building docker container
+├── compose.yaml              # docker container services for the project
+├── Dockerfile.app            # docker image for streamlit app
+├── Dockerfile.isaacsim       # docker image for isaac sim 5.1.0
+├── docker
+│   ├── isaacsim_entrypoint.py # headless Isaac Sim bootstrap for the kitting bridge
 ├── generative_kitting/       # main Python package
 │   ├── config.yaml           # central configuration (env-var aware)
 │   ├── main.py               # CLI / UI entry point
@@ -329,7 +459,7 @@ robot_in_air/
 | Symptom | Likely cause / fix |
 |---|---|
 | `Cannot reach Ollama` on startup | `ollama serve` not running, or `OLLAMA_BASE_URL` points at the wrong host. |
-| Bridge log says `[OK] Bridge v2 on http://127.0.0.1:8600` but Streamlit can't connect | Firewall on your machine — or you're running Streamlit in a container that can't reach loopback. Set `BRIDGE_HOST=0.0.0.0` only as a last resort. |
+| Bridge log says `[OK] Bridge v2 on http://127.0.0.1:8200` but Streamlit can't connect | Firewall on your machine — or you're running Streamlit in a container that can't reach loopback. Set `BRIDGE_HOST=0.0.0.0` only as a last resort. |
 | `URDF / YAML not found` when initialising IK | `ISAACSIM_PATH` is unset or points at the wrong folder. It must contain `exts/isaacsim.asset.importer.urdf/`. |
 | Streamlit UI starts but VLM model dropdown is empty | The model server reachable at `OLLAMA_BASE_URL` has no models loaded. `ollama list` on that host should show what's available. |
 | Robot's joints diverge wildly during a pick | Known IK edge case — the wrist joints are continuous and can wrap. Reset the scene in Isaac Sim and re-`exec()` the bridge. |

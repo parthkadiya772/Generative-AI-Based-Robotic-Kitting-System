@@ -59,8 +59,8 @@ simulation:
 
 # ─── Perception (VLM) ───────────────────────────────────────
 perception:
-  vlm_provider: "ollama_qwen"         # Active provider (overridden by UI model selection)
-  vlm_model: "qwen2.5vl:7b"          # Active model  (overridden by UI model selection)
+  vlm_provider: "ollama"              # Active provider (overridden by UI model selection)
+  vlm_model: "${OLLAMA_MODEL}"       # Active model  (overridden by UI model selection)
   vlm_base_url: "${OLLAMA_BASE_URL}"         # Active endpoint (overridden by UI model selection)
   max_retries: 2
   temperature: 0.0                    # Low temperature for deterministic perception
@@ -71,22 +71,9 @@ perception:
   # ── Available VLM Models (shown as dropdown in Streamlit UI) ──
   # Add your VPN model endpoints here.  "name" is the dropdown label.
   vlm_models:
-
-    # ── VPN Remote Server ────────────────────────────────────
-
-    - name: "Gemma4 4B (VPN Remote)"
-      provider: "ollama_gemma"
-      model: "gemma4:e4b"
-      base_url: "${OLLAMA_BASE_URL}"
-
-    - name: "Gemma4 2B (VPN Remote)"
-      provider: "ollama_gemma"
-      model: "gemma4:e2b"
-      base_url: "${OLLAMA_BASE_URL}"
-
-    - name: "Qwen3-VL 30B (VPN Remote)"
-      provider: "ollama_qwen"
-      model: "qwen3-vl:30b"
+    - name: "Configured Ollama model (${OLLAMA_MODEL})"
+      provider: "ollama"
+      model: "${OLLAMA_MODEL}"
       base_url: "${OLLAMA_BASE_URL}"
 
   # ── Zero-Shot Detector (precise bounding boxes — replaces VLM coord guesses) ──
@@ -339,23 +326,21 @@ perception:
 
 # ─── Orchestration (LLM) ────────────────────────────────────
 orchestration:
-  llm_provider: "ollama_llama"        # Active provider (overridden by UI model selection)
-  llm_model: "llama3.1:8b"           # Active model  (overridden by UI model selection)
+  llm_provider: "ollama"             # Active provider (overridden by UI model selection)
+  llm_model: "${OLLAMA_MODEL}"       # Active model  (overridden by UI model selection)
   llm_api_key_env: "OPENAI_API_KEY"
   llm_base_url: "${OLLAMA_BASE_URL}"        # Active endpoint (overridden by UI model selection)
   max_retries: 3
   temperature: 0.0                    # Zero temperature for deterministic planning
-  max_tokens: 4096
+  max_tokens: 8192
   max_plan_steps: 50                  # Reject plans with more steps (hallucination guard)
 
   # ── Available LLM Models (shown as dropdown in Streamlit UI) ──
   # Add your VPN model endpoints here.  "name" is the dropdown label.
   llm_models:
-
-    # ── VPN Remote Server ────────────────────────────────────
-    - name: "Llama 3.1 8B (VPN Remote)"
-      provider: "ollama_llama"
-      model: "llama3.1:8b"
+    - name: "Configured Ollama model (${OLLAMA_MODEL})"
+      provider: "ollama"
+      model: "${OLLAMA_MODEL}"
       base_url: "${OLLAMA_BASE_URL}"
 
 # ─── Execution ───────────────────────────────────────────────

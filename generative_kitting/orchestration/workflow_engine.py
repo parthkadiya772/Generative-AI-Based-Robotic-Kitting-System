@@ -613,7 +613,7 @@ class KittingWorkflowEngine:
                 raise RuntimeError(
                     "Overhead capture returned the placeholder image "
                     "(640x480, near-black). The Isaac Sim bridge is "
-                    "unreachable — check it's running on port 8600.")
+                    "unreachable — check it's running on port 8200.")
             result["phases"].append({
                 "phase": WorkflowPhase.SCENE_SCAN,
                 "status": "success",

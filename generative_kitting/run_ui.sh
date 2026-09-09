@@ -90,6 +90,9 @@ else
     echo "[2/3] Skipping dependency check (Environment already configured)."
 fi
 
+# Activate the environment for any child processes launched by this script.
+source "$VENV_DIR/bin/activate"
+
 # ── Step 3: Launch Streamlit ───────────────────────────────
 if [ ! -f "$STREAMLIT_APP" ]; then
     echo ""
@@ -104,6 +107,6 @@ echo "  URL : http://localhost:8501"
 echo "  Stop: Ctrl+C"
 echo ""
 
-"$PYTHON_EXE" -m streamlit run "$STREAMLIT_APP"
+python -m streamlit run "$STREAMLIT_APP"
 echo ""
 echo "[INFO] Streamlit process exited (code: $?)."

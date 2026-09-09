@@ -1,0 +1,18 @@
+FROM nvcr.io/nvidia/isaac-sim:5.1.0
+
+ENV ACCEPT_EULA=Y \
+    PRIVACY_CONSENT=Y \
+    ISAACSIM_PATH=/isaac-sim \
+    KITTING_PROJECT_ROOT=/workspace/robot_in_air \
+    BRIDGE_PORT=8200
+
+WORKDIR /workspace/robot_in_air
+
+COPY . /workspace/robot_in_air
+COPY docker/isaacsim_entrypoint.py /opt/kitting/isaacsim_entrypoint.py
+
+EXPOSE 8200
+EXPOSE 49100/tcp
+EXPOSE 47998/udp
+
+ENTRYPOINT ["/isaac-sim/python.sh", "/opt/kitting/isaacsim_entrypoint.py"]

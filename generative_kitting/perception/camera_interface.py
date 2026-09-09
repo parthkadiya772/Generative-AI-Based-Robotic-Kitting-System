@@ -204,7 +204,7 @@ class BridgeCameraInterface:
         """
         if bridge_url is None:
             host = os.environ.get("BRIDGE_HOST", "127.0.0.1")
-            port = os.environ.get("BRIDGE_PORT", "8600")
+            port = os.environ.get("BRIDGE_PORT", "8200")
             bridge_url = f"http://{host}:{port}"
         self.bridge_url = bridge_url.rstrip("/")
         self.camera_prim_path = "/World/Camera"

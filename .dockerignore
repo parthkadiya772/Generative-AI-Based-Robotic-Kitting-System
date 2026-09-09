@@ -1,0 +1,16 @@
+.git
+.gitignore
+.env
+.aikido
+__pycache__
+*.pyc
+.pytest_cache
+.mypy_cache
+.vscode
+generative_kitting/logs
+**/.aikido
+**/__pycache__
+**/.pytest_cache
+**/.mypy_cache
+*.pyc
+generative_kitting/logs

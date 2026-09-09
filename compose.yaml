@@ -1,0 +1,88 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    environment:
+      OLLAMA_HOST: 0.0.0.0:11434
+    volumes:
+      - ollama_models:/root/.ollama
+    gpus: all
+    expose:
+      - "11434"
+    restart: unless-stopped
+
+  ollama-init:
+    image: ollama/ollama:latest
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:e2b}
+    volumes:
+      - ollama_models:/root/.ollama
+    depends_on:
+      - ollama
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        until ollama list >/dev/null 2>&1; do sleep 2; done;
+        echo "Pulling Ollama model: $$OLLAMA_MODEL";
+        ollama pull "$$OLLAMA_MODEL"
+    gpus: all
+    restart: "no"
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.app
+    image: ${GHCR_OWNER:-local}/robot-in-air-app:${IMAGE_TAG:-latest}
+    env_file:
+      - .env
+    environment:
+      BRIDGE_HOST: isaacsim
+      BRIDGE_PORT: 8200
+      KITTING_PROJECT_ROOT: /app
+      ISAACSIM_PATH: /isaac-sim
+      OLLAMA_BASE_URL: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:e2b}
+    ports:
+      - "8501:8501"
+    tmpfs:
+      - /app/generative_kitting/logs:size=512m
+    depends_on:
+      isaacsim:
+        condition: service_started
+      ollama-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  isaacsim:
+    build:
+      context: .
+      dockerfile: Dockerfile.isaacsim
+    image: ${GHCR_OWNER:-local}/robot-in-air-isaacsim:${IMAGE_TAG:-5.1.0}
+    env_file:
+      - .env
+    environment:
+      ACCEPT_EULA: "Y"
+      PRIVACY_CONSENT: "Y"
+      ISAACSIM_PATH: /isaac-sim
+      KITTING_PROJECT_ROOT: /workspace/robot_in_air
+      BRIDGE_HOST: 0.0.0.0
+      BRIDGE_PORT: 8200
+      LIVESTREAM_PORT: 49100
+    ports:
+      - "8200:8200"
+      - "49100:49100/tcp"
+      - "47998:47998/udp"
+    tmpfs:
+      - /isaac-sim/.cache:size=8g,uid=1234,gid=1234,mode=1777
+      - /isaac-sim/.nv/ComputeCache:size=2g,uid=1234,gid=1234,mode=1777
+      - /isaac-sim/.nvidia-omniverse/logs:size=1g,uid=1234,gid=1234,mode=1777
+      - /isaac-sim/.nvidia-omniverse/config:size=256m,uid=1234,gid=1234,mode=1777
+      - /isaac-sim/.local/share/ov/data:size=2g,uid=1234,gid=1234,mode=1777
+    gpus: all
+    shm_size: "16gb"
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+
+volumes:
+  ollama_models:

@@ -286,7 +286,7 @@ st.markdown("""
 
 _BRIDGE_URL = (
     f"http://{os.environ.get('BRIDGE_HOST', '127.0.0.1')}"
-    f":{os.environ.get('BRIDGE_PORT', '8600')}"
+    f":{os.environ.get('BRIDGE_PORT', '8200')}"
 )
 _OLLAMA_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 
@@ -455,7 +455,7 @@ with st.sidebar:
                 st.success("Connected to Isaac Sim!")
                 st.rerun()
             else:
-                st.error("Cannot reach Isaac Sim bridge on port 8600")
+                st.error("Cannot reach Isaac Sim bridge on port 8200")
 
     st.divider()
 
@@ -515,9 +515,9 @@ with st.sidebar:
     if not vlm_models_list:
         # Fallback: build a single entry from flat config
         vlm_models_list = [{
-            "name": st.session_state.config.get("perception", {}).get("vlm_model", "qwen2.5-vl:7b"),
-            "provider": st.session_state.config.get("perception", {}).get("vlm_provider", "ollama_qwen"),
-            "model": st.session_state.config.get("perception", {}).get("vlm_model", "qwen2.5-vl:7b"),
+            "name": st.session_state.config.get("perception", {}).get("vlm_model", "gemma4:e2b"),
+            "provider": st.session_state.config.get("perception", {}).get("vlm_provider", "ollama_gemma"),
+            "model": st.session_state.config.get("perception", {}).get("vlm_model", "gemma4:e2b"),
             "base_url": st.session_state.config.get("perception", {}).get("vlm_base_url", _OLLAMA_URL),
         }]
 
@@ -547,9 +547,9 @@ with st.sidebar:
     llm_models_list = st.session_state.config.get("orchestration", {}).get("llm_models", [])
     if not llm_models_list:
         llm_models_list = [{
-            "name": st.session_state.config.get("orchestration", {}).get("llm_model", "llama3.1:8b"),
-            "provider": st.session_state.config.get("orchestration", {}).get("llm_provider", "ollama_llama"),
-            "model": st.session_state.config.get("orchestration", {}).get("llm_model", "llama3.1:8b"),
+            "name": st.session_state.config.get("orchestration", {}).get("llm_model", "gemma4:e2b"),
+            "provider": st.session_state.config.get("orchestration", {}).get("llm_provider", "ollama_gemma"),
+            "model": st.session_state.config.get("orchestration", {}).get("llm_model", "gemma4:e2b"),
             "base_url": st.session_state.config.get("orchestration", {}).get("llm_base_url", _OLLAMA_URL),
         }]
 

@@ -12,5 +12,16 @@ Three-layer architecture:
     3. Execution Layer   — Deterministic robot control via Isaac Sim
 """
 
+import os
+import sys
+
+
+# Keep the existing flat imports working when this package is imported from the
+# repository root (for example, with ``python -m generative_kitting.main``).
+_package_root = os.path.dirname(os.path.abspath(__file__))
+if _package_root not in sys.path:
+    sys.path.insert(0, _package_root)
+
+
 __version__ = "0.1.0"
 __author__ = "Parth"

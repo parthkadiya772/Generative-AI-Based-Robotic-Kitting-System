@@ -2,7 +2,7 @@
 Isaac Sim ↔ Streamlit Bridge Server  (v2 — Neuro-Symbolic Kitting).
 
 Run this script inside Isaac Sim's Script Editor.  It exposes an HTTP
-API on port 8600 that the Streamlit dashboard consumes for:
+API on the configured bridge port that the Streamlit dashboard consumes for:
 
   GET  /api/ping          → health check + capabilities list
   GET  /api/status        → robot joint positions, DOF info, sim state
@@ -34,7 +34,7 @@ import numpy as np
 # CONFIGURATION (mirrors the constants in robot_control.py)
 # ═════════════════════════════════════════════════════════════
 
-BRIDGE_PORT = 8600
+BRIDGE_PORT = int(os.environ.get("BRIDGE_PORT", "8200"))
 ROBOT_PRIM  = "/World"
 
 # Dual cameras
@@ -3563,7 +3563,7 @@ async def _execute_plan(plan_steps):
 #
 # The bridge starts when this script runs in Isaac Sim's Script
 # Editor and stops automatically when the simulation is stopped.
-# This releases port 8600 so Streamlit can detect disconnection.
+# This releases the bridge port so Streamlit can detect disconnection.
 # ═════════════════════════════════════════════════════════════
 
 _bridge_server = None          # HTTPServer instance (set on start, cleared on stop)
@@ -3576,7 +3576,7 @@ def _shutdown_bridge(reason="simulation stopped"):
     """Shut down the HTTP server and reset bridge state.
 
     Called when the simulation is stopped or paused in Isaac Sim.
-    Releases port 8600 so Streamlit sees "bridge not reachable".
+    Releases the bridge port so Streamlit sees "bridge not reachable".
     """
     global _bridge_server, _bridge_server_thread, _bridge_running
 
@@ -3589,12 +3589,12 @@ def _shutdown_bridge(reason="simulation stopped"):
     print(f"  KITTING BRIDGE — Shutting down ({reason})")
     print(f"{'=' * 60}")
 
-    # Stop HTTP server — releases port 8600
+    # Stop HTTP server — releases the bridge port
     if _bridge_server is not None:
         try:
             _bridge_server.shutdown()
             _bridge_server.server_close()
-            print("[OK] HTTP server stopped — port 8600 released")
+            print(f"[OK] HTTP server stopped — port {BRIDGE_PORT} released")
         except Exception as e:
             print(f"[WARN] HTTP server shutdown error: {e}")
         _bridge_server = None
@@ -3909,4 +3909,5 @@ async def _process_commands_loop():
     print("[OK] Command loop exited")
 
 
-asyncio.ensure_future(start_bridge())
+if os.environ.get("KITTING_BRIDGE_AUTOSTART", "1") == "1":
+    asyncio.ensure_future(start_bridge())
