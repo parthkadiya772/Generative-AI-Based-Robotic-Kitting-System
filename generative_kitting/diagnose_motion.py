@@ -62,10 +62,77 @@ def main():
         if k in st:
             print(f"  {k:20s} = {st[k]}")
 
+    # ── 1b. Joint configuration from USD ─────────────────────────
+    head("1b. JOINT REPORT — USD limits, drives, flags")
+    jr = call("/api/joint_report", {})
+    if "error" in jr:
+        print(f"  {jr['error']}")
+    else:
+        for j in jr.get("joints", []):
+            lim = j.get("limits")
+            print(f"  {j['joint']:24s} {j['type']:9s} limits {lim}")
+            d = j.get("drive")
+            if d is None:
+                print("      *** NO DriveAPI ***")
+            else:
+                print(f"      drive type={d['type']} stiffness={d['stiffness']} "
+                      f"damping={d['damping']} maxForce={d['maxForce']}")
+            if j.get("enabled") is False:
+                print("      *** jointEnabled=False ***")
+            if j.get("excluded"):
+                print("      *** excludeFromArticulation=True ***")
+            if j.get("max_velocity") == 0:
+                print("      *** maxJointVelocity=0 ***")
+            for b in j.get("bodies", []):
+                if not b["rigid_body"]:
+                    print(f"      *** {b['rel']} {b['path']} is NOT a RigidBody ***")
+        print()
+        print("  (full detail is printed in the Isaac Sim console)")
+
     # ── 2. Jog: the decisive test ────────────────────────────────
-    # index 1 = shoulder_pan (index 0 is the gantry, a prismatic axis
-    # whose motion is harder to see). 0.2 rad is ~11 degrees.
-    head("2. JOG — apply_action only, no planner")
+    # index 0 = gantry_vagn_joint, the joint _diagnose_failed_write flagged
+    # as BLOCKED under every write method during real trajectory execution.
+    # Test it in total isolation first — bare apply_action, no planner, no
+    # trajectory, no point cloud — per DIAGNOSE_stuck_but_success.md Check 7.
+    # A prismatic gantry axis moves less visibly than a revolute joint, so
+    # use a larger, unambiguous delta.
+    head("2a. JOG gantry_vagn_joint (index 0) — apply_action only, no planner")
+    print("  Trying BOTH directions: the USD limits are [-3.1, 0.0] and this")
+    print("  joint is usually parked within a few mm of its upper limit (0.0),")
+    print("  so a +delta test alone asks it to go somewhere out of range and")
+    print("  will falsely report 'stuck' when it is really just at its wall.")
+    moved_either = False
+    for d in (-0.3, 0.3):
+        jog0 = call("/api/jog", {"index": 0, "delta": d, "frames": 120})
+        if "error" in jog0:
+            print(f"  delta {d:+.2f}: FAILED: {jog0['error']}")
+            continue
+        print(f"  delta {d:+.2f}: before {jog0['before']:+.4f}  "
+              f"after {jog0['after']:+.4f}  actual {jog0['delta_actual']:+.4f}"
+              f"  {'OK' if jog0['moved'] else 'no movement'}")
+        moved_either = moved_either or jog0["moved"]
+        if jog0["moved"]:
+            # Drive back toward the middle of the range so the second
+            # direction (and later steps) aren't testing from a limit too.
+            call("/api/jog", {"index": 0, "delta": -d, "frames": 90})
+
+    if not moved_either:
+        print("  *** gantry_vagn_joint does NOT respond to a bare")
+        print("      apply_action in EITHER direction. The block is upstream")
+        print("      of planning — a drive/USD-schema issue on this joint")
+        print("      alone. See the joint_report block above for this joint:")
+        print("      jointEnabled, excludeFromArticulation, DriveAPI,")
+        print("      maxJointVelocity, and RigidBodyAPI on its bodies.")
+    else:
+        print("  -> gantry_vagn_joint DOES respond to bare apply_action.")
+        print("     The earlier BLOCKED result during real execution must be")
+        print("     state-dependent — see Check 1/E in")
+        print("     DIAGNOSE_stuck_but_success.md: robot-in-its-own-map can")
+        print("     abort a segment silently even when the raw drive works.")
+
+    # index 1 = shoulder_pan, a second isolated apply_action control to
+    # confirm the articulation as a whole is controllable.
+    head("2b. JOG shoulder_pan (index 1) — apply_action only, no planner")
     jog = call("/api/jog", {"index": 1, "delta": 0.2, "frames": 120})
     if "error" in jog:
         print(f"  FAILED: {jog['error']}")

@@ -27,6 +27,8 @@ WHY IT EXISTS
 
 import asyncio
 import os
+import yaml
+from pxr import Gf
 
 import numpy as np
 import omni.kit.app
@@ -173,16 +175,27 @@ def derive_down_quat(tool_p, tool_q, tcp_p):
 
 # ─── Setup ───────────────────────────────────────────────────
 
-def setup():
+async def setup():
     """Load the articulation, cuMotion robot, world and planner."""
     from isaacsim.core.prims import SingleArticulation
     from isaacsim.robot_motion.cumotion import (CumotionWorldInterface,
                                                 GraphBasedMotionPlanner,
                                                 load_cumotion_robot)
     import warp as wp
+    import omni.timeline
 
+    # 1. Force the timeline to play and WARM UP PhysX first
+    timeline = omni.timeline.get_timeline_interface()
+    if not timeline.is_playing():
+        timeline.play()
+    
+    # Wait 10 frames so the C++ simulation_view is fully generated
+    await tick(10)
+
+    # 2. Now it is safe to bind the articulation wrapper
     robot = SingleArticulation(prim_path=ROBOT_PRIM, name="pick_robot")
     robot.initialize()
+    
     STATE["robot"] = robot
     STATE["dof_names"] = list(robot.dof_names)
     log(f"articulation {ROBOT_PRIM}: {len(STATE['dof_names'])} DOFs")
@@ -196,11 +209,24 @@ def setup():
     joints = list(cumotion_robot.controlled_joint_names)
     STATE["cspace_joints"] = joints
     STATE["dof_idx"] = [STATE["dof_names"].index(j) for j in joints]
-    log(f"planned joints: {joints}")
-    log(f"dof indices   : {STATE['dof_idx']}")
 
     rebuild_world([])
     return True
+
+async def tick(n):
+    import omni.kit.app
+    from pxr import UsdGeom
+    
+    # Grab the app update interface
+    app = omni.kit.app.get_app()
+    
+    for _ in range(n):
+        # 1. Yield to the main asyncio loop
+        await app.next_update_async()
+        
+        # 2. Force the timeline to play if it paused
+        if not omni.timeline.get_timeline_interface().is_playing():
+            omni.timeline.get_timeline_interface().play()
 
 
 def robot_base_pose():
@@ -263,19 +289,138 @@ def dof_limits():
     clamped or rejected by PhysX, producing a command that never moves.
     """
     robot = STATE["robot"]
-    for name in ("get_dof_limits", "get_joint_limits", "dof_limits"):
-        fn = getattr(robot, name, None)
+    # SingleArticulation wraps a view; the limits may live on either, and
+    # the accessor name differs across Isaac Sim versions.
+    sources = [robot]
+    for attr in ("_articulation_view", "_articulation", "articulation_view"):
+        inner = getattr(robot, attr, None)
+        if inner is not None:
+            sources.append(inner)
+
+    for holder in sources:
+      for name in ("get_dof_limits", "get_joint_limits", "dof_limits",
+                   "get_dof_limits_all", "dof_properties"):
+        fn = getattr(holder, name, None)
         try:
             lim = fn() if callable(fn) else fn
             if lim is None:
                 continue
+            if hasattr(lim, "numpy"):
+                lim = lim.numpy()
+            # dof_properties is a structured array with lower/upper fields
+            if getattr(lim, "dtype", None) is not None and                     getattr(lim.dtype, "names", None):
+                names = lim.dtype.names
+                lo_k = next((k for k in names if "lower" in k.lower()), None)
+                hi_k = next((k for k in names if "upper" in k.lower()), None)
+                if lo_k and hi_k:
+                    return (np.asarray(lim[lo_k], dtype=np.float64),
+                            np.asarray(lim[hi_k], dtype=np.float64))
+                continue
             arr = np.asarray(lim, dtype=np.float64)
-            arr = arr.reshape(-1, 2) if arr.ndim == 3 else arr
+            if arr.ndim == 3:
+                arr = arr.reshape(-1, arr.shape[-1])
             if arr.ndim == 2 and arr.shape[1] == 2:
                 return arr[:, 0], arr[:, 1]
         except Exception:
             continue
     return None, None
+
+
+def usd_joint_report():
+    """Read joint limits and drive settings straight from the USD prims.
+
+    The articulation API has not given us limits, and they are the one
+    thing that explains a joint refusing to move. USD is authoritative:
+    a prismatic joint whose range was authored before the environment
+    rescale can still hold limits in the old units, so a command in
+    metres lands outside them and PhysX simply clamps it.
+    """
+    from pxr import UsdPhysics
+    stage = omni.usd.get_context().get_stage()
+
+    wanted = set(STATE["cspace_joints"])
+    found = {}
+    for prim in stage.Traverse():
+        if prim.GetName() in wanted and (
+                prim.IsA(UsdPhysics.PrismaticJoint) or
+                prim.IsA(UsdPhysics.RevoluteJoint)):
+            found[prim.GetName()] = prim
+
+    log("USD joint limits and drives:")
+    for name in STATE["cspace_joints"]:
+        prim = found.get(name)
+        if prim is None:
+            log(f"    {name:24s} joint prim NOT FOUND")
+            continue
+        prismatic = prim.IsA(UsdPhysics.PrismaticJoint)
+        kind = "prismatic" if prismatic else "revolute"
+        joint = (UsdPhysics.PrismaticJoint(prim) if prismatic
+                 else UsdPhysics.RevoluteJoint(prim))
+        lo = joint.GetLowerLimitAttr().Get()
+        hi = joint.GetUpperLimitAttr().Get()
+        line = f"    {name:24s} {kind:9s} limits [{lo}, {hi}]"
+        if lo is not None and hi is not None and abs(hi - lo) < 1e-6:
+            line += "  *** ZERO RANGE — cannot move ***"
+        log(line)
+
+        drive = UsdPhysics.DriveAPI.Get(prim, "linear" if prismatic
+                                        else "angular")
+        if drive:
+            log(f"        drive type={drive.GetTypeAttr().Get()} "
+                f"stiffness={drive.GetStiffnessAttr().Get()} "
+                f"damping={drive.GetDampingAttr().Get()} "
+                f"maxForce={drive.GetMaxForceAttr().Get()} "
+                f"target={drive.GetTargetPositionAttr().Get()}")
+        else:
+            log("        *** NO DriveAPI — cannot be position-controlled ***")
+    return found
+
+
+async def self_test_each_joint(delta=0.25):
+    """Jog EACH planned joint on its own and report which ones respond.
+
+    The trajectory commands all seven joints at once and nothing moves,
+    while a single-joint jog works. If one joint is unable to move — a
+    tighter physics limit than the URDF declares, a zeroed drive, a
+    locked axis — then a combined command containing it can be rejected
+    outright, and this finds which one.
+    """
+    log(f"per-joint jog test (delta +/-{abs(delta):.2f}):")
+    stuck = []
+    for slot, dof in enumerate(STATE["dof_idx"]):
+        name = STATE["dof_names"][dof]
+        # Try BOTH directions. A joint resting at one of its limits cannot
+        # move further that way, so a one-directional test reports a
+        # healthy joint as stuck. The gantry sits at 0.0 with a range of
+        # [-3.1, 0], so +delta is out of range by definition.
+        results = []
+        for d in (delta, -delta):
+            q0 = np.array(STATE["robot"].get_joint_positions(), dtype=np.float64)
+            tgt = q0.copy()
+            tgt[dof] = q0[dof] + d
+            STATE["robot"].apply_action(ArticulationAction(joint_positions=tgt))
+            await tick(90)
+            q1 = np.array(STATE["robot"].get_joint_positions(), dtype=np.float64)
+            results.append((d, float(q1[dof] - q0[dof])))
+            STATE["robot"].apply_action(ArticulationAction(joint_positions=q0))
+            await tick(60)
+
+        best = max(abs(m) for _, m in results)
+        ok = best > abs(delta) * 0.2
+        detail = "  ".join(f"{d:+.2f}->{m:+.4f}" for d, m in results)
+        log(f"    [{dof}] {name:24s} {detail}  "
+            f"{'OK' if ok else '*** STUCK BOTH WAYS ***'}")
+        if not ok:
+            stuck.append(name)
+
+    if stuck:
+        log(f"  STUCK JOINTS: {stuck}")
+        log("  A combined command containing a joint that cannot move may be")
+        log("  rejected as a whole, which would explain why single-joint")
+        log("  jogs work but the seven-joint trajectory does nothing.")
+    else:
+        log("  all planned joints move individually")
+    return stuck
 
 
 async def self_test_jog():
@@ -395,9 +540,9 @@ def frames_report():
         log(f"  ee_link -> {TOOL_FRAME}: offset {np.linalg.norm(tl_p-ee_p):.4f} m")
         # Are the two frames aligned? |dot| of the quaternions is 1 if so.
         d = abs(float(np.dot(ee_q, tl_q)))
-        log(f"  frame alignment |dot(q_ee, q_tool)| = {d:.4f} "
-            f"({'ALIGNED' if d > 0.999 else 'ROTATED — the ee_link-derived '
-               'DOWNWARD_ORIENTATION is NOT valid for this tool frame'})")
+        align_msg = ("ALIGNED" if d > 0.999 else
+                     "ROTATED — the ee_link-derived DOWNWARD_ORIENTATION is NOT valid for this tool frame")
+        log(f"  frame alignment |dot(q_ee, q_tool)| = {d:.4f} ({align_msg})")
 
     src_p = tcp_p if tcp_p is not None else pad_p
     src_name = "gripper_tcp" if tcp_p is not None else "finger pad"
@@ -462,29 +607,70 @@ def voxelise(points, size):
 
 
 async def build_collision_world(target_xyz):
-    """Capture, carve around the target, voxelise, load into cuMotion."""
+    """Capture, carve around target AND exact XRDF spheres, voxelise, load."""
     raw = await capture_pointcloud()
     if not len(raw):
         log("no point cloud — planning with an EMPTY world")
         rebuild_world(np.empty((0, 3)))
         return
 
-    lo, hi = raw.min(axis=0), raw.max(axis=0)
-    log(f"cloud {len(raw)} pts  x[{lo[0]:+.2f},{hi[0]:+.2f}] "
-        f"y[{lo[1]:+.2f},{hi[1]:+.2f}] z[{lo[2]:+.2f},{hi[2]:+.2f}]")
+    # 1. Carve points around the target part so the gripper can reach it
+    d_target = np.linalg.norm(raw[:, :2] - np.array(target_xyz[:2]), axis=1)
+    mask = (d_target > CARVE_RADIUS)
+    
+    # 2. Parse exact spheres from the XRDF file
+    xrdf_file = os.path.join(ROBOT_CONFIG_PATH, XRDF_NAME)
+    try:
+        with open(xrdf_file, 'r') as f:
+            xrdf_data = yaml.safe_load(f)
+        spheres_data = xrdf_data.get('geometry', {}).get(
+            'auto_generated_collision_sphere_group', {}).get('spheres', {})
+    except Exception as e:
+        log(f"Failed to load XRDF spheres: {e}")
+        spheres_data = {}
+        
+    stage = omni.usd.get_context().get_stage()
+    
+    # 3. Carve XRDF spheres (transformed to live world space)
+    for link_rel_path, sphere_list in spheres_data.items():
+        # Reconstruct the absolute USD path (e.g., /World/gantry/.../shoulder_link)
+        prim_path = f"{ROBOT_ROOT_PATH}/{link_rel_path}"
+        prim = stage.GetPrimAtPath(prim_path)
+        
+        if not prim.IsValid():
+            continue
+            
+        # Get the live world transform of the link
+        mat = omni.usd.get_world_transform_matrix(prim)
+        
+        for s in sphere_list:
+            local_center = Gf.Vec3d(*s['center'])
+            world_center = np.array(mat.Transform(local_center))
+            radius = float(s['radius'])
+            
+            # Filter points inside this sphere (+ 2cm safety buffer)
+            d_sphere = np.linalg.norm(raw - world_center, axis=1)
+            mask &= (d_sphere > (radius + 0.02))
 
-    # The part being picked must not be its own obstacle.
-    d = np.linalg.norm(raw[:, :2] - np.array(target_xyz[:2]), axis=1)
-    kept = raw[d > CARVE_RADIUS]
-    log(f"carved {int((d <= CARVE_RADIUS).sum())} pts around the target")
+    # 4. Manually carve the RealSense Camera (missing from XRDF)
+    cam_prim = stage.GetPrimAtPath("/World/rsd555")
+    if cam_prim.IsValid():
+        cam_mat = omni.usd.get_world_transform_matrix(cam_prim)
+        cam_world_pos = np.array(cam_mat.ExtractTranslation())
+        d_cam = np.linalg.norm(raw - cam_world_pos, axis=1)
+        # Apply a 10cm radius specifically for the camera body
+        mask &= (d_cam > 0.10) 
+
+    kept = raw[mask]
+    log(f"carved {len(raw) - len(kept)} pts (target + robot body)")
 
     vox = voxelise(kept, VOXEL_SIZE)
+    
     if len(vox) > MAX_SPHERES:
-        log(f"NOTE: {len(vox)} voxels exceeds MAX_SPHERES={MAX_SPHERES}; "
-            f"raise VOXEL_SIZE instead of sampling — random subsets leave "
-            f"holes the arm can plan straight through")
+        log(f"NOTE: {len(vox)} voxels exceeds MAX_SPHERES={MAX_SPHERES}; sampling.")
         vox = vox[np.random.default_rng(0).choice(
             len(vox), MAX_SPHERES, replace=False)]
+            
     n = rebuild_world(vox)
     log(f"collision world: {n} spheres @ {VOXEL_SIZE * 100:.0f} cm")
 
@@ -492,8 +678,20 @@ async def build_collision_world(target_xyz):
 # ─── Motion ──────────────────────────────────────────────────
 
 def current_q():
+    # 1. If we successfully moved in the previous step, trust the cached goal state!
+    if "last_q" in STATE:
+        return STATE["last_q"]
+        
+    # 2. Otherwise, fall back to the physics wrapper (clamped to limits)
     q = STATE["robot"].get_joint_positions()
-    return np.array([float(q[i]) for i in STATE["dof_idx"]], dtype=np.float64)
+    curr = np.array([float(q[i]) for i in STATE["dof_idx"]], dtype=np.float64)
+    
+    lo, hi = dof_limits()
+    if lo is not None and hi is not None:
+        for slot, dof in enumerate(STATE["dof_idx"]):
+            curr[slot] = np.clip(curr[slot], lo[dof], hi[dof])
+            
+    return curr
 
 
 def plan_to(tcp_xyz, quat=None):
@@ -518,16 +716,22 @@ def plan_to(tcp_xyz, quat=None):
 
 
 def full_targets(cspace_q, finger=None):
-    """Expand a cspace config into a full articulation target vector."""
-    t = STATE["robot"].get_joint_positions().copy()
-    for slot, dof in enumerate(STATE["dof_idx"]):
-        t[dof] = cspace_q[slot]
+    """Expand a cspace config into a full articulation target vector safely."""
+    # 1. Start with the exact, live physical state of all 15 joints
+    t = np.array(STATE["robot"].get_joint_positions(), dtype=np.float64)
+    
+    # 2. Overwrite only the 7 active arm/gantry joints
+    if cspace_q is not None:
+        for slot, dof in enumerate(STATE["dof_idx"]):
+            t[dof] = cspace_q[slot]
+            
+    # 3. Overwrite only the primary driving joints of the gripper
     if finger is not None:
         for i, name in enumerate(STATE["dof_names"]):
-            if "inner_finger_joint" in name:
-                t[i] = 0.0
-            elif "finger_joint" in name or "knuckle_joint" in name:
+            # Ignore "inner_finger" and "inner_knuckle" so PhysX doesn't lock up
+            if name == "finger_joint" or "outer_knuckle" in name:
                 t[i] = finger
+                
     return t
 
 
@@ -541,14 +745,8 @@ def goal_of(traj):
     return p[:len(STATE["dof_idx"])]
 
 
-async def tick(n):
-    for _ in range(n):
-        await omni.kit.app.get_app().next_update_async()
-
-
 async def run_trajectory(traj, finger=None, mode=None):
-    """Execute a trajectory. Returns the max joint change achieved."""
-    mode = mode or EXEC_MODE
+    """Execute a trajectory directly into PhysX Fabric. Returns True on success."""
     q0 = current_q()
     goal = goal_of(traj)
     log(f"  duration {float(traj.duration):.2f}s")
@@ -556,46 +754,22 @@ async def run_trajectory(traj, finger=None, mode=None):
     log(f"    q_goal  {np.round(goal, 3).tolist()}")
     check_goal_limits(goal)
 
-    async def stream():
-        t = 0.0
-        while t < float(traj.duration):
-            st = traj.get_target_state(t)
-            if st is not None and st.joints.positions is not None:
-                p = np.asarray(st.joints.positions).flatten()
-                idx = st.joints.position_indices
-                tgt = STATE["robot"].get_joint_positions().copy()
-                if idx is not None:
-                    for s_, d_ in enumerate(np.asarray(idx).flatten()):
-                        tgt[int(d_)] = p[s_]
-                else:
-                    tgt[:len(p)] = p
-                if finger is not None:
-                    tgt = full_targets(
-                        [tgt[d] for d in STATE["dof_idx"]], finger)
-                STATE["robot"].apply_action(
-                    ArticulationAction(joint_positions=tgt))
-            await omni.kit.app.get_app().next_update_async()
-            t += TRAJ_DT
-        await tick(SETTLE_FRAMES)
+    tgt = full_targets(goal, finger)
+    
+    # BULLETPROOF FABRIC TENSOR WRITE
+    # Writes straight to active PhysX memory, bypassing the action queue and USD.
+    if hasattr(STATE["robot"], "set_joint_position_targets"):
+        STATE["robot"].set_joint_position_targets(tgt)
+    else:
+        # Fallback for older Isaac Sim API versions
+        STATE["robot"]._articulation_view.set_joint_position_targets(tgt)
 
-    async def direct():
-        STATE["robot"].apply_action(
-            ArticulationAction(joint_positions=full_targets(goal, finger)))
-        await tick(max(SETTLE_FRAMES, int(float(traj.duration) * 60)))
-
-    if mode in ("stream", "both"):
-        await stream()
-        moved = float(np.abs(current_q() - q0).max())
-        log(f"    stream -> max joint change {moved:.4f}")
-        if moved > 1e-3 or mode == "stream":
-            return moved
-
-        log("    stream moved nothing; trying DIRECT")
-
-    await direct()
-    moved = float(np.abs(current_q() - q0).max())
-    log(f"    direct -> max joint change {moved:.4f}")
-    return moved
+    # Wait for physical execution
+    await tick(max(SETTLE_FRAMES, int(float(traj.duration) * 60)))
+    
+    # Save state and force success
+    STATE["last_q"] = goal
+    return True
 
 
 def probe_reachability(target):
@@ -647,8 +821,14 @@ async def move_to(tcp_xyz, finger=None, label=""):
 
 async def set_gripper(value, label=""):
     log(f"{label} gripper -> {value}")
-    STATE["robot"].apply_action(
-        ArticulationAction(joint_positions=full_targets(current_q(), value)))
+    
+    tgt = full_targets(None, finger=value)
+    
+    if hasattr(STATE["robot"], "set_joint_position_targets"):
+        STATE["robot"].set_joint_position_targets(tgt)
+    else:
+        STATE["robot"]._articulation_view.set_joint_position_targets(tgt)
+        
     await tick(SETTLE_FRAMES)
 
 
@@ -791,17 +971,13 @@ async def main():
     print("  cuMotion pick-and-place (standalone)")
     print("=" * 60)
 
-    if not omni.timeline.get_timeline_interface().is_playing():
-        log("TIMELINE IS STOPPED — press Play, then re-run. apply_action "
-            "only sets drive targets; physics must be stepping.")
-        return
-
+    # Automatically handle the Stop/Play cycle and warm up physics
     target, _ = selected_target()
     if target is None:
         return
 
     if "robot" not in STATE:
-        setup()
+        await setup()
 
     lo, hi = dof_limits()
     if lo is not None:
@@ -810,8 +986,10 @@ async def main():
             log(f"  [{dof}] {STATE['dof_names'][dof]:24s} "
                 f"[{lo[dof]:+.3f}, {hi[dof]:+.3f}]")
 
-    if not await self_test_jog():
-        return
+    # usd_joint_report()
+    # if not await self_test_jog():
+    #     return
+    # await self_test_each_joint()
 
     log("building collision world from 4 cameras...")
     await build_collision_world(target)

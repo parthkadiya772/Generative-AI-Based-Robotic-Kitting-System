@@ -20,8 +20,8 @@ import numpy as np
 # ─── Configuration ───────────────────────────────────────────
 
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-VLM_MODEL = "qwen2.5vl:32b"
-LLM_MODEL = "llama3.1:8b"
+VLM_MODEL = "Qwen/Qwen3-VL"
+LLM_MODEL = "Qwen/Qwen3-VL"
 
 # Robot prim paths (from your AIKIDO.usd)
 ROBOT_PRIM = "/World/gantry"

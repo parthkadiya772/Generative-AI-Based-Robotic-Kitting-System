@@ -489,97 +489,67 @@ with st.sidebar:
 
     st.divider()
 
-    # ── AI Model Selection (from config list) ────────────────
-    st.markdown("### 🧠 AI Models")
+    # ── AI Model Selection (Unified Foundation Model) ────────
+    st.markdown("### 🧠 Foundation AI Model")
 
-    # ── VLM Model Selector ───────────────────────────────────
     vlm_models_list = st.session_state.config.get("perception", {}).get("vlm_models", [])
     if not vlm_models_list:
-        # Fallback: build a single entry from flat config
         vlm_models_list = [{
-            "name": st.session_state.config.get("perception", {}).get("vlm_model", "qwen2.5-vl:7b"),
-            "provider": st.session_state.config.get("perception", {}).get("vlm_provider", "ollama_qwen"),
-            "model": st.session_state.config.get("perception", {}).get("vlm_model", "qwen2.5-vl:7b"),
-            "base_url": st.session_state.config.get("perception", {}).get("vlm_base_url", "http://localhost:11434"),
+            "name": st.session_state.config.get("perception", {}).get("vlm_model", "Qwen/Qwen3-VL"),
+            "provider": st.session_state.config.get("perception", {}).get("vlm_provider", "vllm"),
+            "model": st.session_state.config.get("perception", {}).get("vlm_model", "Qwen/Qwen3-VL"),
+            "base_url": st.session_state.config.get("perception", {}).get("vlm_base_url", "http://localhost:8000/v1"),
         }]
 
     vlm_names = [m["name"] for m in vlm_models_list]
-    vlm_selected_name = st.selectbox(
-        "👁️ Vision Model (VLM)",
+    current_active_model = st.session_state.config.get("perception", {}).get("vlm_model", "")
+    default_idx = 0
+    for idx, m in enumerate(vlm_models_list):
+        if m.get("model") == current_active_model or "Qwen3-VL" in m.get("name", ""):
+            default_idx = idx
+            break
+
+    selected_model_name = st.selectbox(
+        "🤖 Vision & Planning Model",
         options=vlm_names,
-        index=0,
-        key="vlm_model_select",
-        help="Select the Vision-Language Model for object detection",
+        index=default_idx,
+        key="unified_ai_model_select",
+        help="Unified foundation model used for both visual perception (grounding) and task planning",
     )
 
-    # Look up the selected VLM config
-    vlm_selected = next(
-        (m for m in vlm_models_list if m["name"] == vlm_selected_name),
+    # Look up selected model config
+    model_selected = next(
+        (m for m in vlm_models_list if m["name"] == selected_model_name),
         vlm_models_list[0],
     )
     st.caption(
-        f"📡 `{vlm_selected['provider']}` · "
-        f"`{vlm_selected['model']}` · "
-        f"`{vlm_selected['base_url']}`"
-    )
-
-    st.markdown("---")
-
-    # ── LLM Model Selector ───────────────────────────────────
-    llm_models_list = st.session_state.config.get("orchestration", {}).get("llm_models", [])
-    if not llm_models_list:
-        llm_models_list = [{
-            "name": st.session_state.config.get("orchestration", {}).get("llm_model", "llama3.1:8b"),
-            "provider": st.session_state.config.get("orchestration", {}).get("llm_provider", "ollama_llama"),
-            "model": st.session_state.config.get("orchestration", {}).get("llm_model", "llama3.1:8b"),
-            "base_url": st.session_state.config.get("orchestration", {}).get("llm_base_url", "http://localhost:11434"),
-        }]
-
-    llm_names = [m["name"] for m in llm_models_list]
-    llm_selected_name = st.selectbox(
-        "🧠 Planner Model (LLM)",
-        options=llm_names,
-        index=0,
-        key="llm_model_select",
-        help="Select the Large Language Model for task planning",
-    )
-
-    # Look up the selected LLM config
-    llm_selected = next(
-        (m for m in llm_models_list if m["name"] == llm_selected_name),
-        llm_models_list[0],
-    )
-    st.caption(
-        f"📡 `{llm_selected['provider']}` · "
-        f"`{llm_selected['model']}` · "
-        f"`{llm_selected['base_url']}`"
+        f"📡 Provider: `{model_selected['provider']}` · "
+        f"Model: `{model_selected['model']}` · "
+        f"URL: `{model_selected['base_url']}`"
     )
 
     # ── Apply Model Selection ────────────────────────────────
-    if st.button("🔄 Apply Models", width="stretch", key="apply_settings"):
-        # Update VLM config from selection
-        st.session_state.config["perception"]["vlm_provider"] = vlm_selected["provider"]
-        st.session_state.config["perception"]["vlm_model"] = vlm_selected["model"]
-        st.session_state.config["perception"]["vlm_base_url"] = vlm_selected["base_url"]
+    if st.button("🔄 Apply Model", width="stretch", key="apply_settings"):
+        # Update perception (VLM)
+        st.session_state.config["perception"]["vlm_provider"] = model_selected["provider"]
+        st.session_state.config["perception"]["vlm_model"] = model_selected["model"]
+        st.session_state.config["perception"]["vlm_base_url"] = model_selected["base_url"]
 
-        # Update LLM config from selection
-        st.session_state.config["orchestration"]["llm_provider"] = llm_selected["provider"]
-        st.session_state.config["orchestration"]["llm_model"] = llm_selected["model"]
-        st.session_state.config["orchestration"]["llm_base_url"] = llm_selected["base_url"]
+        # Update orchestration (LLM / Planner)
+        st.session_state.config["orchestration"]["llm_provider"] = model_selected["provider"]
+        st.session_state.config["orchestration"]["llm_model"] = model_selected["model"]
+        st.session_state.config["orchestration"]["llm_base_url"] = model_selected["base_url"]
 
         # Reinitialise models with new config
         st.session_state.vlm = VLMPerception(st.session_state.config["perception"])
         st.session_state.planner = LLMPlanner(st.session_state.config["orchestration"])
 
-        st.success(
-            f"✅ VLM → {vlm_selected['name']}\n\n"
-            f"✅ LLM → {llm_selected['name']}"
-        )
+        st.success(f"✅ Unified AI Model Applied → {model_selected['name']} (Perception + Planning)")
 
         st.session_state.execution_log.append({
             "time": datetime.now().strftime("%H:%M:%S"),
             "action": "Model Switch",
-            "status": f"VLM={vlm_selected['model']}, LLM={llm_selected['model']}",
+            "status": f"Unified Model={model_selected['model']}",
             "type": "info",
         })
 

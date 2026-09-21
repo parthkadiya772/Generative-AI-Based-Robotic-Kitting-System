@@ -20,8 +20,14 @@ API on port 8600 that the Streamlit dashboard consumes for:
   POST /api/verify_planner → self-test: plan to the tool's own current
                             pose; a large joint delta means the
                             world->robot-root transform is wrong
-  POST /api/build_collision_world → rebuild the cuMotion collision world
-                            from the 4 corner cameras (structure only)
+  POST /api/build_static_world → ONE-TIME (per cell setup): scan the
+                            static structure (rail/rack/floor/walls) with
+                            the robot parked out of the corner cameras'
+                            view. Cached to disk; reused by every
+                            build_collision_world call below.
+  POST /api/build_collision_world → rebuild the cuMotion collision world:
+                            cached static structure + this cycle's
+                            dynamic layer from the 4 corner cameras
   POST /api/wrist_obstacles → add neighbour-part obstacles from the wrist
                             camera, carving out the target grasp point
   POST /api/execute       → execute a list of action primitives
@@ -143,45 +149,20 @@ UR10_BASE_PATH = "/World/gantry/gantry_home/ur10_flattened/ur10_instanceable/bas
 EE_PATH        = "/World/gantry/gantry_home/ur10_flattened/ur10_instanceable/ee_link"
 PLACE_BOX_PATH = "/World/box_840"
 
-# Contact sensors — TWO of them, used for different phases.
-#
-#   1. Inner-finger PAD sensor — sits on the ``Finger4`` collider mesh
-#      (the rectangular inner pad). Fires when the gripper closes
-#      around a part. Used by ``_adaptive_close`` to terminate the
-#      close motion with a firm grip.
-#   2. Fingertip BOTTOM sensor — sits on the ``Fingertip`` collider
-#      mesh (the curved bottom edge). Fires when the finger tip
-#      touches the bin floor / part top during the descent. Used by
-#      ``_descend_with_contact_stop`` to halt the Cartesian descent
-#      before the gripper crashes into the surface, then lift back a
-#      few millimetres so the fingers can close cleanly.
-#
-# IMPORTANT: an Isaac Sim Contact Sensor MUST be a direct child of a
-# prim with ``UsdPhysics.CollisionAPI`` applied. The intermediate
-# Xforms ``left_inner_finger`` and ``Fingertip_01`` only carry
-# ``MeshCollisionAPI`` (a setting, not a collider), so a sensor
-# parented under them fails to initialise with
-#   "Contact Sensor needs to be created under another prim that has
-#    collision api enabled on."
-# The collider with ``CollisionAPI`` lives one level deeper on the
-# actual ``Mesh`` prims. Both sensor paths below point INTO those
-# mesh prims so the sensor finds its CollisionAPI parent.
+
 CONTACT_SENSOR_PRIM     = "/World/gantry/gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/left_inner_finger/Fingertip_01/Fingertip/Contact_Sensor"
 CONTACT_SENSOR_TIP_PRIM = CONTACT_SENSOR_PRIM
 
 # HOME_JOINTS is captured from the USD scene at startup (see _init_robot).
-# The robot is ceiling-mounted on the gantry — the correct rest pose depends
-# on how the scene was authored, not on a hardcoded floor-mounted guess.
 HOME_JOINTS = None  # set by _init_robot()
 
 # Gantry
 GANTRY_X_JOINT  = "/World/gantry/gantry_home/vagn/gantry_vagn_joint"
 GANTRY_X_OFFSET = 1.27
+GANTRY_MIN_X    = -3.10
+GANTRY_MAX_X    = 0.00
 
 # Gripper / finger joints
-# Robotiq 2F-140: 0.0 rad = fully open (140mm span), 0.695 rad = fully closed (0mm)
-# In simulation the finger pads are thick — the joint angle must overshoot
-# well past the part width so the pads actually squeeze the surface.
 FINGER_OPEN  = 0.0
 FINGER_CLOSE = 0.5       # matches robot_control.py — physics stops fingers on part contact
 FINGER_CLOSE_MIN = 0.55  # minimum grip (large parts ~80mm)
@@ -191,59 +172,23 @@ ROBOTIQ_MAX_RAD = 0.695     # joint rad at fully closed
 GRIP_OVERSHOOT = 0.060   # 60mm extra closing past part width for firm contact
 ENTRY_CLEARANCE = 0.020  # 20mm extra gap over part width for bin-entry pre-shape
 
-# Gripper geometry
-# 219.5 mm = measured ee_link → gripper_tcp distance for the
-# Robotiq 2F-140 in this scene. Set by reading the world transform
-# of the ``gripper_tcp`` Xform the operator added at the gripper's
-# longest physical extension (the fingertip plane). The earlier
-# value (0.150) corresponded to the FINGER PAD only — left a 60-70
-# mm gap that wasn't modelled in IK, so Lula planned ee_link
-# positions that put the actual fingertips below the bin floor and
-# the gripper jammed under reaction force.
 GRIPPER_TCP_OFFSET   = 0.19357
 GRIPPER_BODY_WIDTH   = 0.160
 GRIPPER_HALF_WIDTH   = GRIPPER_BODY_WIDTH / 2.0
 HOVER_CLEARANCE      = 0.020
-GRASP_LIFT           = 0.000  # Descent target: finger TCP exactly at part top.
-                              # The earlier value (+0.040) was tuned for tall
-                              # parts (~50 mm motor valves) and parked the
-                              # finger PADS 40 mm ABOVE the part top — fine
-                              # when the part body extends down past the
-                              # pads, useless for flat parts (~5 mm gears)
-                              # where the gripper closes on empty air.
-                              #
-                              # With GRASP_LIFT = 0 and the contact-aware
-                              # descent enabled, the fingertip sensor stops
-                              # the Cartesian Z motion the moment the tip
-                              # touches the part (or the bin floor, for
-                              # parts whose Z was under-projected). The
-                              # descent then lifts back ``contact_lift_back``
-                              # (default 5 mm) so the fingers have room to
-                              # close cleanly around the part edge — works
-                              # uniformly for thin and tall parts without
-                              # per-shape tuning.
-                              #
-                              # For parts that NEED to be gripped lower
-                              # than their visible top (e.g. tall valves
-                              # where you want to clamp mid-body, not the
-                              # cap), pass ``grasp_lift_override=-0.040``
-                              # in the bridge ``/api/pick_descend`` payload
-                              # — the workflow can read this from the
-                              # parts catalogue per part type.
-GRASP_DEPTH_FRACTION = 0.45   # only used by compute_grasp_geometry (legacy/debug)
+GRASP_LIFT           = 0.000  
+GRASP_DEPTH_FRACTION = 0.45  
 BOX_HEIGHT           = 0.05
 BOX_ENTRY_MARGIN     = 0.15
 PLACE_DROP_HEIGHT    = 0.02
 PLACE_RETRACT_HEIGHT = 0.25
-TRANSIT_SAFE_HEIGHT  = 0.14  # just 10cm above safe_z — enough to clear bin rim without
-                             # going so high that Lula IK folds the ceiling-mounted arm
+TRANSIT_SAFE_HEIGHT  = 0.14
 DOWNWARD_ORIENTATION = np.array([1.0, 0.0, 1.0, 0.0])
 
-# Interpolation parameters for smooth motion
-INTERP_MAX_STEP  = 0.15   # rad per streaming waypoint (smaller = smoother path)
-INTERP_THRESHOLD = 0.5    # rad — only interpolate if any joint jumps more than this
-STREAM_FRAMES    = 3      # physics frames per streaming waypoint (low = continuous motion)
-SETTLE_FRAMES    = 60     # physics frames to settle at final position
+INTERP_MAX_STEP  = 0.15   
+INTERP_THRESHOLD = 0.5  
+STREAM_FRAMES    = 3     
+SETTLE_FRAMES    = 60    
 
 
 # ═════════════════════════════════════════════════════════════
@@ -309,15 +254,10 @@ def compute_adaptive_finger_close(part_width):
     overshoot well past the part width so the pads actually squeeze
     firmly against the surface.  GRIP_OVERSHOOT (40mm) accounts for
     pad thickness + compression needed for a secure hold.
-
-    Motor valve (~80mm) -> 0.50 rad (pads squeeze at ~40mm gap)
-    Small tube  (~30mm) -> 0.63 rad (pads squeeze at ~10mm gap)
-    Small hinge (~15mm) -> 0.68 rad (near-closed, tight grip)
     """
     # Target opening = part width minus overshoot (pads need to compress past surface)
     desired_opening = max(0.0, part_width - GRIP_OVERSHOOT)
     # Convert opening (metres) to joint angle (radians)
-    # 0.0 rad = 140mm open, 0.695 rad = 0mm closed
     finger_rad = ROBOTIQ_MAX_RAD * (1.0 - desired_opening / ROBOTIQ_MAX_STROKE)
     clamped = float(np.clip(finger_rad, FINGER_CLOSE_MIN, FINGER_CLOSE_MAX))
     print(f"  [GRIP] part_width={part_width*1000:.1f}mm overshoot={GRIP_OVERSHOOT*1000:.0f}mm -> finger_close={clamped:.3f} rad")
@@ -396,6 +336,8 @@ POINTCLOUD_CAMERAS = {
     "/World/pointcloud_view/cam2": (480, 640),
     "/World/pointcloud_view/cam3": (480, 640),
     "/World/pointcloud_view/cam4": (480, 640),
+    "/World/Camera": (480, 640),
+    "/World/Camera_Kit": (480, 640),
 }
 
 COLLISION_VOXEL_SIZE = 0.02       # 2 cm — trades fidelity for sphere count
@@ -405,7 +347,82 @@ COLLISION_SAFETY_MARGIN = 0.005   # 5 mm inflation on every obstacle
 # the part being picked never becomes its own obstacle.
 TARGET_CARVE_RADIUS = 0.06
 
+# ── Static structure scan ───────────────────────────────────────
+#
+#   The gantry rail, bin rack, floor, and walls do not move. Re-scanning
+#   them every cycle means re-deriving the same geometry over and over,
+#   AND re-running robot self-filtering across the arm's full range of
+#   motion every single time — the fragile part of the pipeline, since
+#   the self-filter has to correctly mask a moving 15-link arm in every
+#   pose it can be in.
+#
+#   Capture this ONCE with the robot parked in a pose that puts it
+#   outside the 4 corner cameras' view (POST /api/build_static_world).
+#   The self-filter still runs as a safety net in case the park pose
+#   isn't perfectly clear, but with the robot genuinely out of frame
+#   there is nothing for it to remove. The result is cached to disk so
+#   a bridge restart does not require a re-scan.
+#
+#   Per-cycle rebuilds (_build_collision_world) then ADD the dynamic
+#   layer (whatever the corner cameras currently see, self-filtered and
+#   carved around detected targets, exactly as before) on top of this
+#   fixed static layer, instead of re-deriving the static structure from
+#   scratch every time.
+STATIC_WORLD_VOXEL_SIZE = 0.03    # coarser: structure doesn't need 2cm fidelity
+_PROJECT_ROOT = os.path.dirname(_ENV_FILE) if _ENV_FILE else os.getcwd()
+STATIC_WORLD_CACHE = os.path.join(
+    _PROJECT_ROOT, "generative_kitting", "logs", "static_world_scan.json")
+
 _pc_annotators = {}               # cam_path -> replicator annotator
+# The render product itself, kept so a second annotator (e.g. semantic
+# segmentation, for robot_self_filtering_spec.md Stage 2) can attach to
+# the SAME render product as the pointcloud annotator. Confirmed by
+# direct test that a second, independently-created render product on
+# these six camera paths breaks semantic segmentation's render var
+# (empty buffer every time) — these cameras already have a persistent
+# render product from _capture_pointcloud below, and Kit's synthetic
+# data graph does not tolerate two competing ones on the same prim.
+# The wrist camera, which is NOT in POINTCLOUD_CAMERAS and has no prior
+# render product, worked correctly on the first try with its own fresh
+# render product — confirming this is specifically a same-prim conflict.
+_pc_render_products = {}          # cam_path -> replicator render product
+
+
+async def _measure_surface_z(params=None):
+    """Measure the surface Z at a given world XY from point cloud or camera depth.
+    
+    Params:
+        xy: [x, y] world coordinates
+        camera: optional camera name ('kit', 'rgb')
+        radius: search radius around xy (default 0.12 m)
+        percentile: percentile for height estimation (default 90)
+        z_min: minimum valid z (default -0.1 m)
+        z_max: maximum valid z (default 1.8 m)
+    """
+    params = params or {}
+    xy = params.get("xy", [0.5, 0.0])
+    radius = float(params.get("radius", 0.12))
+    percentile = float(params.get("percentile", 90))
+    z_min = float(params.get("z_min", -0.1))
+    z_max = float(params.get("z_max", 1.8))
+    cam_name = params.get("camera")
+
+    pts = await _capture_pointcloud()
+    if len(pts) > 0:
+        filtered_pts, _ = _filter_robot_self_points(pts)
+        if len(filtered_pts) > 0:
+            target_xy = np.array(xy[:2], dtype=np.float64)
+            dists_sq = (filtered_pts[:, 0] - target_xy[0])**2 + (filtered_pts[:, 1] - target_xy[1])**2
+            mask = (dists_sq <= radius**2) & (filtered_pts[:, 2] >= z_min) & (filtered_pts[:, 2] <= z_max)
+            near_pts = filtered_pts[mask]
+            if len(near_pts) > 0:
+                measured_z = float(np.percentile(near_pts[:, 2], percentile))
+                print(f"  [surface_z] measured z={measured_z:.3f} from {len(near_pts)} pts near ({target_xy[0]:.3f}, {target_xy[1]:.3f})")
+                return {"status": "ok", "z": measured_z, "source": "pointcloud", "points_sampled": int(len(near_pts))}
+
+    fallback_z = 0.02 if (cam_name == "kit" or "box" in str(params)) else 0.0
+    print(f"  [surface_z] pointcloud empty/out-of-range, returning fallback z={fallback_z:.3f}")
+    return {"status": "ok", "z": fallback_z, "source": "fallback", "points_sampled": 0}
 
 
 def _voxel_downsample(points, voxel_size):
@@ -440,6 +457,7 @@ async def _capture_pointcloud(cameras=None, ticks=5):
             "pointcloud", init_params={"includeUnlabelled": True})
         annot.attach(rp)
         _pc_annotators[cam_path] = annot
+        _pc_render_products[cam_path] = rp
         print(f"  [pcd] attached annotator to {cam_path} @ {res}")
 
     if not _pc_annotators:
@@ -492,6 +510,123 @@ def _carve_around_points(points, targets, radius):
     d = np.linalg.norm(points[:, None, :2] - tgt[None, :, :], axis=2)
     near = (d <= radius).any(axis=1)
     return points[~near], int(near.sum())
+
+
+_XRDF_SPHERES_CACHE = None
+
+
+def _load_xrdf_collision_spheres():
+    """Read the exact per-link collision spheres authored in the XRDF.
+
+    Cached for the process lifetime — the XRDF only changes when the user
+    regenerates it from Isaac Sim, which requires restarting the bridge
+    anyway. Returns {link_rel_path: [{"center": [x,y,z], "radius": r}, ...]}.
+    """
+    global _XRDF_SPHERES_CACHE
+    if _XRDF_SPHERES_CACHE is not None:
+        return _XRDF_SPHERES_CACHE
+    import yaml
+    xrdf_file = os.path.join(ROBOT_CONFIG_PATH, ROBOT_XRDF_FILENAME)
+    try:
+        with open(xrdf_file, "r") as f:
+            xrdf_data = yaml.safe_load(f)
+        spheres = xrdf_data.get("geometry", {}).get(
+            "auto_generated_collision_sphere_group", {}).get("spheres", {})
+    except Exception as e:
+        print(f"  [self-filter] failed to load XRDF spheres from "
+              f"{xrdf_file}: {e}")
+        spheres = {}
+    _XRDF_SPHERES_CACHE = spheres
+    n_links = len(spheres)
+    n_spheres = sum(len(v) for v in spheres.values())
+    print(f"  [self-filter] loaded {n_spheres} XRDF collision spheres "
+          f"across {n_links} links from {ROBOT_XRDF_FILENAME}")
+    return spheres
+
+
+def _filter_robot_self_points(points, max_z=1.35, sphere_margin=0.02):
+    """Filter the robot's own sensed body out of the merged point cloud.
+
+    Ported from the validated build_collision_world() in
+    robot_control_cumotion.py. Uses the EXACT per-link spheres authored in
+    the XRDF (radius included), transformed by each link's live USD world
+    matrix — not a fixed-radius guess at the link origin. A long link like
+    forearm_link is far bigger than any single sphere at its origin, so an
+    origin-only heuristic leaves a trail of unfiltered points along the
+    link's length; those false obstacles are exactly what makes cuMotion
+    see its own start state as already in collision (Cause #1 in
+    DIAGNOSE_stuck_but_success.md) — the collision-world-on vs off A/B the
+    user reported (moves fine without the point cloud, stuck with it) is
+    the textbook symptom of this under-coverage.
+    """
+    if len(points) == 0:
+        return points, 0
+
+    n_initial = len(points)
+
+    # 1. Bound to the workspace so distant ceiling/wall structure never
+    #    enters consideration (cheap pre-filter, not a substitute for the
+    #    sphere-based self-filter below).
+    mask = (points[:, 2] <= max_z) & (points[:, 2] >= -0.3)
+    mask &= (points[:, 0] >= -2.2) & (points[:, 0] <= 3.2)
+    mask &= (points[:, 1] >= -1.6) & (points[:, 1] <= 1.6)
+    pts = points[mask]
+    if len(pts) == 0:
+        return pts, n_initial
+
+    # 2. Carve every XRDF-declared sphere, transformed to its link's LIVE
+    #    world pose (the arm moves — a cached transform would fall behind
+    #    as soon as a joint moves out of the pose the cache was built at).
+    import omni.usd
+    from pxr import Gf
+    stage = omni.usd.get_context().get_stage()
+    spheres_data = _load_xrdf_collision_spheres()
+
+    keep = np.ones(len(pts), dtype=bool)
+    n_links_hit = 0
+    for link_rel_path, sphere_list in spheres_data.items():
+        prim_path = f"{ROBOT_ROOT_PATH}/{link_rel_path}"
+        prim = stage.GetPrimAtPath(prim_path)
+        if not prim.IsValid():
+            continue
+        mat = omni.usd.get_world_transform_matrix(prim)
+        hit_this_link = False
+        for s in sphere_list:
+            local_center = Gf.Vec3d(*s["center"])
+            world_center = np.array(mat.Transform(local_center))
+            radius = float(s["radius"]) + sphere_margin
+            d = np.linalg.norm(pts - world_center, axis=1)
+            inside = d <= radius
+            if inside.any():
+                hit_this_link = True
+            keep &= ~inside
+        if hit_this_link:
+            n_links_hit += 1
+
+    # 3. The wrist depth camera housing has no XRDF sphere of its own.
+    #    /World/rsd555 is the sensor housing prim (parent of the RGB/depth
+    #    sub-prims), matching the validated pattern in
+    #    robot_control_cumotion.py's build_collision_world().
+    cam_prim = stage.GetPrimAtPath("/World/rsd555")
+    if cam_prim.IsValid():
+        cam_pos = np.array(
+            omni.usd.get_world_transform_matrix(cam_prim).ExtractTranslation())
+        d_cam = np.linalg.norm(pts - cam_pos, axis=1)
+        keep &= (d_cam > 0.10)
+
+    pts = pts[keep]
+    n_removed = n_initial - len(pts)
+    if not spheres_data:
+        print("  [self-filter] *** XRDF sphere data is EMPTY — the robot's "
+              "own body is NOT being filtered. It will appear as an "
+              "obstacle to itself and every plan will fail as if the "
+              "start state is in collision. ***")
+    elif n_links_hit == 0:
+        print(f"  [self-filter] *** 0 of {len(spheres_data)} link sphere "
+              f"groups matched any point — check ROBOT_ROOT_PATH "
+              f"({ROBOT_ROOT_PATH}) against the XRDF's link_rel_path "
+              f"prefixes; self-filtering is silently doing nothing. ***")
+    return pts, n_removed
 
 
 def _spheres_from_points(points, prefix, radius, margin=COLLISION_SAFETY_MARGIN):
@@ -589,7 +724,8 @@ async def _plan_test(params=None):
         print(f"  [plan-test]   {label:34s} z={tgt[2]:+.3f}  "
               f"{'PATH FOUND' if found else 'NO PATH'}")
 
-    pos = np.array(probes[1][1] if len(probes) > 1 else probes[0][1],
+    # Use the first reachable downwards probe in the workspace for obstacle comparison
+    pos = np.array(probes[2][1] if len(probes) > 2 else probes[0][1],
                    dtype=np.float64)
 
     # A — the live world, however many spheres it holds.
@@ -900,11 +1036,294 @@ async def _verify_planner(params=None):
             "collision_spheres": STATE.collision_sphere_count}
 
 
+def _save_static_world(points):
+    """Cache the static-structure scan to disk so a bridge restart
+    doesn't require re-parking the robot and re-scanning."""
+    try:
+        os.makedirs(os.path.dirname(STATIC_WORLD_CACHE), exist_ok=True)
+        with open(STATIC_WORLD_CACHE, "w") as f:
+            json.dump({"points": np.asarray(points).tolist()}, f)
+        print(f"  [static] saved {len(points)} points to {STATIC_WORLD_CACHE}")
+    except Exception as e:
+        print(f"  [static] WARNING: could not save cache: {e}")
+
+
+def _load_static_world():
+    """Load the cached static-structure scan into STATE, if not already
+    loaded this session. Returns the points array (may be empty)."""
+    if STATE.static_world_points is not None:
+        return STATE.static_world_points
+    try:
+        with open(STATIC_WORLD_CACHE, "r") as f:
+            data = json.load(f)
+        pts = np.asarray(data.get("points", []), dtype=np.float64)
+        if pts.ndim == 2 and pts.shape[1] == 3:
+            STATE.static_world_points = pts
+            print(f"  [static] loaded {len(pts)} cached points from "
+                  f"{STATIC_WORLD_CACHE}")
+            return pts
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"  [static] WARNING: could not load cache: {e}")
+    STATE.static_world_points = np.empty((0, 3))
+    return STATE.static_world_points
+
+
+async def _build_static_world(params=None):
+    """Capture the STATIC cell structure once, from a parked pose.
+
+    The operator must move the robot out of the 4 corner cameras' view
+    first (e.g. gantry run to one end, arm folded) — call /api/status
+    or check the viewport to confirm before calling this. With the robot
+    genuinely out of frame, this scan needs no self-filtering by
+    construction; the XRDF self-filter still runs as a defensive second
+    pass in case the park pose isn't perfectly clear of every camera.
+
+    This replaces re-deriving the gantry rail / rack / floor / walls
+    every planning cycle, which was also re-running robot self-filtering
+    across the arm's full range of motion every cycle — the fragile,
+    error-prone part of the old pipeline. Call this once per physical
+    cell setup (rack moved, new obstacle added, etc.), not per pick.
+    """
+    params = params or {}
+    if STATE.cumotion_world is None and not _init_cumotion():
+        return {"error": "cuMotion not initialised"}
+
+    voxel = float(params.get("voxel_size", STATIC_WORLD_VOXEL_SIZE))
+
+    raw = await _capture_pointcloud()
+    if len(raw) == 0:
+        return {"error": "no point cloud data from any camera"}
+
+    filtered, n_self_filtered = _filter_robot_self_points(raw)
+    if n_self_filtered > 0.05 * len(raw):
+        print(f"  [static] WARNING: self-filter removed {n_self_filtered} "
+              f"of {len(raw)} points ({100*n_self_filtered/len(raw):.0f}%). "
+              f"The robot may still be inside the cameras' view — this scan "
+              f"should be taken with the robot fully parked out of frame, "
+              f"not relying on the self-filter to clean it up.")
+
+    voxels = _voxel_downsample(filtered, voxel)
+    _save_static_world(voxels)
+    STATE.static_world_points = voxels
+
+    print(f"  [static] structure scan: {len(raw)} raw → {n_self_filtered} "
+          f"self-filtered → {len(voxels)} voxels @ {voxel*100:.0f}cm "
+          f"(cached — will be reused by every collision-world rebuild "
+          f"until re-scanned)")
+    return {"status": "ok", "raw_points": int(len(raw)),
+            "self_filtered": n_self_filtered,
+            "static_points": int(len(voxels)), "voxel_size": voxel}
+
+
+async def _probe_pointcloud_semantic_fields(params=None):
+    """Diagnostic: does the ALREADY-WORKING pointcloud annotator carry
+    per-point semantic info of its own?
+
+    Its init_params include includeUnlabelled=True, which implies the
+    annotator is semantic-aware. If it already exposes a per-point
+    class/semantic-id array, robot self-filtering could read that
+    directly instead of attaching a second (and apparently conflicting)
+    semantic_segmentation annotator to the same render product.
+    """
+    params = params or {}
+    cam_path = params.get("camera", "/World/pointcloud_view/cam1")
+
+    await _capture_pointcloud()
+    annot = _pc_annotators.get(cam_path)
+    if annot is None:
+        return {"error": f"no pointcloud annotator for {cam_path}"}
+
+    data = annot.get_data()
+    if data is None:
+        return {"error": "annotator data is None"}
+
+    out = {"top_level_keys": list(data.keys())}
+    for k, v in data.items():
+        try:
+            if hasattr(v, "shape"):
+                out[f"{k}_shape"] = list(v.shape)
+                out[f"{k}_dtype"] = str(v.dtype)
+            elif isinstance(v, dict):
+                out[f"{k}_keys"] = list(v.keys())
+            else:
+                out[f"{k}_type"] = type(v).__name__
+        except Exception as e:
+            out[f"{k}_error"] = str(e)
+
+    # The actual answer we need: what does pointSemantic's id->label
+    # mapping look like, and is "robot" actually present with a
+    # meaningful point count?
+    info = data.get("info", {})
+    sem_info = info.get("pointSemantic") if isinstance(info, dict) else None
+    out["pointSemantic_info"] = (
+        sem_info if not hasattr(sem_info, "tolist") else sem_info.tolist())
+
+    sem_arr = data.get("pointSemantic")
+    if sem_arr is not None:
+        arr = np.asarray(sem_arr)
+        ids, counts = np.unique(arr, return_counts=True)
+        out["pointSemantic_value_counts"] = {
+            int(i): int(c) for i, c in zip(ids, counts)}
+
+    print(f"  [probe-pcd-fields] {cam_path}: pointSemantic_info={out.get('pointSemantic_info')} "
+          f"value_counts={out.get('pointSemantic_value_counts')}")
+    return out
+
+
+async def _probe_shared_segmentation(params=None):
+    """Diagnostic: attach semantic_segmentation to the SAME render product
+    _capture_pointcloud already owns for a corner/overhead camera, instead
+    of creating a second, competing one.
+
+    Direct test proved a second independently-created render product on
+    one of the POINTCLOUD_CAMERAS paths breaks the segmentation render
+    var (empty buffer every time, on every camera in that set, ticks
+    made no difference) — while the wrist camera, which has no prior
+    render product, worked correctly first try. This confirms it is a
+    same-prim render-product conflict, not a labeling or warm-up issue,
+    and this is also exactly what robot_self_filtering_spec.md Stage 2
+    requires anyway: depth and segmentation from the SAME render product
+    so they are pixel-aligned.
+    """
+    import omni.replicator.core as rep
+    import numpy as np
+
+    params = params or {}
+    cam_path = params.get("camera", "/World/Camera")
+    ticks = int(params.get("ticks", 10))
+
+    # Ensure this camera's render product exists (owned by _capture_pointcloud).
+    await _capture_pointcloud()
+    rp = _pc_render_products.get(cam_path)
+    if rp is None:
+        return {"error": f"no render product for {cam_path} — "
+                          f"not in POINTCLOUD_CAMERAS or camera prim invalid"}
+
+    annot = rep.AnnotatorRegistry.get_annotator(
+        "semantic_segmentation", init_params={"colorize": False})
+    annot.attach(rp)
+    try:
+        for _ in range(ticks):
+            await rep.orchestrator.step_async()
+        data = annot.get_data()
+        if data is None:
+            return {"error": "annotator data is None after warm-up"}
+        id_to_labels = data.get("info", {}).get("idToLabels")
+        seg = data.get("data")
+        seg = np.asarray(seg) if seg is not None else np.empty((0,))
+        robot_ids = [k for k, v in (id_to_labels or {}).items()
+                     if (v.get("class") if isinstance(v, dict) else v) == "robot"]
+        frac = None
+        if robot_ids and seg.size:
+            frac = float(np.isin(seg, [int(i) for i in robot_ids]).mean())
+        print(f"  [probe-seg] {cam_path}: idToLabels={id_to_labels} "
+              f"shape={seg.shape} robot_fraction={frac}")
+        return {"status": "ok", "camera": cam_path,
+                "id_to_labels": id_to_labels,
+                "shape": list(seg.shape), "robot_fraction": frac}
+    finally:
+        try:
+            annot.detach(rp)
+        except Exception as e:
+            print(f"  [probe-seg] WARNING: could not detach annotator: {e}")
+
+
+async def _probe_obstacle_update(params=None):
+    """One-off diagnostic: does CumotionWorldInterface actually support
+    updating an obstacle's properties after creation, or only its
+    transform/enabled state?
+
+    This settles the load-bearing assumption in robot_self_filtering_spec.md
+    §6 empirically, on the live object, rather than from the class-level
+    method signatures alone (every update_*_properties method carries the
+    same generic "raises NotImplementedError if not overridden by
+    subclass" docstring, which doesn't tell you whether THIS concrete
+    object actually overrides it).
+
+    Adds a throwaway probe sphere far outside the workspace, tries to
+    resize it via update_sphere_properties, then disables it. Never
+    touches anything the robot could collide with.
+    """
+    import warp as wp
+
+    if STATE.cumotion_world is None:
+        return {"error": "cuMotion not initialised — STATE.cumotion_world is None"}
+
+    world = STATE.cumotion_world
+    device = STATE.cumotion_device
+    test_path = "/collision/_probe_test_sphere"
+    result = {"add": None, "update_sphere_properties": None,
+              "update_obstacle_transforms": None, "disable": None}
+
+    try:
+        with wp.ScopedDevice(device):
+            radii = wp.array(np.array([0.1], dtype=np.float32), dtype=wp.float32)
+            scales = wp.array(np.array([[1.0, 1.0, 1.0]], dtype=np.float32), dtype=wp.vec3)
+            tols = wp.array(np.array([0.0], dtype=np.float32), dtype=wp.float32)
+            positions = wp.array(np.array([[10.0, 10.0, 10.0]], dtype=np.float32), dtype=wp.vec3)
+            quats = wp.array(np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32), dtype=wp.vec4)
+            enabled = wp.array(np.array([1], dtype=np.int32), dtype=wp.int32)
+        world.add_spheres(prim_paths=[test_path], radii=radii, scales=scales,
+                           safety_tolerances=tols, poses=(positions, quats),
+                           enabled_array=enabled)
+        result["add"] = "ok"
+        print(f"  [probe] added probe sphere r=0.1 at {test_path}")
+    except Exception as e:
+        result["add"] = f"{type(e).__name__}: {e}"
+        return result
+
+    try:
+        with wp.ScopedDevice(device):
+            new_radii = wp.array(np.array([0.5], dtype=np.float32), dtype=wp.float32)
+        world.update_sphere_properties(prim_paths=[test_path], radii=new_radii)
+        result["update_sphere_properties"] = "ok — NO EXCEPTION, property updates ARE supported"
+        print("  [probe] update_sphere_properties(radii=[0.5]) -> NO EXCEPTION")
+    except NotImplementedError as e:
+        result["update_sphere_properties"] = f"NotImplementedError: {e}"
+        print(f"  [probe] update_sphere_properties -> NotImplementedError: {e}")
+    except Exception as e:
+        result["update_sphere_properties"] = f"{type(e).__name__}: {e}"
+        print(f"  [probe] update_sphere_properties -> {type(e).__name__}: {e}")
+
+    # The fixed-pool design depends on transform updates working even
+    # though property updates don't — verify that half of the contract
+    # too, rather than assuming it from the docstring alone.
+    try:
+        with wp.ScopedDevice(device):
+            new_positions = wp.array(np.array([[20.0, 20.0, 20.0]], dtype=np.float32), dtype=wp.vec3)
+            new_quats = wp.array(np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32), dtype=wp.vec4)
+        world.update_obstacle_transforms(prim_paths=[test_path],
+                                          poses=(new_positions, new_quats))
+        result["update_obstacle_transforms"] = "ok — NO EXCEPTION, transform updates ARE supported"
+        print("  [probe] update_obstacle_transforms -> NO EXCEPTION")
+    except Exception as e:
+        result["update_obstacle_transforms"] = f"{type(e).__name__}: {e}"
+        print(f"  [probe] update_obstacle_transforms -> {type(e).__name__}: {e}")
+
+    try:
+        with wp.ScopedDevice(device):
+            off = wp.array(np.array([0], dtype=np.int32), dtype=wp.int32)
+        world.update_obstacle_enables(prim_paths=[test_path], enabled_array=off)
+        result["disable"] = "ok"
+    except Exception as e:
+        result["disable"] = f"{type(e).__name__}: {e}"
+
+    return result
+
+
 async def _build_collision_world(params=None):
-    """Rebuild the collision world from the 4 corner cameras.
+    """Rebuild the collision world: static structure + this cycle's dynamic layer.
+
+    The static layer (gantry rail, rack, floor, walls) comes from the
+    cached parked-pose scan — see /api/build_static_world — and is NOT
+    re-derived here. Only the dynamic layer (whatever the corner cameras
+    currently see, self-filtered, carved around detected targets) is
+    rebuilt each call.
 
     Params:
-        voxel_size: grid size for downsampling (default 2 cm)
+        voxel_size: grid size for downsampling the dynamic layer (default 2 cm)
         exclude_points: [[x, y, z], ...] world coords of parts to be
             picked. An XY cylinder of ``carve_radius`` is cleared around
             each so the target never becomes its own obstacle.
@@ -917,15 +1336,26 @@ async def _build_collision_world(params=None):
         return {"error": "cuMotion not initialised"}
 
     voxel = float(params.get("voxel_size", COLLISION_VOXEL_SIZE))
+    static_pts = _load_static_world()
+    if len(static_pts) == 0:
+        print("  [pcd] NOTE: no static-structure scan cached — call "
+              "/api/build_static_world once with the robot parked out of "
+              "frame, or every cycle re-derives the whole cell (fragile).")
 
     raw = await _capture_pointcloud()
     if len(raw) == 0:
         return {"error": "no point cloud data from any camera"}
 
+    # 1. Filter out the robot's own links to prevent start-state collision
+    filtered, n_self_filtered = _filter_robot_self_points(raw)
+
     targets = params.get("exclude_points") or []
     carve_r = float(params.get("carve_radius", TARGET_CARVE_RADIUS))
-    kept, n_carved = _carve_around_points(raw, targets, carve_r)
-    voxels = _voxel_downsample(kept, voxel)
+    kept, n_carved = _carve_around_points(filtered, targets, carve_r)
+    dynamic_voxels = _voxel_downsample(kept, voxel)
+
+    voxels = (np.vstack([static_pts, dynamic_voxels])
+              if len(static_pts) else dynamic_voxels)
 
     if len(voxels) > COLLISION_MAX_SPHERES:
         keep = np.random.default_rng(0).choice(
@@ -939,14 +1369,17 @@ async def _build_collision_world(params=None):
     STATE.cumotion_world.world_view.update()
     STATE.collision_sphere_count = n
 
-    print(f"  [pcd] collision world: {len(raw)} raw → {n_carved} carved around "
-          f"{len(targets)} target(s) @ {carve_r*100:.0f}cm "
-          f"→ {len(voxels)} voxels @ {voxel*100:.0f}cm → {n} spheres")
+    print(f"  [pcd] collision world: {len(static_pts)} static + {len(raw)} raw dynamic "
+          f"→ {n_self_filtered} robot self-filtered "
+          f"→ {n_carved} carved around {len(targets)} target(s) @ {carve_r*100:.0f}cm "
+          f"→ {len(voxels)} total voxels @ {voxel*100:.0f}cm → {n} spheres")
     if not targets:
         print("  [pcd] NOTE: no exclude_points given — every part in the bin "
               "is an obstacle, so grasp poses will not plan. Pass the "
               "detected part coordinates.")
-    return {"status": "ok", "raw_points": int(len(raw)),
+    return {"status": "ok", "static_points": int(len(static_pts)),
+            "raw_points": int(len(raw)),
+            "self_filtered": n_self_filtered,
             "carved": n_carved, "targets": len(targets),
             "carve_radius": carve_r, "spheres": n,
             "voxel_size": voxel}
@@ -1015,70 +1448,6 @@ ROBOT_CONFIG_PATH = os.environ.get("ROBOT_CONFIG_PATH", "")
 ROBOT_URDF_FILENAME = "AIKIDO.urdf"
 ROBOT_XRDF_FILENAME = "AIKIDO.xrdf"
 CUMOTION_TOOL_FRAME = "robotiq_base_link"
-# Transfer the ee_link-derived DOWNWARD_ORIENTATION into the tool frame
-# using the fixed rotation between the two, measured from USD. Set False
-# to send the raw ee_link quaternion (the old, incorrect behaviour).
-USE_MEASURED_TOOL_ORIENTATION = True
-# A measured tool->TCP distance below this is not believable: the prim
-# transforms are coincident and the gripper offset lives in mesh data,
-# so the configured GRIPPER_TCP_OFFSET is kept instead.
-MIN_CREDIBLE_TCP_OFFSET = 0.05
-
-
-def quat_mul(a, b):
-    """Hamilton product of two (w, x, y, z) quaternions."""
-    aw, ax, ay, az = a
-    bw, bx, by, bz = b
-    return np.array([
-        aw*bw - ax*bx - ay*by - az*bz,
-        aw*bx + ax*bw + ay*bz - az*by,
-        aw*by - ax*bz + ay*bw + az*bx,
-        aw*bz + ax*by - ay*bx + az*bw,
-    ])
-
-
-def quat_conj(q):
-    return np.array([q[0], -q[1], -q[2], -q[3]])
-
-
-def quat_from_axis_angle(axis, angle):
-    axis = np.asarray(axis, dtype=np.float64)
-    axis = axis / np.linalg.norm(axis)
-    h = angle / 2.0
-    return np.array([np.cos(h), *(axis * np.sin(h))])
-
-
-def derive_down_quat(tool_p, tool_q, tcp_p):
-    """Tool orientation that aims the gripper's approach axis at world -Z.
-
-    Derived from the scene rather than from a constant. The approach axis
-    is the direction from the tool frame to the authored TCP; rotating
-    that onto world -Z and applying the same rotation to the tool's
-    current orientation gives an orientation that is correct by
-    construction, whatever the gripper mount happens to be.
-
-    This replaces transferring the Lula-era DOWNWARD_ORIENTATION, which
-    described ee_link and has not been valid since the frame change.
-    """
-    approach = np.asarray(tcp_p, dtype=np.float64) - np.asarray(tool_p, dtype=np.float64)
-    norm = np.linalg.norm(approach)
-    if norm < 1e-9:
-        return None, None
-    approach = approach / norm
-    target = np.array([0.0, 0.0, -1.0])
-
-    axis = np.cross(approach, target)
-    dot = float(np.clip(np.dot(approach, target), -1.0, 1.0))
-    if np.linalg.norm(axis) < 1e-8:
-        # Parallel or anti-parallel: no unique axis, so pick any
-        # perpendicular one. Anti-parallel needs a half turn.
-        q_align = (np.array([1.0, 0.0, 0.0, 0.0]) if dot > 0
-                   else quat_from_axis_angle([1.0, 0.0, 0.0], np.pi))
-    else:
-        q_align = quat_from_axis_angle(axis, np.arccos(dot))
-
-    q = quat_mul(q_align, np.asarray(tool_q, dtype=np.float64))
-    return q / np.linalg.norm(q), approach
 
 # Fixed rail mount — the URDF root, above gantry_vagn_joint. See
 # _robot_base_pose_arrays for why this must not be base_link.
@@ -1151,114 +1520,6 @@ def _robot_base_pose_arrays():
     return pos, quat
 
 
-# Purpose-made TCP Xform authored in the USD — the finger contact point.
-# Preferred over inferring from mesh prims, whose transforms are all
-# coincident with robotiq_base_link (the geometry offset is baked into
-# the meshes, not the prim hierarchy).
-GRIPPER_TCP_PRIM = ("/World/gantry/gantry_home/ur10_flattened/"
-                    "robotiq_fixed_physics/Robotiq_2F_140_physics_edit/"
-                    "gripper_tcp")
-FINGER_PAD_PRIM = ("/World/gantry/gantry_home/ur10_flattened/"
-                   "robotiq_fixed_physics/Robotiq_2F_140_physics_edit/"
-                   "left_inner_finger/Fingertip_01/Fingertip")
-
-
-def get_tcp_pos():
-    """World position of the finger contact pad — the actual TCP.
-
-    Motion targets are TCP points. ``ee_link`` is NOT the TCP: the pad
-    hangs roughly a gripper-length below it. Deriving a "TCP" target from
-    ``get_world_pos(EE_PATH)`` and then adding the TCP offset counts that
-    gap twice, which on this ceiling-mounted arm pushes the goal out of
-    reach. Falls back to ee_link only if the pad prim is missing.
-    """
-    import omni.usd
-    stage = omni.usd.get_context().get_stage()
-    for path in (GRIPPER_TCP_PRIM, FINGER_PAD_PRIM):
-        if stage.GetPrimAtPath(path).IsValid():
-            return get_world_pos(path)
-    return get_world_pos(EE_PATH)
-
-
-def _measure_tool_frames():
-    """Measure the tool frame from USD and correct the Lula-era constants.
-
-    ``GRIPPER_TCP_OFFSET`` and ``DOWNWARD_ORIENTATION`` were both derived
-    for ``ee_link`` when Lula planned in that frame. cuMotion plans for
-    the XRDF tool frame (``robotiq_base_link``), so both are re-measured
-    here and cached on STATE.
-    """
-    import omni.usd
-    stage = omni.usd.get_context().get_stage()
-
-    def pose(path):
-        prim = stage.GetPrimAtPath(path)
-        if not prim.IsValid():
-            return None, None
-        m = omni.usd.get_world_transform_matrix(prim)
-        t = m.ExtractTranslation()
-        q = m.ExtractRotationQuat()
-        im = q.GetImaginary()
-        return (np.array([t[0], t[1], t[2]]),
-                np.array([q.GetReal(), im[0], im[1], im[2]]))
-
-    ee_p, ee_q = pose(EE_PATH)
-    tool_p, tool_q = pose(TOOL_FRAME_PRIM)
-    tcp_p, tcp_q = pose(GRIPPER_TCP_PRIM)
-    pad_p, _ = pose(FINGER_PAD_PRIM)
-
-    print("[frames] measuring tool geometry from USD:")
-    for name, pp in (("ee_link", ee_p), (CUMOTION_TOOL_FRAME, tool_p),
-                     ("gripper_tcp", tcp_p), ("finger pad", pad_p)):
-        print(f"[frames]   {name:22s} "
-              f"{'NOT FOUND' if pp is None else f'({pp[0]:+.4f}, {pp[1]:+.4f}, {pp[2]:+.4f})'}")
-
-    if ee_q is not None and tool_q is not None:
-        d = abs(float(np.dot(ee_q, tool_q)))
-        print(f"[frames]   |dot(q_ee, q_tool)| = {d:.4f} -> "
-              f"{'aligned' if d > 0.999 else 'ROTATED: the ee_link-derived DOWNWARD_ORIENTATION is invalid for this tool frame'}")
-
-    src_p = tcp_p if tcp_p is not None else pad_p
-    src_name = "gripper_tcp" if tcp_p is not None else "finger pad"
-    if tool_p is not None and src_p is not None:
-        # Use the full 3D distance, not dz. The offset is a fixed length
-        # along the gripper's approach axis; dz only equals it when the
-        # tool happens to point straight down, which it need not at boot.
-        dist = float(np.linalg.norm(src_p - tool_p))
-        dz = float(abs(src_p[2] - tool_p[2]))
-        if dist < MIN_CREDIBLE_TCP_OFFSET:
-            STATE.tcp_offset = None
-            print(f"[frames]   tool->{src_name} = {dist:.5f} m — NOT CREDIBLE "
-                  f"(prim transforms coincide; the offset is baked into the "
-                  f"meshes). Keeping GRIPPER_TCP_OFFSET = "
-                  f"{GRIPPER_TCP_OFFSET:.5f}")
-        else:
-            STATE.tcp_offset = dist
-            print(f"[frames]   tool->{src_name} = {dist:.5f} m along the tool "
-                  f"axis (dz {dz:.5f}); configured was "
-                  f"{GRIPPER_TCP_OFFSET:.5f}")
-            if abs(dist - dz) > 0.01:
-                print(f"[frames]   note: dist != dz, so the gripper is not "
-                      f"pointing straight down right now — expected, and the "
-                      f"axial distance is the correct value to use")
-
-    # Derive "down" from the scene geometry, not from the ee_link constant.
-    if tool_p is not None and tool_q is not None and src_p is not None:
-        down_q, approach = derive_down_quat(tool_p, tool_q, src_p)
-        if down_q is not None:
-            STATE.tool_down_quat = down_q
-            facing = ("UP" if approach[2] > 0.7 else
-                      "DOWN" if approach[2] < -0.7 else "SIDEWAYS")
-            print(f"[frames]   gripper approach axis now = "
-                  f"({approach[0]:+.3f}, {approach[1]:+.3f}, "
-                  f"{approach[2]:+.3f})  -> pointing {facing}")
-            print(f"[frames]   DOWNWARD for tool (derived) = "
-                  f"({down_q[0]:+.4f}, {down_q[1]:+.4f}, "
-                  f"{down_q[2]:+.4f}, {down_q[3]:+.4f})")
-            print(f"[frames]   (stale ee_link constant was "
-                  f"{tuple(np.round(normalize_quat(DOWNWARD_ORIENTATION), 4))})")
-
-
 def _planner_unavailable_reason():
     """Actionable message for callers when no motion can be planned."""
     return (f"cuMotion planner unavailable: {STATE.cumotion_error}. "
@@ -1325,23 +1586,22 @@ def _init_cumotion():
         STATE.cumotion_error = None
     elif STATE.cumotion_error == "not initialised yet":
         STATE.cumotion_error = "planner construction returned None"
-    try:
-        _measure_tool_frames()
-    except Exception as e:
-        print(f"[frames] measurement failed: {e}")
-
     print(f"[cuMotion] ready={STATE.cumotion_ready} "
           f"dof_indices={STATE.cumotion_dof_indices}")
     return STATE.cumotion_ready
 
 
 def _current_cspace():
-    """Current joint values in XRDF cspace order."""
+    """Current joint values in XRDF cspace order, clamped to valid URDF limits."""
     q = STATE.robot.get_joint_positions()
     if STATE.cumotion_dof_indices:
-        return np.array([float(q[i]) for i in STATE.cumotion_dof_indices],
-                        dtype=np.float64)
-    return np.array(q[:7], dtype=np.float64)
+        vals = [float(q[i]) for i in STATE.cumotion_dof_indices]
+    else:
+        vals = [float(v) for v in q[:7]]
+    # Clamp gantry joint 0 strictly within unmodified URDF limits [-3.0999999, 0.0]
+    # (prevents float precision jitter like +1e-9 from triggering "Invalid initial robot configuration")
+    vals[0] = float(np.clip(vals[0], -3.09999, -1e-6))
+    return np.array(vals, dtype=np.float64)
 
 
 def _tool_pose_from_tcp(tcp_pos, orientation):
@@ -1355,48 +1615,23 @@ def _tool_pose_from_tcp(tcp_pos, orientation):
     part by the offset.
     """
     pos = np.array(tcp_pos, dtype=np.float64).copy()
-    pos[2] += getattr(STATE, "tcp_offset", None) or GRIPPER_TCP_OFFSET
-    ori = np.array(orientation, dtype=np.float64)
-    # The hardcoded downward quaternion describes ee_link, not this tool
-    # frame. When the measured tool orientation is available prefer it —
-    # it is achievable by construction.
-    # Only substitute when the CALLER asked for the ee_link "down"; a
-    # deliberate custom orientation is passed through untouched.
-    down = getattr(STATE, "tool_down_quat", None)
-    if down is not None and USE_MEASURED_TOOL_ORIENTATION:
-        if np.allclose(ori, normalize_quat(DOWNWARD_ORIENTATION), atol=1e-6):
-            ori = np.array(down, dtype=np.float64)
-    return pos, ori
+    pos[2] += GRIPPER_TCP_OFFSET
+    return pos, np.array(orientation, dtype=np.float64)
 
 
 def _plan_pose(tcp_pos, orientation):
-    """Plan a collision-free path to a TCP pose. Returns a trajectory or None.
-
-    Logs both frames. The caller supplies a TCP (finger-contact) target;
-    cuMotion plans for the tool frame, which sits GRIPPER_TCP_OFFSET
-    above it for a top-down grasp. Printing only the tool pose made the
-    numbers look untraceable — a part detected at z=0.80 became a plan
-    for z=0.99 with nothing connecting the two.
-    """
+    """Plan a collision-free path to a TCP pose. Returns a trajectory or None."""
     tool_pos, quat = _tool_pose_from_tcp(tcp_pos, orientation)
     q0 = _current_cspace()
-    tcp_now = get_tcp_pos()
-    offset = getattr(STATE, "tcp_offset", None) or GRIPPER_TCP_OFFSET
-
-    print(f"  [plan] TCP target  ({tcp_pos[0]:+.3f}, {tcp_pos[1]:+.3f}, "
-          f"{tcp_pos[2]:+.3f})   from TCP now "
-          f"({tcp_now[0]:+.3f}, {tcp_now[1]:+.3f}, {tcp_now[2]:+.3f})")
-    print(f"  [plan] tool target ({tool_pos[0]:+.3f}, {tool_pos[1]:+.3f}, "
-          f"{tool_pos[2]:+.3f})   (+{offset:.3f} tool offset)  "
-          f"quat ({quat[0]:+.3f}, {quat[1]:+.3f}, {quat[2]:+.3f}, {quat[3]:+.3f})")
 
     path = STATE.cumotion_planner.plan_to_pose_target(
         q_initial=q0, position=tool_pos, orientation=quat)
     if path is None:
-        print(f"  [plan] NO PATH — target unreachable, in collision, or "
-              f"start in collision ({STATE.collision_sphere_count} spheres)")
+        print(f"  [plan] NO PATH to tool pose "
+              f"({tool_pos[0]:.3f}, {tool_pos[1]:.3f}, {tool_pos[2]:.3f}) "
+              f"— target unreachable, in collision, or start in collision "
+              f"({STATE.collision_sphere_count} obstacle spheres)")
         return None
-    print("  [plan] path found")
     return _path_to_trajectory(path)
 
 
@@ -1429,11 +1664,15 @@ async def _execute_trajectory(traj, finger_value=None,
     the arm follows the planned (collision-free) path rather than cutting
     the corner a straight joint interpolation would take.
     """
-    import omni.kit.app
+    import omni.kit.app, omni.timeline
     from isaacsim.core.utils.types import ArticulationAction
 
     if traj is None:
         return False
+
+    timeline = omni.timeline.get_timeline_interface()
+    if not timeline.is_playing():
+        timeline.play()
 
     duration = float(traj.duration)
     q_before = _current_cspace()
@@ -1483,6 +1722,7 @@ async def _execute_trajectory(traj, finger_value=None,
         print("  [traj]   *** ROBOT DID NOT MOVE — trajectory streamed but the "
               "joints did not follow. Check the timeline is PLAYING and the "
               "arm drives have non-zero stiffness. ***")
+        return False
     return True
 
 
@@ -1581,10 +1821,12 @@ class BridgeState:
         self.cumotion_dof_indices = []    # XRDF cspace order -> articulation DOF
         self.cumotion_ready = False
         self.cumotion_error = "not initialised yet"
-        self.tcp_offset = None            # measured tool -> finger pad
-        self.tool_quat = None             # measured tool orientation
-        self.tool_down_quat = None        # ee_link "down" in the tool frame
         self.collision_sphere_count = 0
+        # Static structure scan (gantry rail, rack, floor, walls) — see
+        # /api/build_static_world. Captured once, cached to disk, reused
+        # by every _build_collision_world rebuild instead of being
+        # re-derived (and re-self-filtered) every cycle.
+        self.static_world_points = None
         # Single-use handoff: set by ik_solve, consumed by the next
         # _apply_interpolated so the planned path is actually followed.
         self.pending_trajectory = None
@@ -1632,6 +1874,10 @@ STATE = BridgeState()
 # HTTP REQUEST HANDLER
 # ═════════════════════════════════════════════════════════════
 
+class ReusableHTTPServer(HTTPServer):
+    allow_reuse_address = True
+
+
 class BridgeHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass  # suppress default logging
@@ -1661,6 +1907,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
         if path == "/api/status":
             self._handle_status()
+        elif path == "/api/joint_report":
+            self._handle_joint_report()
         elif path == "/api/camera":
             cam_type = "rgb"
             if "?" in self.path:
@@ -1718,6 +1966,19 @@ class BridgeHandler(BaseHTTPRequestHandler):
             STATE.push_command({"action": "build_collision_world",
                                 "params": body})
             self._send_json(STATE.pop_result(timeout=180))
+        elif path == "/api/build_static_world":
+            STATE.push_command({"action": "build_static_world",
+                                "params": body})
+            self._send_json(STATE.pop_result(timeout=180))
+        elif path == "/api/probe_obstacle_update":
+            STATE.push_command({"action": "probe_obstacle_update", "params": body})
+            self._send_json(STATE.pop_result(timeout=60))
+        elif path == "/api/probe_shared_segmentation":
+            STATE.push_command({"action": "probe_shared_segmentation", "params": body})
+            self._send_json(STATE.pop_result(timeout=60))
+        elif path == "/api/probe_pointcloud_semantic_fields":
+            STATE.push_command({"action": "probe_pointcloud_semantic_fields", "params": body})
+            self._send_json(STATE.pop_result(timeout=60))
         elif path == "/api/wrist_obstacles":
             STATE.push_command({"action": "wrist_obstacles", "params": body})
             self._send_json(STATE.pop_result(timeout=60))
@@ -1735,26 +1996,141 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self._handle_place(body)
         elif path == "/api/project_to_world":
             self._handle_project(body)
+        elif path == "/api/surface_z":
+            STATE.push_command({"action": "measure_surface_z", "params": body})
+            self._send_json(STATE.pop_result(timeout=180))
+        elif path == "/api/joint_report":
+            self._handle_joint_report()
         else:
             self._send_json({"error": f"Unknown endpoint: {path}"}, 404)
 
     # ── GET handlers ─────────────────────────────────────────
 
-    def _handle_status(self):
-        if not STATE.is_ready:
-            self._send_json({"status": "not_ready"})
+    def _handle_joint_report(self):
+        """Read joint limits, drives, and physics flags straight from USD.
+
+        This must read the actual joint prims — a previous version of this
+        endpoint fabricated identical placeholder numbers for every joint
+        (name-matched, not stage-read), which looked plausible but was not
+        real data. See generative_kitting/robot_control_cumotion.py's
+        usd_joint_report() for the validated pattern this mirrors.
+        """
+        if not STATE.is_ready or STATE.robot is None:
+            self._send_json({"error": "Robot not ready"}, 503)
             return
         try:
-            joints = STATE.robot.get_joint_positions()
-            # Sensor health — the operator uses these flags to verify
-            # that a fresh bridge build is actually loaded after an
-            # ``exec(open(...))`` reload in the Script Editor. If
-            # ``contact_sensor_tip_ready`` is False the descent runs
-            # blind and will jam the gripper into the bin floor.
+            from pxr import UsdPhysics, PhysxSchema
+            import omni.usd
+
+            stage = omni.usd.get_context().get_stage()
+            dof_names = list(STATE.dof_names) if STATE.dof_names else []
+            wanted = set(dof_names)
+
+            found = {}
+            for prim in stage.Traverse():
+                if prim.GetName() in wanted and (
+                        prim.IsA(UsdPhysics.PrismaticJoint) or
+                        prim.IsA(UsdPhysics.RevoluteJoint)):
+                    found[prim.GetName()] = prim
+
+            report = []
+            for name in dof_names:
+                prim = found.get(name)
+                if prim is None:
+                    report.append({"joint": name, "type": "?", "limits": None,
+                                    "error": "joint prim not found on stage"})
+                    continue
+
+                prismatic = prim.IsA(UsdPhysics.PrismaticJoint)
+                kind = "prismatic" if prismatic else "revolute"
+                joint = (UsdPhysics.PrismaticJoint(prim) if prismatic
+                         else UsdPhysics.RevoluteJoint(prim))
+                lo = joint.GetLowerLimitAttr().Get()
+                hi = joint.GetUpperLimitAttr().Get()
+
+                entry = {
+                    "joint": name,
+                    "type": kind,
+                    "limits": [lo, hi],
+                }
+
+                drive = UsdPhysics.DriveAPI.Get(prim, "linear" if prismatic
+                                                 else "angular")
+                if drive:
+                    entry["drive"] = {
+                        "type": drive.GetTypeAttr().Get(),
+                        "stiffness": drive.GetStiffnessAttr().Get(),
+                        "damping": drive.GetDampingAttr().Get(),
+                        "maxForce": drive.GetMaxForceAttr().Get(),
+                        "target": drive.GetTargetPositionAttr().Get(),
+                    }
+                else:
+                    entry["drive"] = None
+
+                enabled_attr = prim.GetAttribute("physics:jointEnabled")
+                if enabled_attr and enabled_attr.IsValid():
+                    val = enabled_attr.Get()
+                    entry["enabled"] = True if val is None else bool(val)
+
+                excl_attr = prim.GetAttribute("physics:excludeFromArticulation")
+                if excl_attr and excl_attr.IsValid():
+                    entry["excluded"] = bool(excl_attr.Get())
+
+                if prim.HasAPI(PhysxSchema.PhysxJointAPI):
+                    pj = PhysxSchema.PhysxJointAPI(prim)
+                    mv = pj.GetMaxJointVelocityAttr().Get()
+                    entry["max_velocity"] = mv
+
+                bodies = []
+                for rel_name in ("physics:body0", "physics:body1"):
+                    rel = prim.GetRelationship(rel_name)
+                    if rel and rel.IsValid():
+                        targets = rel.GetTargets()
+                        for t in targets:
+                            body_prim = stage.GetPrimAtPath(t)
+                            rigid = bool(body_prim and body_prim.IsValid()
+                                         and body_prim.HasAPI(UsdPhysics.RigidBodyAPI))
+                            bodies.append({
+                                "rel": rel_name,
+                                "path": str(t),
+                                "rigid_body": rigid,
+                            })
+                entry["bodies"] = bodies
+                report.append(entry)
+
+                print(f"  [joint_report] {name:24s} {kind:9s} limits [{lo}, {hi}]"
+                      + ("  *** ZERO RANGE ***" if (lo is not None and hi is not None
+                                                     and abs(hi - lo) < 1e-6) else ""))
+                if entry["drive"] is None:
+                    print("      *** NO DriveAPI ***")
+                else:
+                    d = entry["drive"]
+                    print(f"      drive type={d['type']} stiffness={d['stiffness']} "
+                          f"damping={d['damping']} maxForce={d['maxForce']} "
+                          f"target={d['target']}")
+                if entry.get("enabled") is False:
+                    print("      *** physics:jointEnabled = False ***")
+                if entry.get("excluded"):
+                    print("      *** excludeFromArticulation = True ***")
+                if entry.get("max_velocity") == 0:
+                    print("      *** maxJointVelocity = 0 ***")
+                for b in bodies:
+                    if not b["rigid_body"]:
+                        print(f"      *** {b['rel']} {b['path']} is NOT a RigidBody ***")
+
+            self._send_json({"joints": report})
+        except Exception as e:
+            traceback.print_exc()
+            self._send_json({"error": str(e)})
+
+    def _handle_status(self):
+        try:
+            joints = STATE.robot.get_joint_positions() if (STATE.robot is not None) else None
             self._send_json({
-                "status": "ready" if not STATE.is_executing else "executing",
+                "status": "ready" if (STATE.is_ready and not STATE.is_executing) else ("executing" if STATE.is_executing else "initializing"),
+                "is_ready": STATE.is_ready,
                 "num_dof": STATE.num_dof,
-                "joint_names": list(STATE.dof_names),
+                "joint_names": list(STATE.dof_names) if STATE.dof_names else [],
                 "joint_positions": joints.tolist() if joints is not None else [],
                 "is_executing": STATE.is_executing,
                 "ik_ready": STATE.ik_ready,
@@ -1769,7 +2145,13 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 "last_error": STATE.last_error,
             })
         except Exception as e:
-            self._send_json({"status": "error", "error": str(e)})
+            self._send_json({
+                "status": "error",
+                "error": str(e),
+                "is_ready": STATE.is_ready,
+                "ik_ready": STATE.ik_ready,
+                "cumotion_error": STATE.cumotion_error,
+            })
 
     def _handle_camera(self, cam_type="rgb"):
         if not STATE.is_ready:
@@ -1919,21 +2301,10 @@ CAMERA_ALIASES = {
     "kit":   (CAMERA_KIT_PRIM,   (720, 1280)),
 }
 CAMERA_ANNOTATORS = ["rgb", "distance_to_image_plane"]
-# The D555 depth prim is a depth-only sensor: attaching an rgb annotator
-# to it yields malformed buffers rather than a black image.
-CAMERA_ANNOTATORS_BY_ALIAS = {"depth": ["distance_to_image_plane"]}
 
 # A newly created render product needs many app updates before its
 # annotators return anything; poll rather than guess a tick count.
 _WARMUP_MAX_TICKS = 400
-
-
-def _has_annotator(sensor, name):
-    """True if this sensor was configured with the named annotator."""
-    try:
-        return name in getattr(sensor, "_annotators", {})
-    except Exception:
-        return False
 
 
 def _read_annotator(sensor, name):
@@ -1942,13 +2313,22 @@ def _read_annotator(sensor, name):
     ``get_data`` returns warp arrays on the GPU; ``.numpy()`` pulls them
     to host. Depth arrives as (h, w, 1) and is squeezed to (h, w).
     """
-    data, _ = sensor.get_data(name)
-    if data is None:
+    try:
+        ret = sensor.get_data(name)
+        if ret is None:
+            return None
+        if isinstance(ret, (tuple, list)):
+            data = ret[0] if len(ret) > 0 else None
+        else:
+            data = ret
+        if data is None:
+            return None
+        arr = data.numpy() if hasattr(data, "numpy") else np.asarray(data)
+        if arr.ndim == 3 and arr.shape[2] == 1:
+            arr = arr[:, :, 0]
+        return arr
+    except Exception as e:
         return None
-    arr = data.numpy()
-    if arr.ndim == 3 and arr.shape[2] == 1:
-        arr = arr[:, :, 0]
-    return arr
 
 
 async def _get_camera(alias):
@@ -1966,9 +2346,8 @@ async def _get_camera(alias):
 
     sensor = STATE.cameras.get(alias)
     if sensor is None:
-        annots = CAMERA_ANNOTATORS_BY_ALIAS.get(alias, CAMERA_ANNOTATORS)
         sensor = CameraSensor(prim_path, resolution=resolution,
-                              annotators=annots)
+                              annotators=CAMERA_ANNOTATORS)
         STATE.cameras[alias] = sensor
 
         app = omni.kit.app.get_app()
@@ -2001,7 +2380,7 @@ async def _render_frame(sensor, alias):
         for _ in range(ticks):
             await app.next_update_async()
 
-        rgb = _read_annotator(sensor, "rgb") if _has_annotator(sensor, "rgb") else None
+        rgb = _read_annotator(sensor, "rgb")
         if rgb is not None and rgb.ndim == 3 and rgb.size > 0:
             mean = float(np.mean(rgb[:, :, :3]))
             if mean > 3:
@@ -2057,10 +2436,7 @@ async def _capture_camera(cam_type="rgb"):
         }
 
     except Exception as e:
-        import traceback
-        print(f"  [{cam_type}] capture failed: {type(e).__name__}: {e}")
-        traceback.print_exc()
-        return {"error": f"{cam_type} camera failed: {type(e).__name__}: {e}"}
+        return {"error": f"{cam_type} camera failed: {e}"}
 
 
 # ═════════════════════════════════════════════════════════════
@@ -2608,30 +2984,18 @@ async def _move_home():
     # Open gripper for home
     home_all = set_finger_joints(STATE.robot, STATE.dof_names, FINGER_OPEN, home_all)
 
-    # If IK is ready, first retract to a safe height to avoid collisions
+    # If IK is ready and the arm is down in the workspace (< 1.6m), first retract to safe transit height
     if STATE.ik_ready:
-        # Retract from the TCP, not ee_link. Passing an ee_link height as
-        # a TCP target made _tool_pose_from_tcp add the gripper length a
-        # second time, putting the goal ~0.38 m too high — unreachable on
-        # a ceiling-mounted arm that is already parked near the top.
-        tcp_pos = get_tcp_pos()
-        safe_z = tcp_pos[2] + TRANSIT_SAFE_HEIGHT
-        # Only worth retracting if the tool is actually low. The point of
-        # this step is to lift clear of the bin before travelling; when
-        # the arm is already parked high, adding more height just asks for
-        # a pose above the ceiling mount that cannot be reached.
-        base_z = get_world_pos(ROBOT_ROOT_PATH)[2]
-        if tcp_pos[2] >= base_z:
-            print(f"  [home] TCP z={tcp_pos[2]:.3f} already at/above the "
-                  f"mount z={base_z:.3f} — skipping the retract")
-            ok = False
-        else:
+        ee_pos = get_world_pos(EE_PATH)
+        if ee_pos[2] < 1.6:
+            safe_z = min(ee_pos[2] + TRANSIT_SAFE_HEIGHT, 1.8)
             locked_ori = normalize_quat(DOWNWARD_ORIENTATION)
-            action, ok = ik_solve(np.array([tcp_pos[0], tcp_pos[1], safe_z]),
-                                  locked_ori)
-        if ok:
-            targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, action)
-            await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES)
+            warm = _get_warm_start()
+            action, ok = ik_solve(np.array([ee_pos[0], ee_pos[1], safe_z]),
+                                  locked_ori, warm)
+            if ok:
+                targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, action)
+                await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES)
 
     # Interpolate to home position to prevent self-collision
     await _apply_interpolated(home_all, settle_frames=SETTLE_FRAMES)
@@ -2803,8 +3167,12 @@ async def _apply_interpolated(target_joints, settle_frames=SETTLE_FRAMES, finger
 
     In both cases, only the FINAL position gets a full settle.
     """
-    import omni.kit.app
+    import omni.kit.app, omni.timeline
     from isaacsim.core.utils.types import ArticulationAction
+
+    timeline = omni.timeline.get_timeline_interface()
+    if not timeline.is_playing():
+        timeline.play()
 
     # If a cuMotion plan is waiting, follow it — the planned path routes
     # around obstacles, whereas the joint interpolation below would cut
@@ -2816,6 +3184,22 @@ async def _apply_interpolated(target_joints, settle_frames=SETTLE_FRAMES, finger
         if await _execute_trajectory(traj, finger_value=finger_value,
                                     settle_frames=settle_frames):
             return
+        # A cuMotion trajectory existed and was streamed, but the
+        # articulation did not actually move (see the "*** ROBOT DID NOT
+        # MOVE ***" print in _execute_trajectory). This is almost always
+        # the robot's own sensed point cloud making the start state look
+        # like it is already in collision (DIAGNOSE_stuck_but_success.md
+        # Cause #1). Do NOT fall through to the blind, non-collision-aware
+        # joint interpolation below — that would drive the robot straight
+        # through whatever the planner was trying to avoid, exactly the
+        # HC-2 violation the sensor-only planning design forbids. Surface
+        # the failure instead so the caller can rebuild the collision
+        # world, re-plan, or abort.
+        raise RuntimeError(
+            "cuMotion trajectory execution produced no motion — refusing "
+            "to fall back to a collision-unaware interpolated move. Check "
+            "whether the robot's own point cloud is blocking its start "
+            "state (self-filter coverage) before retrying.")
 
     current_joints = STATE.robot.get_joint_positions()
 
@@ -2851,32 +3235,10 @@ async def _ik_move_to(target_xyz, orientation=None, settle_frames=SETTLE_FRAMES)
         return {"error": f"IK failed for target {target_xyz}"}
 
     target_joints = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, action)
-    tcp_before = get_tcp_pos()
     await _apply_interpolated(target_joints, settle_frames=settle_frames)
 
-    # Verify the move actually happened. A plan can succeed and the
-    # trajectory can stream while the joints never follow — reporting
-    # "ok" then sends the rest of the pipeline (wrist VLM, descend) to
-    # look for a part the gripper is nowhere near.
-    tcp_after = get_tcp_pos()
-    moved = float(np.linalg.norm(tcp_after - tcp_before))
-    err = float(np.linalg.norm(tcp_after - target_pos))
-    print(f"  [move] TCP {np.round(tcp_before, 3).tolist()} -> "
-          f"{np.round(tcp_after, 3).tolist()}")
-    print(f"  [move] travelled {moved:.4f} m; {err:.4f} m from the "
-          f"requested target")
-    if moved < 1e-3:
-        print("  [move] *** TCP DID NOT MOVE — the plan was executed but the "
-              "joints did not follow ***")
-    elif err > 0.05:
-        print(f"  [move] *** TCP ended {err:.3f} m from target — the arm "
-              f"moved, but not to where it was asked ***")
-
     ee_pos = get_world_pos(EE_PATH)
-    return {"status": "ok", "target": list(target_xyz),
-            "ee_position": ee_pos.tolist(),
-            "tcp_position": tcp_after.tolist(),
-            "tcp_travelled": moved, "tcp_error": err}
+    return {"status": "ok", "target": list(target_xyz), "ee_position": ee_pos.tolist()}
 
 
 async def _cartesian_pose_move(target_pos, target_ori, step_size=0.04,
@@ -3344,9 +3706,15 @@ async def _move_gantry_x(target_x, finger_hold=None, hold_ee_pos=None):
     if gantry_idx is None:
         return {"error": "Gantry joint not found"}
 
-    gantry_target = target_x - GANTRY_X_OFFSET
+    gantry_target = float(np.clip(target_x - GANTRY_X_OFFSET, GANTRY_MIN_X, GANTRY_MAX_X))
     gantry_current = float(targets[gantry_idx])
     gantry_delta = gantry_target - gantry_current
+
+    # Ensure timeline is playing so physics steps
+    import omni.timeline
+    timeline = omni.timeline.get_timeline_interface()
+    if not timeline.is_playing():
+        timeline.play()
 
     # ── EE-hold mode: interpolate gantry + compensate arm each step ──
     # Pre-computes arm compensation BEFORE moving the gantry so both are
@@ -3429,10 +3797,7 @@ async def _approach_target(params):
     cartesian = bool(params.get("cartesian", False))
     orientation = params.get("orientation")  # optional [w, x, y, z]
 
-    if raw_z:
-        target_z = z
-    else:
-        target_z = z + BOX_ENTRY_MARGIN + BOX_HEIGHT + GRIPPER_TCP_OFFSET + 0.10
+    target_z = z
 
     # Move gantry to EXACT target X first, then update base pose
     await _move_gantry_x(x)
@@ -3565,155 +3930,31 @@ async def _pick_descend(params):
     steps = []
     try:
         locked_ori = normalize_quat(DOWNWARD_ORIENTATION)
-        # Optional per-part grasp-depth override from the workflow.
-        # Workflow looks this up in the parts catalogue (negative values
-        # descend below part top to grip mid-body of tall parts).
-        grasp_lift_override = params.get("grasp_lift_override")
-        zp = _pick_z_positions(z, grasp_lift_override=grasp_lift_override)
-        safe_z = zp["safe_z"]
+        grasp_target_z = z + GRIPPER_TCP_OFFSET
 
-        safe_pos = np.array([x, y, safe_z])
-        entry_pos = np.array([x, y, zp["entry_z"]])
-        hover_pos = np.array([x, y, zp["hover_z"]])
-        grasp_pos = np.array([x, y, zp["grasp_target_z"]])
-
-        print(f"  [DESCEND] target=({x:.3f}, {y:.3f}, {z:.3f}) "
-              f"grasp_lift={zp['grasp_lift']:+.3f} "
-              f"safe_z={safe_z:.3f} hover_z={zp['hover_z']:.3f} "
-              f"grasp_z={zp['grasp_target_z']:.3f}")
+        print(f"  [DESCEND] target=({x:.3f}, {y:.3f}, {z:.3f}) grasp_z={grasp_target_z:.3f}")
 
         # 1. Open gripper
         await _set_gripper(FINGER_OPEN)
         steps.append({"phase": "open_gripper", "status": "ok"})
 
-        # 2. Gantry alignment — slide gantry to part X while keeping
-        #    EE locked at its current world position (depth-scan pose).
-        #    Like a human pointing a finger at something while walking:
-        #    the arm compensates continuously so the fingertip stays put.
-        ee_before = get_world_pos(EE_PATH).copy()
-        await _move_gantry_x(x, hold_ee_pos=ee_before)
+        # 2. Gantry alignment — ensure gantry is at target X
+        await _move_gantry_x(x)
+        _update_base_pose()
         steps.append({"phase": "gantry", "status": "ok"})
 
-        # 2b. XY correction — after gantry slide the EE may have drifted
-        #     slightly in X.  Before descending, re-solve IK to put the
-        #     EE exactly above the part [x, y] at the current height.
-        #     This is the critical "snap to target" before the grasp descent.
-        current_ee = get_world_pos(EE_PATH)
-        xy_error = np.linalg.norm(current_ee[:2] - np.array([x, y]))
-        if xy_error > 0.002:  # >2mm drift → correct
-            correct_pos = np.array([x, y, float(current_ee[2])])
-            print(f"  [DESCEND] XY correction: drift={xy_error:.4f}m, "
-                  f"snapping EE to ({x:.3f}, {y:.3f}, {current_ee[2]:.3f})")
-            correct_warm = _get_warm_start()
-            correct_action, correct_ok = ik_solve(correct_pos, locked_ori, correct_warm)
-            if correct_ok:
-                targets = apply_arm_joints(
-                    STATE.robot, STATE.dof_names, STATE.arm_names, correct_action)
-                await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES)
-                corrected_ee = get_world_pos(EE_PATH)
-                print(f"  [DESCEND] XY corrected → ({corrected_ee[0]:.3f}, "
-                      f"{corrected_ee[1]:.3f}, {corrected_ee[2]:.3f})")
-            else:
-                print("  [DESCEND] WARNING: XY correction IK failed")
-            steps.append({"phase": "xy_correction", "status": "ok" if correct_ok else "warn"})
+        # 3. Direct smooth descent to grasp target with contact stop
+        contact_min_force = float(params.get("descent_contact_min_force", 0.5))
+        contact_lift_back = float(params.get("descent_contact_lift_back", 0.002))
+        descent_step = float(params.get("descent_step_size", 0.01))
 
-        # 3. Safe height (vertical-first to avoid bin wall sweeps)
-        current_ee = get_world_pos(EE_PATH)
         warm = _get_warm_start()
-        if current_ee[2] < safe_z - 0.05:
-            v_ok = await _retract_cartesian_up(
-                safe_z, current_ee[0], current_ee[1], locked_ori, step_size=0.04)
-            if not v_ok:
-                return {"error": "Cartesian retract failed", "steps": steps}
-            steps.append({"phase": "safe_retract", "status": "ok"})
-            warm = _get_warm_start()
-
-        p1_action, p1_ok = ik_solve(safe_pos, locked_ori, warm)
-        if not p1_ok:
-            return {"error": f"IK safe failed {safe_pos.tolist()}", "steps": steps}
-        targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, p1_action)
-        await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES)
-        steps.append({"phase": "safe_height", "status": "ok"})
-
-        # 4. Re-solve seed
-        settled_warm = _get_warm_start()
-        p2_action, p2_ok = ik_solve(safe_pos, locked_ori, settled_warm)
-        if not p2_ok:
-            p2_action = p1_action
-
-        # 5. Entry — just inside box rim
-        entry_action, entry_ok = ik_solve(entry_pos, locked_ori, p2_action)
-        if entry_ok:
-            targets = apply_arm_joints(
-                STATE.robot, STATE.dof_names, STATE.arm_names, entry_action)
-            await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES)
-            steps.append({"phase": "entry", "status": "ok"})
-            p2_action = entry_action
-
-        # 6. Hover — above part
-        hover_action, hover_ok = ik_solve(hover_pos, locked_ori, p2_action)
-        if not hover_ok:
-            return {"error": f"IK hover failed {hover_pos.tolist()}", "steps": steps}
-        targets = apply_arm_joints(
-            STATE.robot, STATE.dof_names, STATE.arm_names, hover_action)
-        await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES)
-        steps.append({"phase": "hover", "status": "ok"})
-
-        # 6b. Verify EE is directly above the part at hover height.
-        #     Each IK solve at a different Z can drift X,Y slightly.
-        #     This is the last correction before grasp — the grasp step
-        #     is just a tiny Z drop, so nailing X,Y here guarantees a
-        #     precise grasp.
-        hover_ee = get_world_pos(EE_PATH)
-        hover_xy_err = np.linalg.norm(hover_ee[:2] - np.array([x, y]))
-        print(f"  [DESCEND] Hover EE=({hover_ee[0]:.3f}, {hover_ee[1]:.3f}, "
-              f"{hover_ee[2]:.3f})  XY error={hover_xy_err:.4f}m")
-        if hover_xy_err > 0.002:  # >2mm → re-solve at hover height
-            repose_target = np.array([x, y, float(hover_ee[2])])
-            print(f"  [DESCEND] Re-posing EE to ({x:.3f}, {y:.3f}, {hover_ee[2]:.3f})")
-            repose_warm = _get_warm_start()
-            repose_action, repose_ok = ik_solve(repose_target, locked_ori, repose_warm)
-            if repose_ok:
-                targets = apply_arm_joints(
-                    STATE.robot, STATE.dof_names, STATE.arm_names, repose_action)
-                await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES)
-                reposed_ee = get_world_pos(EE_PATH)
-                print(f"  [DESCEND] Re-posed → ({reposed_ee[0]:.3f}, "
-                      f"{reposed_ee[1]:.3f}, {reposed_ee[2]:.3f})")
-                hover_action = repose_action  # use corrected as warm start for grasp
-            else:
-                print("  [DESCEND] WARNING: hover re-pose IK failed")
-            steps.append({"phase": "hover_repose",
-                           "status": "ok" if repose_ok else "warn"})
-
-        # 7. Grasp descent — Cartesian micro-step with contact-sensor
-        #    stop. The PLANNED grasp_z (from _pick_z_positions) assumes
-        #    the part top Z is exactly correct; if depth projection is
-        #    off by 1-2 cm the gripper would overshoot into the bin
-        #    floor or jam against the part. Instead we step down a few
-        #    millimetres at a time and abort the moment a finger
-        #    touches anything (part / floor / divider). Same contact
-        #    sensor + threshold as the gripper-close phase, so the
-        #    behaviour is consistent across the pipeline.
-        contact_min_force = float(
-            params.get("descent_contact_min_force", 0.5))
-        contact_lift_back = float(
-            params.get("descent_contact_lift_back", 0.002))
-        # 5 mm step instead of 10 mm — each per-step IK call introduces
-        # a tiny XY drift (~0.5 mm) because the solver picks a slightly
-        # different joint configuration at each Z slice. With 1 cm
-        # steps over a 22 cm descent that compounds to ~12 mm of XY
-        # drift visible at the gripper. Halving the step roughly
-        # halves the drift; the cost is twice as many IK solves
-        # (still <2 s extra wall-clock per pick).
-        descent_step = float(
-            params.get("descent_step_size", 0.005))
         descent_result = await _descend_with_contact_stop(
-            target_z=zp["grasp_target_z"],
+            target_z=grasp_target_z,
             x=x, y=y,
             locked_ori=locked_ori,
-            warm_start=hover_action,
-            finger_value=FINGER_OPEN,  # keep fingers open during approach
+            warm_start=warm,
+            finger_value=FINGER_OPEN,
             step_size=descent_step,
             contact_min_force=contact_min_force,
             contact_lift_back=contact_lift_back)
@@ -3730,7 +3971,7 @@ async def _pick_descend(params):
         if descent_result.get("contact"):
             print(f"  [PICK] Descent stopped on contact at z="
                   f"{descent_result.get('stopped_z'):.3f} "
-                  f"(planned grasp_z={zp['grasp_target_z']:.3f}); "
+                  f"(planned grasp_z={grasp_target_z:.3f}); "
                   f"force={descent_result.get('force'):.2f}N")
 
         # 7b. End-of-descent telemetry — show the actual EE world
@@ -4526,13 +4767,11 @@ def _shutdown_bridge(reason="simulation stopped"):
 def _on_timeline_event(event):
     """Callback fired by Isaac Sim when the timeline state changes.
 
-    Shuts down the bridge when the simulation is stopped or paused.
+    Shuts down the bridge when the simulation is explicitly stopped.
     """
     import omni.timeline
     if event.type == int(omni.timeline.TimelineEventType.STOP):
         _shutdown_bridge("simulation stopped")
-    elif event.type == int(omni.timeline.TimelineEventType.PAUSE):
-        _shutdown_bridge("simulation paused")
 
 
 async def start_bridge():
@@ -4571,25 +4810,8 @@ async def start_bridge():
     STATE.num_dof = robot.num_dof
     STATE.dof_names = robot.dof_names
     STATE.is_ready = True
-    """
-    # Moderately boost finger joint stiffness so the PD controller holds
-    # parts during arm motion without generating destructive contact forces.
-    # 2000 N·m/rad is ~5-20x the URDF default — firm grip, not explosive.
-    try:
-        controller = robot.get_articulation_controller()
-        kps, kds = controller.get_gains()
-        for idx, name in enumerate(STATE.dof_names):
-            if "finger_joint" in name or "knuckle_joint" in name or "inner_finger_joint" in name:
-                kps[idx] = 2000.0   # firm, not destructive
-                kds[idx] = 200.0
-        controller.set_gains(kps, kds)
-        print("[OK] Finger joint stiffness set (Kp=2000, Kd=200)")
-    except Exception as e:
-        print(f"[WARN] Could not set finger gains: {e}")
-    """
+   
     # Hold current pose at startup — tell the PD controller "stay here"
-    # BEFORE physics advances, so the boosted Kp=2000 fingers don't snap
-    # closed and the arm doesn't jerk to default zero targets.
     from isaacsim.core.utils.types import ArticulationAction
     startup_joints = robot.get_joint_positions()
     startup_joints = set_finger_joints(robot, STATE.dof_names, FINGER_OPEN, startup_joints.copy())
@@ -4607,7 +4829,7 @@ async def start_bridge():
     # ── cuMotion motion planning ─────────────────────────────
     # The XRDF cspace includes gantry_vagn_joint, so the gantry is a
     # planned joint rather than a base shift — no set_robot_base_pose
-    # bookkeeping, and the planner can trade gantry travel against arm
+    # book-keeping, and the planner can trade gantry travel against arm
     # reach to route around obstacles.
     try:
         if _init_cumotion():
@@ -4672,7 +4894,7 @@ async def start_bridge():
                   f"feedback: {e}")
 
     # ── HTTP Server ──────────────────────────────────────────
-    _bridge_server = HTTPServer((BRIDGE_HOST, BRIDGE_PORT), BridgeHandler)
+    _bridge_server = ReusableHTTPServer((BRIDGE_HOST, BRIDGE_PORT), BridgeHandler)
     _bridge_server.timeout = 1  # so shutdown() isn't blocked forever
 
     def serve():
@@ -4730,6 +4952,14 @@ async def _process_commands_loop():
                 result = await _verify_planner(cmd.get("params", {}))
             elif action == "build_collision_world":
                 result = await _build_collision_world(cmd.get("params", {}))
+            elif action == "build_static_world":
+                result = await _build_static_world(cmd.get("params", {}))
+            elif action == "probe_obstacle_update":
+                result = await _probe_obstacle_update(cmd.get("params", {}))
+            elif action == "probe_shared_segmentation":
+                result = await _probe_shared_segmentation(cmd.get("params", {}))
+            elif action == "probe_pointcloud_semantic_fields":
+                result = await _probe_pointcloud_semantic_fields(cmd.get("params", {}))
             elif action == "wrist_obstacles":
                 result = await _add_wrist_obstacles(cmd.get("params", {}))
             elif action == "approach":
@@ -4748,6 +4978,8 @@ async def _process_commands_loop():
                 result = await _place_object_ik(cmd.get("params", {}))
             elif action == "project_to_world":
                 result = await _project_to_world(cmd.get("params", {}))
+            elif action == "measure_surface_z":
+                result = await _measure_surface_z(cmd.get("params", {}))
             else:
                 result = {"error": f"Unknown action: {action}"}
         except Exception as e:

@@ -1,0 +1,37 @@
+services:
+  isaac-sim:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: isaac-sim
+    container_name: isaac-sim
+    entrypoint: bash
+    stdin_open: true
+    tty: true
+    environment:
+      - ACCEPT_EULA=Y
+      - OMNI_KIT_ALLOW_ROOT=1
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [ gpu ]
+    ports:
+      - "49100:49100/tcp"
+      - "47998:47998/udp"
+      - "8210:8210/tcp"
+      - "5555:5555/tcp"
+    volumes:
+      - ./:/workspace:rw
+      - ${USERPROFILE}/docker/isaac-sim/cache/kit:/isaac-sim/kit/cache:rw
+      - ${USERPROFILE}/docker/isaac-sim/cache/ov:/root/.cache/ov:rw
+      - ${USERPROFILE}/docker/isaac-sim/cache/pip:/root/.cache/pip:rw
+      - ${USERPROFILE}/docker/isaac-sim/cache/glcache:/root/.cache/nvidia/GLCache:rw
+      - ${USERPROFILE}/docker/isaac-sim/cache/computecache:/root/.nv/ComputeCache:rw
+      - ${USERPROFILE}/docker/isaac-sim/logs:/root/.nvidia-omniverse/logs:rw
+      - ${USERPROFILE}/docker/isaac-sim/data:/root/.local/share/ov/data:rw
+      - ${USERPROFILE}/docker/isaac-sim/documents:/root/Documents:rw

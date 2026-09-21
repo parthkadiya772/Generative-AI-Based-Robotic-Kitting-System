@@ -36,11 +36,12 @@ For each object, provide:
    KNOWN PART TYPES catalogue above. Do NOT invent descriptive labels.
    If a part is clearly visible but does not match any catalogue entry,
    use ``"unknown"``.
-3. A brief ``semantic_description`` (material, colour, approximate size)
-4. An ``affordance``: "graspable", "stackable", "fragile", or "fixed"
-5. ``approximate_position`` as normalised coordinates (x, y, z) relative
+3. A ``bbox_2d`` (or ``bbox_norm``) — the precise 2D bounding box of the object in normalised [x_min, y_min, x_max, y_max] coordinates (0.0 to 1.0) or [ymin, xmin, ymax, xmax].
+4. A brief ``semantic_description`` (material, colour, approximate size)
+5. An ``affordance``: "graspable", "stackable", "fragile", or "fixed"
+6. ``approximate_position`` as normalised coordinates (x, y, z) relative
    to the workspace centre
-6. A ``confidence`` score (0.0 to 1.0)
+7. A ``confidence`` score (0.0 to 1.0)
 
 Do NOT guess parts you cannot clearly see. Only report what is visible.
 
@@ -55,9 +56,10 @@ Required JSON structure:
     {
       "object_id": "obj_001",
       "label": "motor_valve",
+      "bbox_norm": [0.35, 0.42, 0.48, 0.55],
       "semantic_description": "...",
       "affordance": "graspable",
-      "approximate_position": {"x": 0.0, "y": 0.0, "z": 0.0},
+      "approximate_position": {"x": 0.415, "y": 0.485, "z": 0.0},
       "confidence": 0.95
     }
   ],
@@ -298,23 +300,41 @@ class VLMPerception:
             }
 
         for obj in parsed.get("detected_objects", []):
+            raw_bbox = (
+                obj.get("bbox_norm")
+                or obj.get("bbox_2d")
+                or obj.get("box_2d")
+                or obj.get("bbox")
+            )
+            if isinstance(raw_bbox, (list, tuple)) and len(raw_bbox) == 4:
+                try:
+                    c1, c2, c3, c4 = [float(v) for v in raw_bbox]
+                    # Check if coordinates are in [0, 1000] scale (Qwen format)
+                    if max(c1, c2, c3, c4) > 1.0:
+                        c1, c2, c3, c4 = c1 / 1000.0, c2 / 1000.0, c3 / 1000.0, c4 / 1000.0
+                    
+                    # If field was bbox_2d/box_2d (often [ymin, xmin, ymax, xmax])
+                    if "bbox_2d" in obj or "box_2d" in obj:
+                        ymin, xmin, ymax, xmax = c1, c2, c3, c4
+                        x1, y1, x2, y2 = min(xmin, xmax), min(ymin, ymax), max(xmin, xmax), max(ymin, ymax)
+                    else:
+                        x1, y1, x2, y2 = min(c1, c3), min(c2, c4), max(c1, c3), max(c2, c4)
+                    
+                    # Store canonical normalized bbox [x_min, y_min, x_max, y_max]
+                    obj["bbox_norm"] = [x1, y1, x2, y2]
+                    obj["image_position"] = {
+                        "x": (x1 + x2) / 2.0,
+                        "y": (y1 + y2) / 2.0,
+                    }
+                except (TypeError, ValueError):
+                    pass
+
             if "image_position" not in obj:
-                bbox = obj.get("bbox_norm") or obj.get("bbox")
-                if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
-                    try:
-                        x1, y1, x2, y2 = [float(v) for v in bbox]
-                        obj["image_position"] = {
-                            "x": (x1 + x2) / 2.0,
-                            "y": (y1 + y2) / 2.0,
-                        }
-                    except (TypeError, ValueError):
-                        pass
-                if "image_position" not in obj:
-                    poly_center = _center_from_polygon(
-                        obj.get("mask_polygon") or obj.get("segmentation_polygon")
-                    )
-                    if poly_center:
-                        obj["image_position"] = poly_center
+                poly_center = _center_from_polygon(
+                    obj.get("mask_polygon") or obj.get("segmentation_polygon")
+                )
+                if poly_center:
+                    obj["image_position"] = poly_center
 
             if "approximate_position" not in obj and "image_position" in obj:
                 img = obj["image_position"]
