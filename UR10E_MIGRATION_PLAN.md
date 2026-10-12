@@ -44,7 +44,7 @@ Every step ends with a **live check** in Isaac Sim, run through the MCP tools an
 - **Repoint `.env`:** `ROBOT_CONFIG_PATH` → `robot_config/ur10e`.
 - **Check:** unit tests for the loader. Every prim path in `ur10e/robot.yaml` must resolve on the live stage (one MCP script).
 
-## Step 2: Bridge reads `robot.yaml`, plus fix B1
+## Step 2: Bridge reads `robot.yaml`, plus fix B1 ✅ done (commit 060a70f)
 - Import the loader as `generative_kitting.utils.robot_config`, with the repo root on `sys.path`. Inside Isaac, a bare `utils` resolves to OpenCV's `cv2/utils`.
 - Replace the hard-coded constants in `isaac_sim_bridge.py` (L135–186 and L1447–1473) with loader values. The module-level names stay, so the ~20 call sites don't change in this step.
 - Remove the robot keys from `config.yaml` that are now unused, or make them point at `robot.yaml`.
@@ -82,6 +82,7 @@ Every step ends with a **live check** in Isaac Sim, run through the MCP tools an
 
 ## Step 6: Gripper re-tune
 - **`set_finger_joints`:** rewrite it for the new drive layout. The outer finger joints are now driven (k=2000); the inner fingers are springs.
+- The inner finger joints are weak springs (k=0.002), so `zero` mode barely holds them; measured about −0.34 rad when closed.
 - Re-tune adaptive close, the grasp-confirm threshold, the overshoot and the settle frames. All of these move into the YAML.
 - Make grasp verification read the driver joint by name, not a hard-coded index.
 - **Check:** grasp at least 3 part sizes (small tube, motor valve, large gear). Record contact force and finger angle each time.
