@@ -68,7 +68,7 @@ Every step ends with a **live check** in Isaac Sim, run through the MCP tools an
   - Also fixed: `_plan_cspace` passed `q_target=`, but the API takes `q_final=`.
 - **Follow-ups:**
   - About 29 robot surface points (forearm, wrist_3) survive the self-filter. Fix by raising `sphere_margin` (0.02) or adding forearm spheres.
-  - Planning is slow: 20–30 s per target, 5 min to bin height, with 786 robot spheres × 6000 obstacles. Idea: point XRDF `world_collision` at a group without the gantry/vagn spheres (static; only needed for self-collision).
+  - ✅ Planning speed: the XRDF `world_collision` group now leaves out gantry and vagn (`rebase_xrdf_spheres(..., world_collision_exclude=("gantry", "vagn"))`). A full `plan_test` takes 30 s instead of about 7 min (per target 0.9–1.2 s, bin height 11 s, was 20–26 s / 5 min). Self-collision still uses all 786 spheres.
   - `plan_test` default targets are unreachable from the straight-arm spawn pose; start it from a tool-down pose.
 - **Robot colliders:** inspect and fix the USD physics colliders on every robot link (gantry, vagn, UR10e links, 2F-140) using Isaac Sim's robot setup tools: `isaacsim.robot_setup.collision_detector` and the physics collider debug view. Every link should have a proper collider, and there should be no self-collisions at home pose.
 - **URDF:** export it with the **URDF Exporter** extension (`isaacsim.asset.exporter.urdf` / `.ui`) from `/World/gantry`, giving the chain gantry → vagn → ur10e → robotiq. Review the exporter output; any cleanup is done by changing the exporter settings or the stage, not by hand-editing the file.

@@ -6,11 +6,18 @@ frame. The URDF Exporter puts a child link's frame at its joint
 (localPos1/localRot1, plus an axis-flip correction), so when the two differ
 (the 2F-140 finger links), cuMotion would place the spheres in the wrong spot.
 
+Optionally also writes a world-collision sphere group without static links
+(the gantry frame and vagn only need self-collision checks against the arm;
+checking their 650 spheres against the camera world made planning ~20x slower).
+
 Run inside Isaac Sim with the robot stage open:
 
     exec(open(".../robot_config/rebase_xrdf_spheres.py").read())
-    rebase_xrdf_spheres(".../ur10e/AIKIDO.editor.xrdf", ".../ur10e/AIKIDO.xrdf")
+    rebase_xrdf_spheres(".../ur10e/AIKIDO.editor.xrdf", ".../ur10e/AIKIDO.xrdf",
+                        world_collision_exclude=("gantry", "vagn"))
 """
+
+import copy
 
 import numpy as np
 import omni.usd
@@ -55,7 +62,11 @@ def link_frame_offsets(root_prim_path="/World/gantry"):
     return offsets
 
 
-def rebase_xrdf_spheres(editor_xrdf, out_xrdf, root_prim_path="/World/gantry", tol=1e-6):
+WORLD_COLLISION_GROUP = "world_collision_sphere_group"
+
+
+def rebase_xrdf_spheres(editor_xrdf, out_xrdf, root_prim_path="/World/gantry",
+                        world_collision_exclude=(), tol=1e-6):
     """Write *out_xrdf* with every sphere centre moved into its URDF link frame. Returns moved link names."""
     with open(editor_xrdf) as f:
         data = yaml.safe_load(f)
@@ -70,6 +81,15 @@ def rebase_xrdf_spheres(editor_xrdf, out_xrdf, root_prim_path="/World/gantry", t
                 c = np.append(np.asarray(s["center"], dtype=float), 1.0) @ T
                 s["center"] = [round(float(v), 6) for v in c[:3]]
             moved.append(link)
+    if world_collision_exclude:
+        self_group = data["self_collision"]["geometry"]
+        spheres = data["geometry"][self_group]["spheres"]
+        missing = set(world_collision_exclude) - set(spheres)
+        if missing:
+            raise KeyError(f"world_collision_exclude: no spheres for {sorted(missing)}")
+        data["geometry"][WORLD_COLLISION_GROUP] = {
+            "spheres": copy.deepcopy({k: v for k, v in spheres.items() if k not in world_collision_exclude})}
+        data["world_collision"] = {"geometry": WORLD_COLLISION_GROUP}
     with open(out_xrdf, "w") as f:
         yaml.safe_dump(data, f, sort_keys=False)
     return moved

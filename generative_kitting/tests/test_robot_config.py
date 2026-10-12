@@ -96,6 +96,14 @@ class TestShippedConfigs:
             links = set(data["geometry"]["auto_generated_collision_sphere_group"]["spheres"])
             assert links <= set(cfg.link_prims), f"{path.name}: {links - set(cfg.link_prims)}"
 
+    def test_ur10e_world_collision_skips_static_links(self):
+        data = yaml.safe_load(load_robot_config(UR10E_DIR).xrdf_path.read_text())
+        world = data["geometry"][data["world_collision"]["geometry"]]["spheres"]
+        self_ = data["geometry"][data["self_collision"]["geometry"]]["spheres"]
+        assert "gantry" not in world and "vagn" not in world
+        assert {"gantry", "vagn"} <= set(self_)
+        assert set(world) == set(self_) - {"gantry", "vagn"}
+
     def test_project_root_expanded(self):
         cfg = load_robot_config(UR10E_DIR)
         assert "${" not in cfg.stage_path
