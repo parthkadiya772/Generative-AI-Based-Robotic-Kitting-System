@@ -95,7 +95,29 @@ Every step ends with a **live check** in Isaac Sim, run through the MCP tools an
   - `_plan_test` succeeds.
   - Self-filtering removes the robot from the point cloud.
 
-## Step 5: Frames and motion bugs (B2, B3, B4)
+## Step 5: Frames and motion bugs (B2, B3, B4) ✅ done
+- **Result:**
+  - One TCP convention: `get_tcp_pos()` is the tool frame plus `tcp.offset` along the tool's +Z. `_tool_pose_from_tcp` is its inverse for any orientation. All targets are TCP heights.
+  - B2: removed the extra `+ _tcp_offset()` in `_pick_z_positions`, `_pick_descend` and `_place_object_ik`.
+  - B3: all 19 motion feedback reads use the TCP. `ee_link` does not even move with the arm on this stage.
+  - B4: `_pick_descend` uses `_pick_z_positions`.
+  - Cartesian micro-steps use `ik_step`, damped least squares on cuMotion's Jacobian seeded from the current joints, instead of a planner call per step. It rejects joint jumps over 0.5 rad.
+  - `_pick_descend` makes a planned XY align instead of a gantry-only slide (that slide dragged the TCP 866 mm).
+  - Also fixed:
+    - `_update_base_pose` array shape.
+    - HTTP results are matched to their command id; a timed-out result used to be returned to the next request.
+  - Live, on `large_gear_1`:
+    - approach 1.1 mm off target, tool vertical
+    - descent stopped 0.4 mm from target z, 1.3 mm XY drift
+    - close + retract lifted the gear 0.33 m; transit TCP within 1 mm
+- **Open items:**
+  - The Step 3 tool-down joint pose `[g, 0, −π/2, π/2, −π/2, −π, 0]` is a wrist singularity: vertical TCP motion is lost. Never start Cartesian moves from it. `home_joints: null` captures the straight-arm spawn pose; set a non-singular tool-down home in `robot.yaml`.
+  - `_move_gantry_x(hold_ee_pos=...)` slides only the gantry; the arm does not compensate (used by `realign_gantry` and place).
+  - The single-goal moves in retract/place (`ik_solve` followed by `apply_action`) jump to the goal joints and drop the planned collision-free path. Execute the trajectory instead.
+  - The editor's 786 sphere prims are still on the stage (visual only, unsaved root layer) and are visible to the cameras. Clear them in the editor and do not save them into the USD.
+  - The pad contact sensor did not fire on the gear (Step 6). The open fingertips reach only 19 mm below the TCP, so with `grasp_lift = 0` the grip is a top-edge grip (Step 6 / workflow grasp depth).
+  - `/api/scene_parts` returns broken bboxes for the motor valves (~117 m).
+  - The 30 s HTTP timeout on `/api/approach` is short for planned moves.
 - **One TCP convention:** targets are always the TCP. A single function converts TCP to tool frame, and feedback reads the same frame. This fixes B2 (TCP offset added twice) and B3 (`ee_link` vs TCP mixing).
 - **B4:** `zp` is undefined in `_pick_descend`.
 - Re-check the pick/place height maths: approach, descent, transit and drop heights.

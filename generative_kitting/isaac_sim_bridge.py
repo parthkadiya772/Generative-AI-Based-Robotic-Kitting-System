@@ -226,6 +226,30 @@ def _tool_down():
         raise RuntimeError("robot.yaml orientation.tool_down is not set — measure it first")
     return normalize_quat(DOWNWARD_ORIENTATION)
 
+
+def _quat_to_matrix(q):
+    """3x3 rotation matrix from a [w, x, y, z] quaternion."""
+    w, x, y, z = normalize_quat(np.asarray(q, dtype=np.float64))
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+        [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+        [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)]])
+
+
+def get_tcp_pos():
+    """World TCP: tool frame origin + tcp.offset along the tool's +Z (approach) axis.
+
+    The one feedback point for motion. Every target handed to ik_solve /
+    ik_step and the Cartesian moves is a TCP position, so compare against
+    this — never against ee_link.
+    """
+    import omni.usd
+    from isaacsim.core.utils.prims import get_prim_at_path
+    m = omni.usd.get_world_transform_matrix(get_prim_at_path(TOOL_FRAME_PRIM))
+    approach = np.array(m.GetRow(2), dtype=np.float64)[:3]
+    approach /= np.linalg.norm(approach)
+    return np.array(m.ExtractTranslation()) + _tcp_offset() * approach
+
 INTERP_MAX_STEP  = 0.15   
 INTERP_THRESHOLD = 0.5  
 STREAM_FRAMES    = 3     
@@ -1649,16 +1673,15 @@ def _current_cspace():
 def _tool_pose_from_tcp(tcp_pos, orientation):
     """Convert a TCP target to the tool-frame pose cuMotion plans for.
 
-    The pipeline's targets are finger-contact (TCP) points, but the XRDF
-    tool frame is ``robotiq_base_link``, which sits GRIPPER_TCP_OFFSET
-    back along the tool axis. For the top-down grasps this pipeline uses,
-    the tool axis is world -Z, so the tool frame is that far ABOVE the
-    TCP. Planning to the raw TCP would drive the gripper body into the
-    part by the offset.
+    Targets are TCP points (finger-pad centre). The XRDF tool frame is
+    ``robotiq_base_link``, GRIPPER_TCP_OFFSET back along the tool's +Z
+    (approach) axis, so step back along that axis for the given
+    orientation (straight up for tool-down). The offset is applied here
+    only — callers pass TCP heights and must not add it themselves.
     """
-    pos = np.array(tcp_pos, dtype=np.float64).copy()
-    pos[2] += _tcp_offset()
-    return pos, np.array(orientation, dtype=np.float64)
+    quat = np.array(orientation, dtype=np.float64)
+    approach = _quat_to_matrix(quat)[:, 2]
+    return np.array(tcp_pos, dtype=np.float64) - _tcp_offset() * approach, quat
 
 
 def _plan_pose(tcp_pos, orientation):
@@ -1815,6 +1838,65 @@ def ik_solve(pos, ori, warm=None):
     return goal, True
 
 
+def _robot_base_matrix():
+    """World pose of the cuMotion base frame (ROBOT_ROOT_PATH), 4x4 column-vector."""
+    import omni.usd
+    stage = omni.usd.get_context().get_stage()
+    return np.array(omni.usd.get_world_transform_matrix(
+        stage.GetPrimAtPath(ROBOT_ROOT_PATH)), dtype=np.float64).T
+
+
+def ik_step(pos, ori, warm=None, max_joint_jump=0.5, iterations=60):
+    """Differential IK to a TCP pose for short Cartesian moves. Returns ``(action, ok)``.
+
+    Unlike ``ik_solve`` this does not plan. Damped least squares on
+    cuMotion's Jacobian, starting from ``warm`` (the previous step, else
+    the current joints), takes the smallest joint change that reaches the
+    target, so consecutive steps stay in the same arm configuration. Fails
+    if it does not converge or any joint moves more than
+    ``max_joint_jump`` rad. Not collision-checked: use it for the short
+    straight-line moves (descent, retract, lateral slide) whose start pose
+    was reached by a planned move.
+    """
+    if not STATE.cumotion_ready:
+        return None, False
+    kin = STATE.cumotion_robot.kinematics
+    n = kin.num_cspace_coords()
+    seed = None if warm is None else np.asarray(warm, dtype=np.float64)
+    if seed is None or seed.shape != (n,):
+        seed = _current_cspace()
+    lo = np.array([kin.cspace_coord_limits(i).lower for i in range(n)])
+    hi = np.array([kin.cspace_coord_limits(i).upper for i in range(n)])
+
+    tool_pos, quat = _tool_pose_from_tcp(pos, ori)
+    base_inv = np.linalg.inv(_robot_base_matrix())
+    p_goal = base_inv[:3, :3] @ tool_pos + base_inv[:3, 3]
+    r_goal = base_inv[:3, :3] @ _quat_to_matrix(quat)
+
+    q = seed.copy()
+    damping = 1e-3
+    for _ in range(iterations):
+        pose = np.array(kin.pose(q, CUMOTION_TOOL_FRAME).matrix())
+        dp = p_goal - pose[:3, 3]
+        dr = r_goal @ pose[:3, :3].T
+        dw = 0.5 * np.array([dr[2, 1] - dr[1, 2], dr[0, 2] - dr[2, 0], dr[1, 0] - dr[0, 1]])
+        if np.linalg.norm(dp) < 1e-4 and np.linalg.norm(dw) < 1e-3:
+            break
+        jac = np.array(kin.jacobian(q, CUMOTION_TOOL_FRAME))
+        err = np.concatenate([dp, dw])
+        dq = jac.T @ np.linalg.solve(jac @ jac.T + damping * np.eye(6), err)
+        q = np.clip(q + dq, lo, hi)
+    else:
+        print(f"  [ik_step] no convergence: pos err {np.linalg.norm(dp)*1000:.1f} mm, "
+              f"rot err {np.degrees(np.linalg.norm(dw)):.2f} deg")
+        return None, False
+    jump = float(np.max(np.abs(q - seed)))
+    if jump > max_joint_jump:
+        print(f"  [ik_step] rejected: joint jump {jump:.2f} rad > {max_joint_jump}")
+        return None, False
+    return q, True
+
+
 
 def _check_self_collision_risk(current_joints, target_joints):
     """Check if a direct move risks self-collision (large joint angle jumps)."""
@@ -1884,29 +1966,43 @@ class BridgeState:
         self.last_error = None
         self.execution_log = []
         self._command_queue = []
-        self._result_queue = []
+        self._result_queue = {}           # command id -> result
+        self._abandoned = set()           # ids whose caller already timed out
+        self._next_id = 0
+        self._caller = threading.local()  # id of this HTTP thread's last command
         self._lock = threading.Lock()
 
     def push_command(self, cmd):
         with self._lock:
+            self._next_id += 1
+            cmd["_id"] = self._next_id
+            self._caller.cmd_id = self._next_id
             self._command_queue.append(cmd)
 
     def pop_command(self):
         with self._lock:
             return self._command_queue.pop(0) if self._command_queue else None
 
-    def push_result(self, result):
+    def push_result(self, result, cmd_id=None):
         with self._lock:
-            self._result_queue.append(result)
+            if cmd_id in self._abandoned:
+                self._abandoned.discard(cmd_id)   # caller gave up; don't leak it
+            else:
+                self._result_queue[cmd_id] = result
 
     def pop_result(self, timeout=60):
+        """Wait for the result of this thread's last pushed command."""
+        cmd_id = getattr(self._caller, "cmd_id", None)
         start = time.time()
         while time.time() - start < timeout:
             with self._lock:
-                if self._result_queue:
-                    return self._result_queue.pop(0)
+                if cmd_id in self._result_queue:
+                    return self._result_queue.pop(cmd_id)
             time.sleep(0.05)
-        return {"error": "Timeout waiting for Isaac Sim response"}
+        with self._lock:
+            self._abandoned.add(cmd_id)
+        return {"error": "Timeout waiting for Isaac Sim response "
+                         "(the command keeps running; its result is discarded)"}
 
 
 STATE = BridgeState()
@@ -3028,7 +3124,7 @@ async def _move_home():
 
     # If IK is ready and the arm is down in the workspace (< 1.6m), first retract to safe transit height
     if STATE.ik_ready:
-        ee_pos = get_world_pos(EE_PATH)
+        ee_pos = get_tcp_pos()
         if ee_pos[2] < 1.6:
             safe_z = min(ee_pos[2] + TRANSIT_SAFE_HEIGHT, 1.8)
             locked_ori = _tool_down()
@@ -3193,8 +3289,12 @@ def _update_base_pose():
     """
     if STATE.cumotion_world is None:
         return None
+    import warp as wp
     pos, quat = _robot_base_pose_arrays()
-    STATE.cumotion_world.update_world_to_robot_root_transforms(poses=(pos, quat))
+    # update_* wants plain (1, 3) / (1, 4) float arrays, not vec3/vec4
+    flat = [wp.array(a.numpy().reshape(1, n).astype(np.float32), dtype=wp.float32,
+                     device=STATE.cumotion_device) for a, n in ((pos, 3), (quat, 4))]
+    STATE.cumotion_world.update_world_to_robot_root_transforms(poses=tuple(flat))
     return pos.numpy()[0]
 
 
@@ -3279,7 +3379,7 @@ async def _ik_move_to(target_xyz, orientation=None, settle_frames=SETTLE_FRAMES)
     target_joints = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, action)
     await _apply_interpolated(target_joints, settle_frames=settle_frames)
 
-    ee_pos = get_world_pos(EE_PATH)
+    ee_pos = get_tcp_pos()
     return {"status": "ok", "target": list(target_xyz), "ee_position": ee_pos.tolist()}
 
 
@@ -3301,7 +3401,7 @@ async def _cartesian_pose_move(target_pos, target_ori, step_size=0.04,
 
     frames_per_step = stream_frames if stream_frames is not None else STREAM_FRAMES
     target_pos = np.asarray(target_pos, dtype=np.float64)
-    current_ee = get_world_pos(EE_PATH)
+    current_ee = get_tcp_pos()
     delta = target_pos - current_ee
     dist = float(np.linalg.norm(delta))
     if dist < 0.005:
@@ -3314,11 +3414,11 @@ async def _cartesian_pose_move(target_pos, target_ori, step_size=0.04,
     for step in range(1, n_steps + 1):
         frac = step / n_steps
         step_pos = current_ee + delta * frac
-        action, ok = ik_solve(step_pos, target_ori, warm)
+        action, ok = ik_step(step_pos, target_ori, warm)
         if not ok:
             print(f"  [CART_POSE] IK failed at step {step}/{n_steps} "
                   f"pos={step_pos.tolist()} — stopping here")
-            return False, get_world_pos(EE_PATH).tolist()
+            return False, get_tcp_pos().tolist()
         targets = apply_arm_joints(STATE.robot, STATE.dof_names,
                                     STATE.arm_names, action)
         STATE.robot.apply_action(ArticulationAction(joint_positions=targets))
@@ -3328,14 +3428,14 @@ async def _cartesian_pose_move(target_pos, target_ori, step_size=0.04,
         last_action = action
 
     # Final settle at exact target
-    final_action, final_ok = ik_solve(target_pos, target_ori, warm)
+    final_action, final_ok = ik_step(target_pos, target_ori, warm)
     if final_ok:
         targets = apply_arm_joints(STATE.robot, STATE.dof_names,
                                     STATE.arm_names, final_action)
         STATE.robot.apply_action(ArticulationAction(joint_positions=targets))
     for _ in range(SETTLE_FRAMES):
         await omni.kit.app.get_app().next_update_async()
-    return final_ok, get_world_pos(EE_PATH).tolist()
+    return final_ok, get_tcp_pos().tolist()
 
 
 async def _descend_with_contact_stop(target_z, x, y, locked_ori,
@@ -3381,7 +3481,7 @@ async def _descend_with_contact_stop(target_z, x, y, locked_ori,
     from isaacsim.core.utils.types import ArticulationAction
 
     frames_per_step = stream_frames if stream_frames is not None else STREAM_FRAMES
-    current_ee = get_world_pos(EE_PATH)
+    current_ee = get_tcp_pos()
     current_z = float(current_ee[2])
 
     if current_z - target_z < 0.005:
@@ -3415,7 +3515,7 @@ async def _descend_with_contact_stop(target_z, x, y, locked_ori,
         z_step = current_z + (target_z - current_z) * frac
         step_pos = np.array([x, y, z_step])
 
-        action, ok = ik_solve(step_pos, locked_ori, warm)
+        action, ok = ik_step(step_pos, locked_ori, warm)
         if not ok:
             print(f"  [DESCEND-CONTACT] IK failed at step {step}/{n_steps} "
                   f"z={z_step:.3f} — stopping here")
@@ -3431,7 +3531,7 @@ async def _descend_with_contact_stop(target_z, x, y, locked_ori,
             await omni.kit.app.get_app().next_update_async()
 
         warm = action
-        last_z = float(get_world_pos(EE_PATH)[2])
+        last_z = float(get_tcp_pos()[2])
 
         # Per-step contact check — uses the FINGERTIP-BOTTOM sensor
         # (NOT the inner-pad sensor used by the gripper close). If the
@@ -3457,7 +3557,7 @@ async def _descend_with_contact_stop(target_z, x, y, locked_ori,
             if contact_lift_back > 0:
                 lift_z = last_z + contact_lift_back
                 lift_pos = np.array([x, y, lift_z])
-                lift_action, lift_ok = ik_solve(lift_pos, locked_ori, warm)
+                lift_action, lift_ok = ik_step(lift_pos, locked_ori, warm)
                 if lift_ok:
                     targets = apply_arm_joints(
                         STATE.robot, STATE.dof_names,
@@ -3470,7 +3570,7 @@ async def _descend_with_contact_stop(target_z, x, y, locked_ori,
                         ArticulationAction(joint_positions=targets))
                     for _ in range(SETTLE_FRAMES):
                         await omni.kit.app.get_app().next_update_async()
-                    after_lift_z = float(get_world_pos(EE_PATH)[2])
+                    after_lift_z = float(get_tcp_pos()[2])
                     print(f"  [DESCEND-CONTACT] Lifted back "
                           f"{contact_lift_back*1000:.1f} mm "
                           f"to z={after_lift_z:.3f} for clean close")
@@ -3536,7 +3636,7 @@ async def _cartesian_lateral_move(target_x, target_y, z, locked_ori,
     from isaacsim.core.utils.types import ArticulationAction
 
     frames_per_step = stream_frames if stream_frames is not None else STREAM_FRAMES
-    current_ee = get_world_pos(EE_PATH)
+    current_ee = get_tcp_pos()
     current_x = float(current_ee[0])
     current_y = float(current_ee[1])
 
@@ -3555,7 +3655,7 @@ async def _cartesian_lateral_move(target_x, target_y, z, locked_ori,
         y_step = current_y + dy * frac
         step_pos = np.array([x_step, y_step, z])
 
-        action, ok = ik_solve(step_pos, locked_ori, warm)
+        action, ok = ik_step(step_pos, locked_ori, warm)
         if not ok:
             print(f"  [CARTESIAN_LATERAL] IK failed at step {step}/"
                   f"{n_steps} ({x_step:.3f}, {y_step:.3f}, {z:.3f}) "
@@ -3575,7 +3675,7 @@ async def _cartesian_lateral_move(target_x, target_y, z, locked_ori,
 
     # Final settle at the exact (target_x, target_y, z).
     final_pos = np.array([target_x, target_y, z])
-    final_action, final_ok = ik_solve(final_pos, locked_ori, warm)
+    final_action, final_ok = ik_step(final_pos, locked_ori, warm)
     if final_ok:
         targets = apply_arm_joints(STATE.robot, STATE.dof_names,
                                    STATE.arm_names, final_action)
@@ -3618,7 +3718,7 @@ async def _retract_cartesian_up(target_z, x, y, locked_ori,
 
     frames_per_step = stream_frames if stream_frames is not None else STREAM_FRAMES
 
-    current_ee = get_world_pos(EE_PATH)
+    current_ee = get_tcp_pos()
     current_z  = current_ee[2]
 
     if abs(current_z - target_z) < 0.01:
@@ -3632,7 +3732,7 @@ async def _retract_cartesian_up(target_z, x, y, locked_ori,
         z_step   = current_z + (target_z - current_z) * frac
         step_pos = np.array([x, y, z_step])
 
-        action, ok = ik_solve(step_pos, locked_ori, warm)
+        action, ok = ik_step(step_pos, locked_ori, warm)
         if not ok:
             direction = "up" if target_z > current_z else "down"
             print(f"  [CARTESIAN_{direction.upper()}] IK failed at step {step}/{n_steps} z={z_step:.3f} — stopping here")
@@ -3650,7 +3750,7 @@ async def _retract_cartesian_up(target_z, x, y, locked_ori,
 
     # Final settle at the exact target position
     final_pos    = np.array([x, y, target_z])
-    final_action, final_ok = ik_solve(final_pos, locked_ori, warm)
+    final_action, final_ok = ik_step(final_pos, locked_ori, warm)
     if final_ok:
         targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, final_action)
         if finger_value is not None:
@@ -3685,7 +3785,7 @@ async def _smooth_joint_retract(safe_pos, locked_ori, finger_value=None):
 
     grasp_warm = _get_warm_start()
 
-    target_action, ok = ik_solve(safe_pos, locked_ori, grasp_warm)
+    target_action, ok = ik_step(safe_pos, locked_ori, grasp_warm, max_joint_jump=0.8)
     if not ok:
         print("  [SMOOTH_RETRACT] IK failed — falling back to micro-steps")
         return await _retract_cartesian_up(
@@ -3794,7 +3894,7 @@ async def _move_gantry_x(target_x, finger_hold=None, hold_ee_pos=None):
             for _ in range(SETTLE_FRAMES):
                 await omni.kit.app.get_app().next_update_async()
 
-        ee_final = get_world_pos(EE_PATH)
+        ee_final = get_tcp_pos()
         drift_xy = np.linalg.norm(ee_final[:2] - ee_lock[:2])
         drift_z = abs(ee_final[2] - ee_lock[2])
         print(f"  [GANTRY] EE-hold done. EE=({ee_final[0]:.3f}, {ee_final[1]:.3f}, {ee_final[2]:.3f}) "
@@ -3815,19 +3915,11 @@ async def _move_gantry_x(target_x, finger_hold=None, hold_ee_pos=None):
 
 
 async def _approach_target(params):
-    """Move arm near target XYZ.
+    """Move the TCP to world (x, y, z) — z is a TCP height, used verbatim.
 
-    Two modes (selected by ``raw_z`` in the payload):
-
-    * ``raw_z=False`` (default, pick-approach): adds a safety buffer
-      ``BOX_ENTRY_MARGIN + BOX_HEIGHT + GRIPPER_TCP_OFFSET + 0.10``
-      to the requested z so the gripper hovers safely above a bin wall
-      before the descent sequence takes over.
-
-    * ``raw_z=True`` (pose move): the requested z is sent to IK
-      verbatim. Used by the wrist-scan pipeline to park the ee_link
-      at an exact world height for camera framing or gantry
-      re-alignment, with no buffering and no restriction.
+    ``raw_z`` is accepted for compatibility and ignored (no buffer is
+    added). ``cartesian: True`` moves in a straight line with ``ik_step``
+    instead of a planned path.
 
     All coordinates come from the workflow engine — either USD prim
     bbox lookups (bin/tray) or VLM + depth projection (parts).
@@ -3901,10 +3993,10 @@ async def _realign_gantry_hold_ee(params):
     if target_x is None:
         return {"error": "Missing 'x' in payload"}
 
-    ee_before = get_world_pos(EE_PATH).copy()
+    ee_before = get_tcp_pos().copy()
     await _move_gantry_x(float(target_x), hold_ee_pos=ee_before)
     _update_base_pose()
-    ee_after = get_world_pos(EE_PATH)
+    ee_after = get_tcp_pos()
 
     drift = float(np.linalg.norm(ee_after - ee_before))
     print(f"  [REALIGN] gantry → x={target_x:.3f}; "
@@ -3928,7 +4020,6 @@ def _pick_z_positions(z, grasp_lift_override=None):
     TCP exactly at part top (default), which lets the contact-aware
     descent stop on first touch and lift back a clean 5 mm.
     """
-    tcp_z_offset = 0.0 if STATE.target_frame == "gripper_tcp" else _tcp_offset()
     grasp_lift = GRASP_LIFT
     if grasp_lift_override is not None:
         try:
@@ -3937,14 +4028,15 @@ def _pick_z_positions(z, grasp_lift_override=None):
             pass
     part_top_z = z
     grasp_z = z + grasp_lift       # TCP at part top + lift (lift can be 0 or negative)
-    safe_z = part_top_z + BOX_HEIGHT + BOX_ENTRY_MARGIN + tcp_z_offset
-    entry_z = part_top_z + BOX_HEIGHT + tcp_z_offset
-    hover_z = part_top_z + HOVER_CLEARANCE + tcp_z_offset
-    grasp_target_z = grasp_z + tcp_z_offset
+    # All TCP heights — _tool_pose_from_tcp adds the tool offset once.
+    safe_z = part_top_z + BOX_HEIGHT + BOX_ENTRY_MARGIN
+    entry_z = part_top_z + BOX_HEIGHT
+    hover_z = part_top_z + HOVER_CLEARANCE
+    grasp_target_z = grasp_z
     transit_z = safe_z + TRANSIT_SAFE_HEIGHT
     return dict(safe_z=safe_z, entry_z=entry_z, hover_z=hover_z,
                 grasp_target_z=grasp_target_z, transit_z=transit_z,
-                tcp_z_offset=tcp_z_offset, grasp_lift=grasp_lift)
+                grasp_lift=grasp_lift)
 
 
 # ─── PICK PHASE 1: Descend to grasp position ───────────────
@@ -3972,7 +4064,8 @@ async def _pick_descend(params):
     steps = []
     try:
         locked_ori = _tool_down()
-        grasp_target_z = z + _tcp_offset()
+        zp = _pick_z_positions(z, params.get("grasp_lift"))
+        grasp_target_z = zp["grasp_target_z"]
 
         print(f"  [DESCEND] target=({x:.3f}, {y:.3f}, {z:.3f}) grasp_z={grasp_target_z:.3f}")
 
@@ -3980,10 +4073,16 @@ async def _pick_descend(params):
         await _set_gripper(FINGER_OPEN)
         steps.append({"phase": "open_gripper", "status": "ok"})
 
-        # 2. Gantry alignment — ensure gantry is at target X
-        await _move_gantry_x(x)
-        _update_base_pose()
-        steps.append({"phase": "gantry", "status": "ok"})
+        # 2. XY alignment. The gantry is a cuMotion cspace joint, so do not
+        #    slide it on its own (that drags the TCP off target); if the TCP
+        #    is not above (x, y), make one planned move there at this height.
+        tcp_now = get_tcp_pos()
+        xy_off = float(np.hypot(tcp_now[0] - x, tcp_now[1] - y))
+        if xy_off > 0.005:
+            align = await _ik_move_to([x, y, float(tcp_now[2])], orientation=locked_ori)
+            if "error" in align:
+                return {"error": f"XY align failed: {align['error']}", "steps": steps}
+        steps.append({"phase": "xy_align", "status": "ok", "offset_mm": xy_off * 1000})
 
         # 3. Direct smooth descent to grasp target with contact stop
         contact_min_force = float(params.get("descent_contact_min_force", 0.5))
@@ -4026,7 +4125,7 @@ async def _pick_descend(params):
         #           execution.wrist_target_(x|y)_offset to compensate;
         #       (c) Bbox-centre vs grasp-centre mismatch — re-tune
         #           OWL-ViT2 query phrasing or tighten bbox heuristics.
-        actual_ee = get_world_pos(EE_PATH)
+        actual_ee = get_tcp_pos()
         dx_drift = float(actual_ee[0]) - x
         dy_drift = float(actual_ee[1]) - y
         dz_drift = float(actual_ee[2]) - zp["grasp_target_z"]
@@ -4066,7 +4165,7 @@ async def _pick_descend(params):
                   f"({x:.4f}, {y:.4f}) at z={float(actual_ee[2]):.4f}")
             snap_pos = np.array([x, y, float(actual_ee[2])])
             snap_warm = STATE.robot.get_joint_positions()[:6]
-            snap_action, snap_ok = ik_solve(snap_pos, locked_ori, snap_warm)
+            snap_action, snap_ok = ik_step(snap_pos, locked_ori, snap_warm)
             if snap_ok:
                 snap_targets = apply_arm_joints(
                     STATE.robot, STATE.dof_names,
@@ -4078,7 +4177,7 @@ async def _pick_descend(params):
                     ArticulationAction(joint_positions=snap_targets))
                 for _ in range(SETTLE_FRAMES):
                     await omni.kit.app.get_app().next_update_async()
-                snapped_ee = get_world_pos(EE_PATH)
+                snapped_ee = get_tcp_pos()
                 snap_residual = (
                     (float(snapped_ee[0]) - x) ** 2
                     + (float(snapped_ee[1]) - y) ** 2) ** 0.5
@@ -4493,7 +4592,6 @@ async def _place_object_ik(params):
     steps = []
     try:
         locked_ori = _tool_down()
-        tcp_z_offset = 0.0 if STATE.target_frame == "gripper_tcp" else _tcp_offset()
 
         # Use the passed coordinates directly (from VLM + depth projection)
         dest_x, dest_y, dest_top_z = x, y, z
@@ -4501,9 +4599,9 @@ async def _place_object_ik(params):
         # place_z_buffer overrides PLACE_DROP_HEIGHT if the caller sent it.
         drop_height = (place_z_buffer if place_z_buffer is not None
                         else PLACE_DROP_HEIGHT)
-        place_z = dest_top_z + drop_height + tcp_z_offset
-        place_safe_z = dest_top_z + BOX_ENTRY_MARGIN + tcp_z_offset
-        retract_z = dest_top_z + PLACE_RETRACT_HEIGHT + tcp_z_offset
+        place_z = dest_top_z + drop_height
+        place_safe_z = dest_top_z + BOX_ENTRY_MARGIN
+        retract_z = dest_top_z + PLACE_RETRACT_HEIGHT
         if place_z_buffer is not None:
             print(f"  [PLACE] place_z_buffer={place_z_buffer:.3f} m "
                   f"(overriding PLACE_DROP_HEIGHT={PLACE_DROP_HEIGHT:.3f}); "
@@ -4525,7 +4623,7 @@ async def _place_object_ik(params):
 
         # 1. Transit -- move arm to safe height before lateral gantry move.
         #    Single IK solve (same pattern as pick retract).
-        current_ee = get_world_pos(EE_PATH)
+        current_ee = get_tcp_pos()
         transit_up_z = current_ee[2] + TRANSIT_SAFE_HEIGHT + transit_clearance
         transit_up_pos = np.array([current_ee[0], current_ee[1], transit_up_z])
         transit_up_warm = _get_warm_start()
@@ -4558,7 +4656,7 @@ async def _place_object_ik(params):
         #     home (elbow up); the joint controller drives the arm
         #     there over a few frames, then we proceed.
         if params.get("place_reset_arm_config", True):
-            current_ee = get_world_pos(EE_PATH)
+            current_ee = get_tcp_pos()
             reset_pos = np.array([
                 float(current_ee[0]), float(current_ee[1]),
                 float(current_ee[2])])
@@ -4610,7 +4708,7 @@ async def _place_object_ik(params):
         #
         #    User spec: "maintain safe height until exactly over the
         #    kitting tray, THEN place the part."
-        ee_at_transit = get_world_pos(EE_PATH)
+        ee_at_transit = get_tcp_pos()
         xy_drift = float(np.linalg.norm(
             ee_at_transit[:2] - np.array([dest_x, dest_y])))
         print(f"  [PLACE] EE at transit altitude: ("
@@ -4620,7 +4718,7 @@ async def _place_object_ik(params):
         if xy_drift > 0.005:  # >5 mm
             snap_pos = np.array([dest_x, dest_y, float(ee_at_transit[2])])
             snap_warm = _get_warm_start()
-            snap_action, snap_ok = ik_solve(snap_pos, locked_ori, snap_warm)
+            snap_action, snap_ok = ik_step(snap_pos, locked_ori, snap_warm)
             if snap_ok:
                 targets = apply_arm_joints(STATE.robot, STATE.dof_names,
                                            STATE.arm_names, snap_action)
@@ -4630,7 +4728,7 @@ async def _place_object_ik(params):
                     ArticulationAction(joint_positions=targets))
                 for _ in range(60):
                     await omni.kit.app.get_app().next_update_async()
-                ee_after = get_world_pos(EE_PATH)
+                ee_after = get_tcp_pos()
                 after_drift = float(np.linalg.norm(
                     ee_after[:2] - np.array([dest_x, dest_y])))
                 print(f"  [PLACE] EE snap-to-tray-centre: "
@@ -4800,6 +4898,7 @@ def _shutdown_bridge(reason="simulation stopped"):
     with STATE._lock:
         STATE._command_queue.clear()
         STATE._result_queue.clear()
+        STATE._abandoned.clear()
 
     print("[OK] Bridge state reset — Streamlit will see 'disconnected'")
     print(f"{'=' * 60}\n")
@@ -5027,7 +5126,7 @@ async def _process_commands_loop():
             result = {"error": str(e), "traceback": traceback.format_exc()}
             STATE.last_error = str(e)
 
-        STATE.push_result(result)
+        STATE.push_result(result, cmd.get("_id"))
 
     print("[OK] Command loop exited")
 
