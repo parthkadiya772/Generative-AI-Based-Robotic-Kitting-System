@@ -67,6 +67,11 @@ Every step ends with a **live check** in Isaac Sim, run through the MCP tools an
   - Generate collision spheres with the editor's sphere generator for every link, including `vagn`, `base_link` and the gantry carriage.
   - Generate the self-collision ignore list in the editor.
   - Export the XRDF into `robot_config/ur10e/`.
+- **Progress:**
+  - Self-collision check: 0 pairs at the spawn pose (jointed links are skipped by PhysX).
+  - URDF exported. The exporter had a bug: nested links dumped their meshes into the parent link. Patched locally in Isaac, `isaacsim.asset.exporter.urdf/.../converter/link_reader.py` (`it.PruneChildren()`, backup `.orig`).
+  - Re-export into an **empty** folder. The exporter suffixes mesh names instead of overwriting them.
+  - The gantry rail has no physics collider (user chose to skip it). The URDF has no velocity limits; check this at cuMotion init.
 - **Sphere keys:** the XRDF uses URDF link names. The self-filter maps link names to prims through `robot.yaml`, which removes the old USD-path key problem (B5).
 - **Check:**
   - Forward kinematics from the URDF should match the stage link poses within 1 mm, at about 5 joint configurations.

@@ -1,0 +1,489 @@
+<?xml version="1.0" encoding="utf-8"?>
+<robot name="gantry">
+  <link name="gantry">
+    <inertial>
+      <origin xyz="0.0131242359 0.334235132 -0.140537232" rpy="0 0 0"/>
+      <mass value="1000"/>
+      <inertia ixx="47.2306192" ixy="3.42909021" ixz="-0.740929065" iyy="74.986677" iyz="10.5986018" izz="111.682209"/>
+    </inertial>
+    <visual name="gantry">
+      <geometry>
+        <mesh filename="./meshes/gantry.obj"/>
+      </geometry>
+    </visual>
+  </link>
+  <link name="vagn">
+    <inertial>
+      <origin xyz="0.0131242359 0.334235132 -0.140537232" rpy="0 0 0"/>
+      <mass value="17.2644768"/>
+      <inertia ixx="0.81541187" ixy="0.0592014516" ixz="-0.0127917581" iyy="1.29460571" iyz="0.182979298" izz="1.92813482"/>
+    </inertial>
+    <visual name="vagn">
+      <geometry>
+        <mesh filename="./meshes/vagn.obj"/>
+      </geometry>
+    </visual>
+    <collision name="vagn">
+      <geometry>
+        <mesh filename="./meshes/vagn.obj"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="base_link">
+    <inertial>
+      <mass value="4"/>
+      <inertia ixx="0.00610633101" ixy="0" ixz="0" iyy="0.00610633101" iyz="0" izz="0.0112500004"/>
+    </inertial>
+    <visual name="base_link_inertia">
+      <origin xyz="0 -1.14037616e-07 -4.38006489e-08" rpy="-1.03206305e-07 -2.52407842e-09 -3.14159257"/>
+      <geometry>
+        <mesh filename="./meshes/base_link_inertia.obj"/>
+      </geometry>
+    </visual>
+    <collision name="mesh">
+      <origin xyz="0 -1.14037616e-07 -4.38006489e-08" rpy="1.03206305e-07 2.52408745e-09 -4.78134536e-10"/>
+      <geometry>
+        <mesh filename="./meshes/mesh.obj"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="shoulder_link">
+    <inertial>
+      <mass value="7.77799988"/>
+      <inertia ixx="0.0314743109" ixy="0" ixz="0" iyy="0.0314743109" iyz="0" izz="0.0218756255"/>
+    </inertial>
+    <visual name="shoulder_link">
+      <origin xyz="-5.57538371e-08 1.894109e-08 -2.9789592e-08" rpy="-3.11170753e-08 1.52025749e-08 -0.000481260934"/>
+      <geometry>
+        <mesh filename="./meshes/shoulder_link.obj"/>
+      </geometry>
+    </visual>
+    <collision name="mesh">
+      <origin xyz="-5.57538371e-08 1.894109e-08 -2.9789592e-08" rpy="3.1117074e-08 -1.52025776e-08 3.14111148"/>
+      <geometry>
+        <mesh filename="./meshes/mesh_1.obj"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="upper_arm_link">
+    <inertial>
+      <origin xyz="-0.305999994 0 0.174999997" rpy="0 0 0"/>
+      <mass value="12.9300003"/>
+      <inertia ixx="0.0363656245" ixy="0" ixz="1.31912761e-08" iyy="0.421753824" iyz="0" izz="0.421753824"/>
+    </inertial>
+    <visual name="upper_arm_link">
+      <origin xyz="0 0 0" rpy="8.06194077e-08 -3.25547901e-08 2.99546535e-06"/>
+      <geometry>
+        <mesh filename="./meshes/upper_arm_link.obj"/>
+      </geometry>
+    </visual>
+    <collision name="mesh">
+      <origin xyz="-5.7362155e-09 -1.42054161e-08 0.176200002" rpy="1.5707964 1.2035731e-07 -1.57079337"/>
+      <geometry>
+        <mesh filename="./meshes/mesh_2.obj"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="forearm_link">
+    <inertial>
+      <origin xyz="-0.285775006 0 0.0392999984" rpy="0 0 0"/>
+      <mass value="3.86999989"/>
+      <inertia ixx="0.0108843753" ixy="0" ixz="3.41972737e-09" iyy="0.110793024" iyz="0" izz="0.110793024"/>
+    </inertial>
+    <visual name="forearm_link">
+      <origin xyz="4.78815276e-08 1.34764799e-09 3.17087389e-07" rpy="0 0 -3.37069404e-06"/>
+      <geometry>
+        <mesh filename="./meshes/forearm_link.obj"/>
+      </geometry>
+    </visual>
+    <collision name="mesh">
+      <origin xyz="4.78823083e-08 1.34765155e-09 0.0393003155" rpy="1.57079637 3.97363431e-08 -1.57079974"/>
+      <geometry>
+        <mesh filename="./meshes/mesh_3.obj"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="wrist_1_link">
+    <inertial>
+      <mass value="1.96000004"/>
+      <inertia ixx="0.00510824798" ixy="0" ixz="0" iyy="0.00510824798" iyz="0" izz="0.00551250018"/>
+    </inertial>
+    <visual name="wrist_1_link">
+      <origin xyz="1.30760892e-07 -3.9530183e-09 1.15100319e-07" rpy="0 4.06120055e-08 -2.17223186e-05"/>
+      <geometry>
+        <mesh filename="./meshes/wrist_1_link.obj"/>
+      </geometry>
+    </visual>
+    <collision name="mesh">
+      <origin xyz="1.2527827e-07 -3.95356792e-09 -0.13499989" rpy="1.57079636 4.06120025e-08 -2.1722317e-05"/>
+      <geometry>
+        <mesh filename="./meshes/mesh_4.obj"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="wrist_2_link">
+    <inertial>
+      <mass value="1.96000004"/>
+      <inertia ixx="0.00510824798" ixy="0" ixz="0" iyy="0.00510824798" iyz="0" izz="0.00551250018"/>
+    </inertial>
+    <visual name="wrist_2_link">
+      <origin xyz="-1.73826994e-07 2.0063127e-08 -2.23091824e-08" rpy="3.35572618e-08 0 2.69656138e-05"/>
+      <geometry>
+        <mesh filename="./meshes/wrist_2_link.obj"/>
+      </geometry>
+    </visual>
+    <collision name="mesh">
+      <origin xyz="-1.73830744e-07 2.40900005e-08 -0.12000002" rpy="3.35572618e-08 0 2.69656138e-05"/>
+      <geometry>
+        <mesh filename="./meshes/mesh_5.obj"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="wrist_3_link">
+    <inertial>
+      <origin xyz="0 0 -0.0250000004" rpy="0 0 0"/>
+      <mass value="0.202000007"/>
+      <inertia ixx="0.000144345773" ixy="0" ixz="0" iyy="0.000144345773" iyz="0" izz="0.000204525"/>
+    </inertial>
+    <visual name="wrist_3_link">
+      <origin xyz="6.97232361e-08 -2.0103006e-08 -1.46749871e-08" rpy="-3.56017009e-08 1.55201871e-08 2.63700907e-06"/>
+      <geometry>
+        <mesh filename="./meshes/wrist_3_link.obj"/>
+      </geometry>
+    </visual>
+    <collision name="mesh">
+      <origin xyz="6.79104373e-08 -2.42614095e-08 -0.116800017" rpy="1.57079633 1.55206346e-08 2.63708511e-06"/>
+      <geometry>
+        <mesh filename="./meshes/mesh_6.obj"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="robotiq_base_link">
+    <visual name="_F_Body">
+      <geometry>
+        <mesh filename="./meshes/_F_Body.obj"/>
+      </geometry>
+    </visual>
+    <collision name="_F_Body">
+      <geometry>
+        <mesh filename="./meshes/_F_Body.obj"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="left_outer_knuckle">
+    <inertial>
+      <origin xyz="-0.052893769 0.0531833768 0" rpy="0 0 0"/>
+      <mass value="0.00916329306"/>
+      <inertia ixx="2.13106688e-07" ixy="0" ixz="0" iyy="6.73438819e-07" iyz="0" izz="7.51600794e-07"/>
+    </inertial>
+    <visual name="Finger1">
+      <geometry>
+        <mesh filename="./meshes/Finger1.obj"/>
+      </geometry>
+    </visual>
+    <collision name="Finger1">
+      <geometry>
+        <mesh filename="./meshes/Finger1.obj"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="right_outer_knuckle">
+    <inertial>
+      <origin xyz="-0.052893769 0.0531833768 0" rpy="0 0 0"/>
+      <mass value="0.00916329306"/>
+      <inertia ixx="2.13106688e-07" ixy="0" ixz="0" iyy="6.73438819e-07" iyz="0" izz="7.51600794e-07"/>
+    </inertial>
+    <visual name="Finger1">
+      <geometry>
+        <mesh filename="./meshes/Finger1_1.obj"/>
+      </geometry>
+    </visual>
+    <collision name="Finger1">
+      <geometry>
+        <mesh filename="./meshes/Finger1_1.obj"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="left_outer_finger">
+    <inertial>
+      <origin xyz="-0.0767080188 0.0845726952 3.06424522e-06" rpy="0 0 0"/>
+      <mass value="0.0770642534"/>
+      <inertia ixx="4.52990186e-05" ixy="2.17302807e-05" ixz="-9.93454017e-14" iyy="1.90860704e-05" iyz="1.27843922e-13" izz="5.35424406e-05"/>
+    </inertial>
+    <visual name="Finger2">
+      <geometry>
+        <mesh filename="./meshes/Finger2.obj"/>
+      </geometry>
+    </visual>
+    <collision name="Finger2">
+      <geometry>
+        <mesh filename="./meshes/Finger2.obj"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="right_outer_finger">
+    <inertial>
+      <origin xyz="-0.0767080188 0.0845726952 3.06424522e-06" rpy="0 0 0"/>
+      <mass value="0.0770642534"/>
+      <inertia ixx="4.52990186e-05" ixy="2.17302807e-05" ixz="-9.93454017e-14" iyy="1.90860704e-05" iyz="1.27843922e-13" izz="5.35424406e-05"/>
+    </inertial>
+    <visual name="Finger2">
+      <geometry>
+        <mesh filename="./meshes/Finger2_1.obj"/>
+      </geometry>
+    </visual>
+    <collision name="Finger2">
+      <geometry>
+        <mesh filename="./meshes/Finger2_1.obj"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="left_inner_finger">
+    <inertial>
+      <origin xyz="0.160889998 0.0814799964 -1.47829735e-06" rpy="0 0 0"/>
+      <mass value="0.0498343818"/>
+      <inertia ixx="3.79158422e-06" ixy="3.36841854e-06" ixz="9.84051215e-09" iyy="1.83739636e-05" iyz="-5.77592542e-09" izz="1.7129654e-05"/>
+    </inertial>
+    <visual name="Fingertip">
+      <geometry>
+        <mesh filename="./meshes/Fingertip.obj"/>
+      </geometry>
+    </visual>
+    <visual name="Finger4">
+      <geometry>
+        <mesh filename="./meshes/Finger4.obj"/>
+      </geometry>
+    </visual>
+    <collision name="Fingertip">
+      <geometry>
+        <mesh filename="./meshes/Fingertip.obj"/>
+      </geometry>
+    </collision>
+    <collision name="Finger4">
+      <geometry>
+        <mesh filename="./meshes/Finger4.obj"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="right_inner_finger">
+    <inertial>
+      <origin xyz="0.16088824 -0.0814771429 -1.47829735e-06" rpy="0 0 0"/>
+      <mass value="0.0498343818"/>
+      <inertia ixx="3.79158136e-06" ixy="-3.36836547e-06" ixz="2.03253154e-08" iyy="1.83739902e-05" iyz="1.84271791e-09" izz="1.71296302e-05"/>
+    </inertial>
+    <visual name="Finger4">
+      <geometry>
+        <mesh filename="./meshes/Finger4_1.obj"/>
+      </geometry>
+    </visual>
+    <visual name="Fingertip">
+      <geometry>
+        <mesh filename="./meshes/Fingertip_1.obj"/>
+      </geometry>
+    </visual>
+    <collision name="Finger4">
+      <geometry>
+        <mesh filename="./meshes/Finger4_1.obj"/>
+      </geometry>
+    </collision>
+    <collision name="Fingertip">
+      <geometry>
+        <mesh filename="./meshes/Fingertip_1.obj"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="left_inner_knuckle">
+    <inertial>
+      <origin xyz="-0.0482579768 0.101011693 -4.59329508e-09" rpy="0 0 0"/>
+      <mass value="0.0681122169"/>
+      <inertia ixx="3.28597215e-05" ixy="2.15827734e-05" ixz="-5.09471736e-08" iyy="2.55428598e-05" iyz="-1.14897097e-08" izz="4.53846594e-05"/>
+    </inertial>
+    <visual name="Finger3">
+      <geometry>
+        <mesh filename="./meshes/Finger3.obj"/>
+      </geometry>
+    </visual>
+    <collision name="Finger3">
+      <geometry>
+        <mesh filename="./meshes/Finger3.obj"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="right_inner_knuckle">
+    <inertial>
+      <origin xyz="-0.0482579768 0.101011693 -4.59329508e-09" rpy="0 0 0"/>
+      <mass value="0.0681122169"/>
+      <inertia ixx="3.28597215e-05" ixy="2.15827734e-05" ixz="-5.09471736e-08" iyy="2.55428598e-05" iyz="-1.14897097e-08" izz="4.53846594e-05"/>
+    </inertial>
+    <visual name="Finger3">
+      <geometry>
+        <mesh filename="./meshes/Finger3_1.obj"/>
+      </geometry>
+    </visual>
+    <collision name="Finger3">
+      <geometry>
+        <mesh filename="./meshes/Finger3_1.obj"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="grasp_frame"/>
+  <joint name="gantry_vagn_joint" type="prismatic">
+    <origin xyz="3.26999998 -0.294999987 0.159999996" rpy="0 0 0"/>
+    <parent link="gantry"/>
+    <child link="vagn"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-3.0999999" upper="0" effort="10000000"/>
+    <dynamics friction="0.5"/>
+    <!-- isaac:source_drive {"armature": 0.10000000149011612, "drive": {"damping": 10000.0, "max_force": 10000000.0, "stiffness": 100000.0, "target_position": -0.0030837091617286205}, "instance": "linear", "source": "physx"} -->
+  </joint>
+  <joint name="vagn_robot_joint" type="fixed">
+    <origin xyz="-0.0007824963 -1.14684127e-07 -3.7824833e-08" rpy="0 0 0"/>
+    <parent link="vagn"/>
+    <child link="base_link"/>
+  </joint>
+  <joint name="shoulder_pan_joint" type="revolute">
+    <origin xyz="4.13463486e-10 -1.32686995e-07 0.18069996" rpy="-1.03206305e-07 -2.52407842e-09 -3.14159257"/>
+    <parent link="base_link"/>
+    <child link="shoulder_link"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.28318531" upper="6.28318531" effort="330"/>
+    <dynamics friction="0"/>
+    <!-- isaac:source_drive {"armature": 0.0, "drive": {"damping": 13.085969924926758, "max_force": 330.0, "stiffness": 3271.49169921875, "target_position": 0.0}, "instance": "angular", "source": "physx"} -->
+  </joint>
+  <joint name="shoulder_lift_joint" type="revolute">
+    <origin xyz="-5.5753838e-08 1.89410901e-08 -2.9789592e-08" rpy="1.57079624 1.52025749e-08 -0.000481260935"/>
+    <parent link="shoulder_link"/>
+    <child link="upper_arm_link"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.28318531" upper="6.28318531" effort="330"/>
+    <dynamics friction="0"/>
+    <!-- isaac:source_drive {"armature": 0.0, "drive": {"damping": 13.085969924926758, "max_force": 330.0, "stiffness": 3271.49169921875, "target_position": 0.0}, "instance": "angular", "source": "physx"} -->
+  </joint>
+  <joint name="elbow_joint" type="revolute">
+    <origin xyz="-0.612699986 -1.83535506e-06 -1.99466833e-08" rpy="8.06233943e-08 -3.25563999e-08 2.99561348e-06"/>
+    <parent link="upper_arm_link"/>
+    <child link="forearm_link"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-3.14159265" upper="3.14159265" effort="150"/>
+    <dynamics friction="0"/>
+    <!-- isaac:source_drive {"armature": 0.0, "drive": {"damping": 13.085966110229492, "max_force": 150.0, "stiffness": 3271.49169921875, "target_position": 0.0}, "instance": "angular", "source": "physx"} -->
+  </joint>
+  <joint name="wrist_1_joint" type="revolute">
+    <origin xyz="-0.571549964 1.9278736e-06 0.174150322" rpy="0 0 -3.37069404e-06"/>
+    <parent link="forearm_link"/>
+    <child link="wrist_1_link"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.28318531" upper="6.28318531" effort="56"/>
+    <dynamics friction="0"/>
+    <!-- isaac:source_drive {"armature": 0.0, "drive": {"damping": 5.072744369506836, "max_force": 56.0, "stiffness": 1268.18603515625, "target_position": 0.0}, "instance": "angular", "source": "physx"} -->
+  </joint>
+  <joint name="wrist_2_joint" type="revolute">
+    <origin xyz="-2.47265885e-06 -0.119850006 1.15076331e-07" rpy="1.57079627 4.06120025e-08 -2.1722317e-05"/>
+    <parent link="wrist_1_link"/>
+    <child link="wrist_2_link"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.28318531" upper="6.28318531" effort="56"/>
+    <dynamics friction="0"/>
+    <!-- isaac:source_drive {"armature": 0.0, "drive": {"damping": 5.070000171661377, "max_force": 56.0, "stiffness": 1268.18603515625, "target_position": 0.0}, "instance": "angular", "source": "physx"} -->
+  </joint>
+  <joint name="wrist_3_joint" type="revolute">
+    <origin xyz="-3.3166711e-06 0.116550019 -1.84219861e-08" rpy="-1.57079623 -8.73924313e-08 2.70530525e-05"/>
+    <parent link="wrist_2_link"/>
+    <child link="wrist_3_link"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.28318531" upper="6.28318531" effort="56"/>
+    <dynamics friction="0"/>
+    <!-- isaac:source_drive {"armature": 0.0, "drive": {"damping": 5.070000171661377, "max_force": 56.0, "stiffness": 1268.18603515625, "target_position": 0.0}, "instance": "angular", "source": "physx"} -->
+  </joint>
+  <joint name="ur10e_gripper_fixed_joint" type="fixed">
+    <origin xyz="6.97232343e-08 -2.01030064e-08 -1.4674988e-08" rpy="-1.55206305e-08 -3.560273e-08 -1.57079381"/>
+    <parent link="wrist_3_link"/>
+    <child link="robotiq_base_link"/>
+  </joint>
+  <joint name="finger_joint" type="revolute">
+    <origin xyz="3.8417412e-09 -0.0306009073 0.0546625181" rpy="-1.57079633 0 -1.5707962"/>
+    <parent link="robotiq_base_link"/>
+    <child link="left_outer_knuckle"/>
+    <axis xyz="0 0 -1"/>
+    <limit lower="0" upper="0.785398163" effort="1000"/>
+    <dynamics friction="0"/>
+    <!-- isaac:source_drive {"armature": 0.0, "drive": {"damping": 200.0, "max_force": 1000.0, "stiffness": 2000.0, "target_position": 0.0}, "instance": "angular", "source": "physx"} -->
+  </joint>
+  <joint name="right_outer_knuckle_joint" type="revolute">
+    <origin xyz="-3.83226179e-09 0.0306013841 0.0546625181" rpy="-1.57079633 0 1.57079645"/>
+    <parent link="robotiq_base_link"/>
+    <child link="right_outer_knuckle"/>
+    <axis xyz="0 0 -1"/>
+    <limit lower="0" upper="1.30899694"/>
+    <dynamics friction="0"/>
+    <mimic joint="finger_joint" multiplier="-1" offset="0"/>
+    <!-- isaac:source_drive {"armature": 0.0, "drive": {"damping": 0.0, "max_force": Infinity, "stiffness": 0.0, "target_position": 0.0}, "instance": "angular", "source": "physx"} -->
+  </joint>
+  <joint name="left_outer_finger_joint" type="revolute">
+    <origin xyz="0.0314311162 0.00448822857 -1.56787868e-08" rpy="4.68598644e-08 -2.11045535e-08 3.14019127"/>
+    <parent link="left_outer_knuckle"/>
+    <child link="left_outer_finger"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="0" upper="3.14159265" effort="1000"/>
+    <dynamics friction="0"/>
+    <!-- isaac:source_drive {"armature": 0.0, "drive": {"damping": 200.0, "max_force": 1000.0, "stiffness": 2000.0, "target_position": 0.0}, "instance": "angular", "source": "physx"} -->
+  </joint>
+  <joint name="right_outer_finger_joint" type="revolute">
+    <origin xyz="0.0314266719 0.00452019973 -2.48791659e-08" rpy="-1.52365052e-07 -9.2073987e-08 3.14121019"/>
+    <parent link="right_outer_knuckle"/>
+    <child link="right_outer_finger"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="0" upper="3.14159265" effort="1000"/>
+    <dynamics friction="0"/>
+    <!-- isaac:source_drive {"armature": 0.0, "drive": {"damping": 200.0, "max_force": 1000.0, "stiffness": 2000.0, "target_position": 0.0}, "instance": "angular", "source": "physx"} -->
+  </joint>
+  <joint name="left_inner_finger_joint" type="continuous">
+    <origin xyz="-0.0354828078 0.0788751575 1.4323272e-08" rpy="9.09204643e-08 2.82666454e-08 0.000666628285"/>
+    <parent link="left_outer_finger"/>
+    <child link="left_inner_finger"/>
+    <axis xyz="0 0 -1"/>
+    <limit effort="1"/>
+    <dynamics friction="0"/>
+    <!-- isaac:source_drive {"armature": 0.0, "drive": {"damping": 9.999999747378752e-06, "max_force": 1.0, "stiffness": 0.0020000000949949026, "target_position": 0.0}, "instance": "angular", "source": "physx"} -->
+  </joint>
+  <joint name="right_inner_finger_joint" type="continuous">
+    <origin xyz="-0.0355182227 0.0788593532 -3.52959731e-09" rpy="3.14159265 -7.69238411e-09 0.00111959513"/>
+    <parent link="right_outer_finger"/>
+    <child link="right_inner_finger"/>
+    <axis xyz="0 0 1"/>
+    <limit effort="1"/>
+    <dynamics friction="0"/>
+    <!-- isaac:source_drive {"armature": 0.0, "drive": {"damping": 9.999999747378752e-06, "max_force": 1.0, "stiffness": 0.0020000000949949026, "target_position": 0.0}, "instance": "angular", "source": "physx"} -->
+  </joint>
+  <joint name="left_inner_finger_pad_joint" type="revolute">
+    <origin xyz="0.0179063318 0.00650135935 9.63210389e-09" rpy="1.73369589e-07 -3.64109076e-08 -0.000782405366"/>
+    <parent link="left_inner_finger"/>
+    <child link="left_inner_knuckle"/>
+    <axis xyz="0 0 -1"/>
+    <limit lower="-0.785398163" upper="0.785398163"/>
+    <dynamics friction="0"/>
+    <!-- isaac:source_drive {"armature": 0.0, "drive": {"damping": 0.0, "max_force": Infinity, "stiffness": 0.0, "target_position": 0.0}, "instance": "angular", "source": "physx"} -->
+  </joint>
+  <joint name="right_inner_finger_pad_joint" type="revolute">
+    <origin xyz="0.0179337737 -0.00642575083 -2.96537378e-08" rpy="-3.14159259 -6.99222907e-08 0.00500231015"/>
+    <parent link="right_inner_finger"/>
+    <child link="right_inner_knuckle"/>
+    <axis xyz="0 0 -1"/>
+    <limit lower="-0.785398163" upper="0.785398163"/>
+    <dynamics friction="0"/>
+    <!-- isaac:source_drive {"armature": 0.0, "drive": {"damping": 0.0, "max_force": Infinity, "stiffness": 0.0, "target_position": 0.0}, "instance": "angular", "source": "physx"} -->
+  </joint>
+  <joint name="grasp_frame_fixed_joint" type="fixed">
+    <origin xyz="0 2.38429913e-07 0.158154975" rpy="0 1.7536907e-10 1.26440403e-07"/>
+    <parent link="robotiq_base_link"/>
+    <child link="grasp_frame"/>
+  </joint>
+  <loop_joint name="left_inner_knuckle_joint" type="revolute">
+    <link1 link="robotiq_base_link" xyz="0 -0.0126999998 0.0611780025" rpy="-1.57079633 0 1.57079633"/>
+    <link2 link="left_inner_knuckle" xyz="-0.0126999998 0.0614200011 0" rpy="3.14159265 0 0"/>
+  </loop_joint>
+  <loop_joint name="right_inner_knuckle_joint" type="revolute">
+    <link1 link="robotiq_base_link" xyz="0 0.0126999998 0.0611780025" rpy="-1.57079633 0 1.57079633"/>
+    <link2 link="right_inner_knuckle" xyz="-0.0126999998 0.0614200011 0" rpy="0 0 3.14159265"/>
+  </loop_joint>
+</robot>
