@@ -25,7 +25,7 @@ from .config_loader import (
 )
 
 ROBOT_YAML = "robot.yaml"
-GRIPPER_MODES = ("drive", "zero", "free")
+GRIPPER_MODES = ("drive", "pad", "mirror", "zero", "free")
 
 # Every key must be present; values may be null until measured.
 _REQUIRED_KEYS = (
@@ -198,6 +198,34 @@ class RobotConfig:
         return self.raw["gripper"]["finger"]
 
     @property
+    def width_table(self) -> list[list[float]] | None:
+        """Rows of [finger rad, pad gap m, pad-face centre depth m], or None."""
+        return self.raw["gripper"].get("width_table")
+
+    @property
+    def gripper_joint_gains(self) -> dict[str, list[float]]:
+        """Joint -> [stiffness, damping, max force] applied at bridge start."""
+        return self.raw["gripper"].get("joint_gains") or {}
+
+    def gap_for_finger(self, finger_rad: float) -> float:
+        """Pad gap [m] at a finger_joint angle (width_table, else linear in stroke)."""
+        table = self.width_table
+        if table:
+            rad, gap = [r[0] for r in table], [r[1] for r in table]
+            return float(_interp(finger_rad, rad, gap))
+        frac = min(max(finger_rad / self.finger["max_rad"], 0.0), 1.0)
+        return float(self.gripper["stroke"] * (1.0 - frac))
+
+    def finger_for_gap(self, gap: float) -> float:
+        """finger_joint angle [rad] for a pad gap [m]; clamped to the table range."""
+        table = self.width_table
+        if table:
+            rad, gaps = [r[0] for r in table][::-1], [r[1] for r in table][::-1]
+            return float(_interp(gap, gaps, rad))
+        frac = min(max(gap / self.gripper["stroke"], 0.0), 1.0)
+        return float(self.finger["max_rad"] * (1.0 - frac))
+
+    @property
     def contact_sensor_prim(self) -> str:
         return self.prim(self.raw["gripper"]["contact_sensor"])
 
@@ -265,6 +293,18 @@ class RobotConfig:
         if modes.get(self.gripper_drive_joint) != "drive":
             errors.append("joints.gripper_drive must have mode 'drive' in gripper_modes")
 
+        table = self.width_table
+        if table is not None:
+            if any(len(r) != 3 for r in table):
+                errors.append("gripper.width_table: rows need [finger_rad, gap_m, centre_depth_m]")
+            elif not (all(a[0] < b[0] for a, b in zip(table, table[1:]))
+                      and all(a[1] > b[1] for a, b in zip(table, table[1:]))):
+                errors.append("gripper.width_table: finger_rad must increase and gap decrease")
+        for joint, gains in self.gripper_joint_gains.items():
+            if joint not in modes or len(gains) != 3:
+                errors.append(f"gripper.joint_gains.{joint}: needs a gripper_modes joint "
+                              "and [stiffness, damping, max_force]")
+
         n_cspace = len(self.cspace_joints)
         for key in ("cumotion.max_vel", "cumotion.max_acc"):
             if len(self.get(key)) != n_cspace:
@@ -292,6 +332,16 @@ class RobotConfig:
 
         if errors:
             raise RobotConfigError(f"{src}:\n  " + "\n  ".join(errors))
+
+
+def _interp(x: float, xs: list[float], ys: list[float]) -> float:
+    """Piecewise-linear interpolation with xs increasing; clamps outside the range."""
+    if x <= xs[0]:
+        return ys[0]
+    for (x0, y0), (x1, y1) in zip(zip(xs, ys), zip(xs[1:], ys[1:])):
+        if x <= x1:
+            return y0 + (y1 - y0) * (x - x0) / (x1 - x0)
+    return ys[-1]
 
 
 def load_robot_config(config_dir: str | os.PathLike | None = None) -> RobotConfig:

@@ -104,6 +104,30 @@ class TestShippedConfigs:
         assert {"gantry", "vagn"} <= set(self_)
         assert set(world) == set(self_) - {"gantry", "vagn"}
 
+    def test_ur10e_parallel_pad_modes(self):
+        cfg = load_robot_config(UR10E_DIR)
+        assert cfg.gripper_modes["left_inner_finger_joint"] == "mirror"
+        assert cfg.gripper_modes["left_inner_finger_pad_joint"] == "pad"
+        assert set(cfg.gripper_joint_gains) == {
+            "finger_joint", "left_inner_finger_joint", "right_inner_finger_joint",
+            "left_inner_finger_pad_joint", "right_inner_finger_pad_joint"}
+
+    def test_width_table_mapping(self):
+        cfg = load_robot_config(UR10E_DIR)
+        assert cfg.gap_for_finger(0.0) == pytest.approx(0.1438)
+        assert cfg.gap_for_finger(0.45) == pytest.approx((0.0757 + 0.0566) / 2)
+        assert cfg.finger_for_gap(0.0757) == pytest.approx(0.4)
+        assert cfg.finger_for_gap(0.5) == pytest.approx(0.0)       # wider than open
+        assert cfg.finger_for_gap(0.0) == pytest.approx(0.76)      # clamps at closed
+        for rad in (0.05, 0.33, 0.71):
+            assert cfg.finger_for_gap(cfg.gap_for_finger(rad)) == pytest.approx(rad)
+
+    def test_linear_fallback_without_width_table(self):
+        cfg = load_robot_config(UR10_DIR)
+        assert cfg.width_table is None
+        assert cfg.gap_for_finger(0.0) == pytest.approx(0.140)
+        assert cfg.finger_for_gap(0.0) == pytest.approx(cfg.finger["max_rad"])
+
     def test_project_root_expanded(self):
         cfg = load_robot_config(UR10E_DIR)
         assert "${" not in cfg.stage_path
@@ -165,6 +189,18 @@ class TestValidation:
             c["home_joints"] = [0.0] * 6
         with pytest.raises(RobotConfigError, match="home_joints"):
             load_robot_config(_write_variant(tmp_path, UR10_DIR, edit))
+
+    def test_width_table_must_be_monotonic(self, tmp_path):
+        def edit(c):
+            c["gripper"]["width_table"][2][1] = 0.2
+        with pytest.raises(RobotConfigError, match="width_table"):
+            load_robot_config(_write_variant(tmp_path, UR10E_DIR, edit))
+
+    def test_joint_gains_need_known_joint(self, tmp_path):
+        def edit(c):
+            c["gripper"]["joint_gains"]["no_such_joint"] = [1.0, 0.1, 1.0]
+        with pytest.raises(RobotConfigError, match="joint_gains"):
+            load_robot_config(_write_variant(tmp_path, UR10E_DIR, edit))
 
     def test_absolute_paths_pass_through(self):
         cfg = load_robot_config(UR10E_DIR)

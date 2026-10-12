@@ -313,36 +313,27 @@ def compute_grasp_geometry(stage, part_path, depth_frac=0.5):
 
 
 def compute_adaptive_finger_close(part_width):
-    """Compute gripper close value adapted to part size.
+    """Finger angle that squeezes a part of ``part_width`` [m].
 
-    The Robotiq 2F-140 finger pads are thick — the joint angle must
-    overshoot well past the part width so the pads actually squeeze
-    firmly against the surface.  GRIP_OVERSHOOT (40mm) accounts for
-    pad thickness + compression needed for a secure hold.
+    Targets a pad gap GRIP_OVERSHOOT narrower than the part, so the drive
+    keeps pushing once the pads touch. Mapped through robot.yaml
+    gripper.width_table, then clamped to [close_min, close_max].
     """
-    # Target opening = part width minus overshoot (pads need to compress past surface)
-    desired_opening = max(0.0, part_width - GRIP_OVERSHOOT)
-    # Convert opening (metres) to joint angle (radians)
-    finger_rad = ROBOTIQ_MAX_RAD * (1.0 - desired_opening / ROBOTIQ_MAX_STROKE)
+    desired_gap = max(0.0, part_width - GRIP_OVERSHOOT)
+    finger_rad = ROBOT_CFG.finger_for_gap(desired_gap)
     clamped = float(np.clip(finger_rad, FINGER_CLOSE_MIN, FINGER_CLOSE_MAX))
-    print(f"  [GRIP] part_width={part_width*1000:.1f}mm overshoot={GRIP_OVERSHOOT*1000:.0f}mm -> finger_close={clamped:.3f} rad")
+    print(f"  [GRIP] part_width={part_width*1000:.1f}mm overshoot={GRIP_OVERSHOOT*1000:.0f}mm "
+          f"-> finger_close={clamped:.3f} rad")
     return clamped
 
 
 def compute_entry_finger_shape(part_width):
-    """Finger angle for bin entry: wide enough to pass over part, narrow enough for bin walls.
+    """Finger angle for bin entry: pads ENTRY_CLEARANCE wider than the part.
 
-    Pre-shapes the gripper BEFORE descending into the bin so the open (140mm)
-    fingers cannot clip the bin walls.  The result is ENTRY_CLEARANCE (20mm)
-    wider than the part → fingers clear the part during the descent, then a
-    slow final close makes contact from the sides rather than top-down.
-
-    Returns a value between FINGER_OPEN and FINGER_CLOSE_MIN.
+    Pre-shapes the gripper before descending so the open (144 mm) fingers
+    cannot clip the bin walls. Stays wider than close_min.
     """
-    desired_opening = part_width + ENTRY_CLEARANCE
-    desired_opening = min(desired_opening, ROBOTIQ_MAX_STROKE)
-    finger_rad = ROBOTIQ_MAX_RAD * (1.0 - desired_opening / ROBOTIQ_MAX_STROKE)
-    # Must be wider than minimum grip (less closed) — we are still entering
+    finger_rad = ROBOT_CFG.finger_for_gap(part_width + ENTRY_CLEARANCE)
     return float(np.clip(finger_rad, FINGER_OPEN, FINGER_CLOSE_MIN - 0.05))
 
 
@@ -357,29 +348,57 @@ def apply_arm_joints(robot, dof_names, arm_names, ik_result):
 
 
 def set_finger_joints(robot, dof_names, value, base_targets=None):
-    """Set gripper joint targets for encompassing (adaptive) grip.
+    """Set gripper joint targets for finger angle ``value`` [rad].
 
-    Robotiq 2F-140 joint geometry:
-      finger_joint = +value  (outer phalanx rotates inward)
-      inner_finger_joint = 0 (inner pad stays at 0 RELATIVE TO outer phalanx)
-        → inner pad absolute angle = outer_angle + 0 = outer_angle
-        → inner pad points inward/downward with the outer phalanx
-        → creates an encompassing undercut that prevents the part from
-          falling straight down during vertical lift (adaptive/encompassing mode)
-
-    The old behaviour was inner_finger_joint = -value, which counter-rotates
-    the inner pad to keep it vertical (absolute 0 rad = flat/parallel contact).
-    That grip has NO undercut — only side friction holds the part during lift.
+    Per robot.yaml joints.gripper_modes: ``drive`` joints get ``value``;
+    ``pad`` joints get the pad angle and ``mirror`` joints minus it (inner
+    fingers counter-rotate so the pads stay parallel); ``zero`` joints 0;
+    ``free`` joints are left alone. The pad angle is ``value``, except
+    while holding a part (STATE.pad_hold, set at contact): then it is the
+    MEASURED finger angle, like the real parallel linkage, so the pad
+    drives keep the pads parallel without pushing against the squeeze.
+    Opening below the contact angle clears the hold.
     """
+    if STATE.pad_hold is not None and value < STATE.pad_hold - 1e-3:
+        STATE.pad_hold = None
+    pad = value if STATE.pad_hold is None else _finger_angle()
     targets = base_targets if base_targets is not None else robot.get_joint_positions()
     for idx, name in enumerate(dof_names):
-        mode = GRIPPER_JOINT_MODES.get(name, "free")   # robot.yaml joints.gripper_modes
+        mode = GRIPPER_JOINT_MODES.get(name, "free")
         if mode == "drive":
             targets[idx] = value
+        elif mode == "pad":
+            targets[idx] = pad
+        elif mode == "mirror":
+            targets[idx] = -pad
         elif mode == "zero":
             targets[idx] = 0.0
+    STATE.grip_target = float(value)
     return targets
 
+
+def _finger_angle():
+    """Measured finger_joint angle [rad]."""
+    return float(STATE.robot.get_joint_positions()[STATE.dof_names.index(GRIPPER_DRIVE_JOINT)])
+
+
+def _apply_gripper_gains():
+    """Give the asset's unactuated finger joints drives (robot.yaml gripper.joint_gains)."""
+    gains = ROBOT_CFG.gripper_joint_gains
+    if not gains:
+        return
+    ctrl = STATE.robot.get_articulation_controller()
+    kp, kd = (np.array(v, dtype=np.float64) for v in ctrl.get_gains())
+    max_force = np.array(ctrl.get_max_efforts(), dtype=np.float64)
+    for name, (stiffness, damping, force) in gains.items():
+        if name not in STATE.dof_names:
+            print(f"[WARN] gripper.joint_gains: no DOF named '{name}'")
+            continue
+        i = STATE.dof_names.index(name)
+        kp[i], kd[i], max_force[i] = stiffness, damping, force
+    ctrl.set_gains(kps=kp, kds=kd)
+    ctrl.set_max_efforts(max_force)
+    print(f"[OK] Gripper joint gains applied: {', '.join(sorted(gains))}")
 
 # ═════════════════════════════════════════════════════════════
 # COLLISION WORLD  (4-camera point cloud → cuMotion sphere colliders)
@@ -1965,6 +1984,8 @@ class BridgeState:
         self.is_executing = False
         self.contact_sensor = None        # Inner pad — for grip close
         self.contact_sensor_tip = None    # Fingertip bottom — for descent stop
+        self.grip_target = None           # last commanded finger angle [rad]
+        self.pad_hold = None              # finger angle at contact while holding
         self.last_error = None
         self.execution_log = []
         self._command_queue = []
@@ -3243,9 +3264,25 @@ def _force_grip(finger_value):
 
 
 async def _verify_grasp():
-    finger_pos = STATE.robot.get_joint_positions()[STATE.dof_names.index(GRIPPER_DRIVE_JOINT)]
-    is_grasping = abs(finger_pos) > GRASP_CONFIRM_RAD
-    return {"status": "ok", "is_grasping": bool(is_grasping), "finger_pos": float(finger_pos)}
+    """Is a part between the fingers?
+
+    Held = the pad contact sensor reads at least adaptive_close.min_force,
+    or the finger stalled more than GRASP_CONFIRM_RAD short of its target —
+    and the finger is not fully closed (fully closed always means empty).
+    Under load the finger angle alone is unreliable: the compliant inner
+    joints let it settle past its target while the part is still held.
+    """
+    actual = _finger_angle()
+    target = STATE.grip_target
+    touching, force = _read_contact_sensor()
+    min_force = ROBOT_CFG.gripper["adaptive_close"]["min_force"]
+    blocked = target is not None and target - actual > GRASP_CONFIRM_RAD
+    fully_closed = actual >= ROBOTIQ_MAX_RAD - 0.03
+    held = not fully_closed and ((touching and force >= min_force) or blocked)
+    return {"status": "ok", "is_grasping": bool(held),
+            "finger_pos": actual, "finger_target": target,
+            "pad_gap_m": ROBOT_CFG.gap_for_finger(actual),
+            "pad_contact": bool(touching), "contact_force": force}
 
 
 # ═════════════════════════════════════════════════════════════
@@ -4255,12 +4292,10 @@ def _read_contact_sensor():
     if STATE.contact_sensor is None:
         return False, 0.0
     try:
-        frame = STATE.contact_sensor.get_current_frame()
-        in_contact = bool(frame.get("in_contact", False))
-        force_vec = frame.get("force", [0, 0, 0])
-        force_mag = float(np.linalg.norm(force_vec))
-        return in_contact, force_mag
-    except Exception:
+        frame = STATE.contact_sensor.get_data()   # experimental ContactSensor API
+        return bool(frame.get("in_contact", False)), float(np.linalg.norm(frame.get("force", 0.0)))
+    except Exception as e:
+        print(f"  [contact] contact_sensor read failed: {e}")
         return False, 0.0
 
 
@@ -4277,81 +4312,77 @@ def _read_tip_contact_sensor():
     if STATE.contact_sensor_tip is None:
         return False, 0.0
     try:
-        frame = STATE.contact_sensor_tip.get_current_frame()
-        in_contact = bool(frame.get("in_contact", False))
-        force_vec = frame.get("force", [0, 0, 0])
-        force_mag = float(np.linalg.norm(force_vec))
-        return in_contact, force_mag
-    except Exception:
+        frame = STATE.contact_sensor_tip.get_data()   # experimental ContactSensor API
+        return bool(frame.get("in_contact", False)), float(np.linalg.norm(frame.get("force", 0.0)))
+    except Exception as e:
+        print(f"  [contact] contact_sensor_tip read failed: {e}")
         return False, 0.0
 
 
-async def _adaptive_close(min_force=0.5, step_rad=0.02, max_steps=30,
-                           overshoot_rad=0.04):
-    """Close gripper incrementally using contact sensor feedback.
+async def _adaptive_close(min_force=None, step_rad=None, max_steps=None,
+                          overshoot_rad=None):
+    """Close step by step until the fingers touch something, then squeeze.
 
-    Closes in small steps, checking the contact sensor after each.
-    Stops when contact force exceeds min_force, then applies a small
-    overshoot for firm hold.
+    Starts from the current finger angle. Contact = the pad contact sensor
+    reads >= ``min_force``, or the finger stalls (lags its command by more
+    than ``stall_rad``). After contact the target goes ``overshoot_rad``
+    further so the drive keeps pressing. Defaults: robot.yaml
+    gripper.adaptive_close.
 
-    Returns (final_angle, contact_detected, force).
+    Returns (final_target, contact_detected, force).
     """
     import omni.kit.app
     from isaacsim.core.utils.types import ArticulationAction
 
-    current_angle = 0.0
-    contact_detected = False
-    contact_force = 0.0
+    cfg = ROBOT_CFG.gripper["adaptive_close"]
+    min_force = cfg["min_force"] if min_force is None else min_force
+    step_rad = cfg["step_rad"] if step_rad is None else step_rad
+    max_steps = cfg["max_steps"] if max_steps is None else max_steps
+    overshoot_rad = cfg["overshoot_rad"] if overshoot_rad is None else overshoot_rad
+    stall_rad = cfg.get("stall_rad", GRASP_CONFIRM_RAD)
 
+    STATE.pad_hold = None
+    target = _finger_angle()
+    contact, force, reason = False, 0.0, ""
     for step in range(max_steps):
-        current_angle += step_rad
-        if current_angle > ROBOTIQ_MAX_RAD:
-            current_angle = ROBOTIQ_MAX_RAD
-
-        targets = STATE.robot.get_joint_positions()
-        targets = set_finger_joints(
-            STATE.robot, STATE.dof_names, current_angle, targets)
+        target = min(target + step_rad, ROBOTIQ_MAX_RAD)
+        targets = set_finger_joints(STATE.robot, STATE.dof_names, target)
         STATE.robot.apply_action(ArticulationAction(joint_positions=targets))
-
-        # Let physics settle (4 frames per step)
         for _ in range(4):
             await omni.kit.app.get_app().next_update_async()
-
-        in_contact, force_mag = _read_contact_sensor()
-        if in_contact and force_mag >= min_force:
-            contact_detected = True
-            contact_force = force_mag
-            print(f"  [ADAPTIVE] Contact at step {step+1}, "
-                  f"angle={current_angle:.3f} rad, force={force_mag:.2f}N")
+        touching, force = _read_contact_sensor()
+        stalled = target - _finger_angle() > stall_rad
+        if (touching and force >= min_force) or stalled:
+            contact = True
+            reason = "sensor" if touching and force >= min_force else "stall"
+            print(f"  [ADAPTIVE] contact ({reason}) at step {step + 1}: "
+                  f"target={target:.3f} actual={_finger_angle():.3f} rad, force={force:.2f} N")
+            break
+        if target >= ROBOTIQ_MAX_RAD:
+            print("  [ADAPTIVE] fully closed without contact")
             break
 
-        if current_angle >= ROBOTIQ_MAX_RAD:
-            print(f"  [ADAPTIVE] Max angle reached without contact")
-            break
-
-    # Apply overshoot for firm hold
-    if contact_detected:
-        firm_angle = min(current_angle + overshoot_rad, ROBOTIQ_MAX_RAD)
-        targets = STATE.robot.get_joint_positions()
-        targets = set_finger_joints(
-            STATE.robot, STATE.dof_names, firm_angle, targets)
-        STATE.robot.apply_action(ArticulationAction(joint_positions=targets))
-        for _ in range(60):
-            await omni.kit.app.get_app().next_update_async()
-        current_angle = firm_angle
-        _, contact_force = _read_contact_sensor()
-        print(f"  [ADAPTIVE] Firm hold at {firm_angle:.3f} rad, "
-              f"force={contact_force:.2f}N")
-
-    return current_angle, contact_detected, contact_force
+    if contact:
+        STATE.pad_hold = _finger_angle()     # pads now follow the measured finger
+        target = min(target + overshoot_rad, ROBOTIQ_MAX_RAD)
+        for _ in range(30):   # re-send so the pads follow the finger as it squeezes
+            targets = set_finger_joints(STATE.robot, STATE.dof_names, target)
+            STATE.robot.apply_action(ArticulationAction(joint_positions=targets))
+            for _ in range(2):
+                await omni.kit.app.get_app().next_update_async()
+        _, force = _read_contact_sensor()
+        print(f"  [ADAPTIVE] holding: target={target:.3f} actual={_finger_angle():.3f} rad "
+              f"(pad gap {ROBOT_CFG.gap_for_finger(_finger_angle())*1000:.0f} mm), force={force:.2f} N")
+    return target, contact, force
 
 
 async def _pick_close(params):
-    """Close the gripper and confirm the part is grasped.
+    """Close the gripper and check that a part is actually held.
 
-    Two modes:
-      - Adaptive (sensor available): incremental close with contact feedback
-      - Preset (no sensor): fixed angle with retry loop
+    Adaptive close (pad contact sensor or finger stall) by default; with
+    ``finger_close`` in the payload, a fixed close to that angle instead.
+    ``grasp_confirmed`` comes from _verify_grasp: true only if something
+    stops the fingers short of their command — never assumed.
 
     Returns a wrist camera image so the caller can run VLM verification
     that the part is properly held before requesting retract.
@@ -4359,85 +4390,39 @@ async def _pick_close(params):
     import omni.kit.app
     from isaacsim.core.utils.types import ArticulationAction
 
-    finger_close = params.get("finger_close", FINGER_CLOSE)
-    GRASP_CONFIRM_THRESHOLD = 0.05  # rad
-
     STATE.is_executing = True
     try:
-        grasp_confirmed = False
-        actual_finger = 0.0
-        grip_attempt = 0
-        adaptive_used = False
-
-        # ── Adaptive mode: contact sensor driven ─────────────
-        if STATE.contact_sensor is not None:
-            adaptive_used = True
-            print(f"  [CLOSE] Adaptive mode (contact sensor)")
-            final_angle, contact_ok, force = await _adaptive_close()
-            actual_finger = final_angle
-            grasp_confirmed = contact_ok
-            finger_close = final_angle
-            grip_attempt = 1
-
-            if not contact_ok:
-                # Fallback: close to preset angle
-                print(f"  [CLOSE] No contact detected — "
-                      f"falling back to preset {FINGER_CLOSE:.3f}")
-                finger_close = FINGER_CLOSE
-                targets = STATE.robot.get_joint_positions()
-                targets = set_finger_joints(
-                    STATE.robot, STATE.dof_names, finger_close, targets)
-                STATE.robot.apply_action(
-                    ArticulationAction(joint_positions=targets))
-                for _ in range(120):
-                    await omni.kit.app.get_app().next_update_async()
-                actual_finger = finger_close
-                grasp_confirmed = True  # assume preset works
-
-        # ── Preset mode: fixed angle with retries ────────────
+        if params.get("finger_close") is None:
+            print("  [CLOSE] adaptive")
+            target, contact, force = await _adaptive_close()
+            mode = "adaptive"
         else:
-            for grip_attempt in range(1, 4):
-                print(f"  [CLOSE] attempt {grip_attempt}/3  target={finger_close:.3f}")
-                targets = STATE.robot.get_joint_positions()
-                targets = set_finger_joints(
-                    STATE.robot, STATE.dof_names, finger_close, targets)
-                STATE.robot.apply_action(ArticulationAction(joint_positions=targets))
+            target = float(params["finger_close"])
+            print(f"  [CLOSE] fixed target={target:.3f} rad")
+            targets = set_finger_joints(STATE.robot, STATE.dof_names, target)
+            STATE.robot.apply_action(ArticulationAction(joint_positions=targets))
+            for _ in range(120):
+                await omni.kit.app.get_app().next_update_async()
+            mode = "fixed"
 
-                settle = 120 if grip_attempt == 1 else 180
-                for _ in range(settle):
-                    await omni.kit.app.get_app().next_update_async()
-
-                actual_joints = STATE.robot.get_joint_positions()
-                for idx, name in enumerate(STATE.dof_names):
-                    if name == GRIPPER_DRIVE_JOINT:
-                        actual_finger = float(actual_joints[idx])
-                        break
-
-                print(f"  [CLOSE] actual={actual_finger:.4f}  "
-                      f"threshold={GRASP_CONFIRM_THRESHOLD}")
-
-                if actual_finger >= GRASP_CONFIRM_THRESHOLD:
-                    grasp_confirmed = True
-                    print(f"  [CLOSE] ✓ Grasp confirmed (attempt {grip_attempt})")
-                    break
-                print(f"  [CLOSE] ✗ Retrying...")
-
-        grip_hold = finger_close
         grasp_check = await _verify_grasp()
+        confirmed = grasp_check["is_grasping"]
+        print(f"  [CLOSE] {'held' if confirmed else 'NOTHING HELD'}: finger "
+              f"{grasp_check['finger_pos']:.3f} / target {target:.3f} rad, "
+              f"pad gap {grasp_check['pad_gap_m']*1000:.0f} mm, "
+              f"force {grasp_check['contact_force']:.1f} N")
 
-        # Capture wrist image for "is part properly grasped?" VLM check
         wrist_frame = await _capture_camera("wrist")
-        wrist_b64 = wrist_frame.get("image_base64")
-
         return {"status": "ok", "action": "pick_close",
-                "grasp_confirmed": grasp_confirmed,
-                "finger_close": finger_close,
-                "actual_finger": round(actual_finger, 4),
-                "grip_hold": grip_hold,
-                "attempts": grip_attempt,
-                "adaptive": adaptive_used,
+                "grasp_confirmed": confirmed,
+                "mode": mode,
+                "finger_close": target,
+                "actual_finger": round(grasp_check["finger_pos"], 4),
+                "pad_gap_m": round(grasp_check["pad_gap_m"], 4),
+                "contact_force": grasp_check["contact_force"],
+                "grip_hold": target,
                 "grasp_check": grasp_check,
-                "wrist_image": wrist_b64}
+                "wrist_image": wrist_frame.get("image_base64")}
 
     except Exception as e:
         return {"status": "error", "error": str(e)}
@@ -4481,38 +4466,24 @@ async def _pick_retract(params):
         for _ in range(90):  # extra 90 frames (~1.5s) to let fingers fully seat
             await omni.kit.app.get_app().next_update_async()
 
-        # Retract to safe height — SINGLE IK (NOT Cartesian).
-        # Cartesian micro-stepping was tried here but it preserved the
-        # grasp-pose's folded joint configuration during the climb,
-        # producing the weird elbow-over-bin retract. A fresh IK from
-        # current joints lets the solver pick a clean upward
-        # configuration. The grip is re-enforced before AND after each
-        # IK call so finger force is preserved across the jumps.
-        print(f"  [RETRACT] Single-IK lift to safe_z={safe_pos[2]:.3f}")
-        retract_warm = _get_warm_start()
-        retract_action, retract_ok = ik_solve(safe_pos, locked_ori, retract_warm)
-        if retract_ok:
-            await _apply_interpolated(
-                apply_arm_joints(STATE.robot, STATE.dof_names,
-                                 STATE.arm_names, retract_action),
-                finger_value=grip_hold)
-        steps.append({"phase": "retract",
-                       "status": "ok" if retract_ok else "failed"})
-        if not retract_ok:
-            return {"error": f"IK failed for retract safe {safe_pos.tolist()}",
-                    "steps": steps}
-
-        # Transit to clear-height — also single IK with grip re-enforced.
-        print(f"  [RETRACT] Single-IK transit to z={transit_pos[2]:.3f}")
-        transit_warm = _get_warm_start()
-        transit_action, transit_ok = ik_solve(transit_pos, locked_ori, transit_warm)
-        if transit_ok:
-            await _apply_interpolated(
-                apply_arm_joints(STATE.robot, STATE.dof_names,
-                                 STATE.arm_names, transit_action),
-                finger_value=grip_hold)
-        steps.append({"phase": "transit_safe",
-                       "status": "ok" if transit_ok else "skipped"})
+        # Lift straight up out of the bin (ik_step micro-steps, grip held).
+        # A planned path is collision-free but not vertical, and a sideways
+        # sweep while the part is still between its neighbours drags it out
+        # of the fingers. The XY is the current TCP's, so nothing shifts.
+        tcp_now = get_tcp_pos()
+        for phase, z_goal in (("retract", safe_pos[2]), ("transit_safe", transit_pos[2])):
+            print(f"  [RETRACT] straight lift to z={z_goal:.3f}")
+            ok = await _retract_cartesian_up(
+                z_goal, float(tcp_now[0]), float(tcp_now[1]), locked_ori,
+                finger_value=grip_hold, step_size=0.02, stream_frames=6)
+            steps.append({"phase": phase, "status": "ok" if ok else "failed"})
+            if not ok:
+                return {"error": f"straight lift failed below z={z_goal:.3f}",
+                        "steps": steps}
+        grasp_check = await _verify_grasp()
+        steps.append({"phase": "hold_check",
+                      "status": "ok" if grasp_check["is_grasping"] else "lost",
+                      "finger_pos": grasp_check["finger_pos"]})
 
         return {"status": "completed", "action": "pick_retract",
                 "position": [x, y, z], "steps": steps,
@@ -5006,6 +4977,9 @@ async def start_bridge():
     stream = timeline.get_timeline_event_stream()
     _timeline_sub = stream.create_subscription_to_pop(_on_timeline_event)
     print("[OK] Timeline subscription active — bridge will auto-stop on sim stop")
+
+    # ── Gripper drives for the unactuated finger joints ─────
+    _apply_gripper_gains()
 
     # ── Contact Sensors ──────────────────────────────────────    
     from isaacsim.sensors.experimental.physics import ContactSensor

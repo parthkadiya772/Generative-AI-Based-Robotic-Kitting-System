@@ -123,7 +123,44 @@ Every step ends with a **live check** in Isaac Sim, run through the MCP tools an
     - The place "arm config reset" was a Lula warm-start trick and just re-solves the same pose with cuMotion; revisit.
   - Do not save the live stage over `AIKIDO_ur10e_swapped.usd`: its root layer holds simulation state and the bridge's runtime contact sensors.
 
-## Step 6: Gripper re-tune
+## Step 6: Gripper re-tune 🟡 in progress (paused 2026-10-12)
+- **Done:**
+  - **Parallel pads.** The asset leaves the inner finger and pad joints unactuated (inner k = 0.002, pad k = 0), so the pads flopped, depended on history, and re-opened only to 122 mm. The bridge now gives them drives at start (`gripper.joint_gains`).
+    - Modes: inner = `mirror` (−pad angle), pad = `pad` (+pad angle).
+    - While holding a part, the pad angle follows the measured finger angle (`STATE.pad_hold`).
+    - Pads parallel within 0.3°; re-open repeatable at 143.8 mm.
+  - `gripper.width_table` re-measured with parallel pads: `[finger rad, pad gap m, pad-face centre depth m]`. Loader has `gap_for_finger()` / `finger_for_gap()` (linear fallback for UR10). Bridge mappings use them.
+  - `finger_joint` torque capped at 10 N·m (`joint_gains`, about 40 N per pad, `force_limit`). The asset's 1000 N·m was unrealistic.
+  - **Contact sensor fixed.** The bridge called `get_current_frame()`, which does not exist in Isaac 6.1's experimental ContactSensor, so it always read 0. It now uses `get_data()`.
+  - Adaptive close:
+    - starts from the current angle
+    - contact = sensor ≥ `min_force` or finger stall (`stall_rad`)
+    - squeezes `overshoot_rad` past contact
+    - parameters come from `robot.yaml`
+  - `_verify_grasp`: held = sensor force ≥ `min_force` or stalled, and not fully closed. `pick_close` no longer reports "confirmed" by assumption.
+  - `pick_retract`: straight vertical lift with `ik_step` (grip held), then a hold check. A planned, non-vertical path dragged the part out of the fingers.
+  - Live pick test script: `generative_kitting/tools/pick_test.sh X Y TOP_Z [GRASP_LIFT]`.
+- **Results:**
+
+  | Part | Result |
+  |---|---|
+  | `large_gear_1` (95 mm, 42 mm tall, 0.15 kg) | Picks and lifts reliably. Contact (sensor) at 0.319 rad, hold 48 N, hold check after lift OK. Run: `pick_test.sh -1.5206 -0.7157 0.8345` |
+  | `motor_valve_1` (0.33 kg) | Not solved. Grip confirmed (up to 40 N), but the valve slips out during the lift. |
+
+- **Motor valve notes:**
+  - The flat band across the pads is only z 0.807–0.831 (about 102 mm wide; centre x −0.580, y −0.717 at spawn). Above and below it the valve is narrower or rounded.
+  - The valve is yawed about 4° and tilted about 4.6°, so the pads meet the rectangular flange at corners or edges (point contact, little friction torque) and it pivots out.
+  - The last attempt (`pick_test.sh -0.5804 -0.717 0.8655 -0.0465`): contact at a 133 mm pad gap, 40 N, lost on lift. The pads probably touch something wider than the band at that height. Check which links and vertices touch.
+- **Resume here (next session):**
+  1. Valve: measure contacts at the last attempt (which pad vertices, at what height). Try `grasp_lift` so the pads straddle only the 0.807–0.831 band.
+  2. Add grasp yaw: `pick_descend` and `pick_retract` lock `_tool_down()`. Add an optional `yaw` (or orientation) parameter so the pads can align to the part (from perception). Retry the valve with yaw ≈ part yaw.
+  3. Check that pad force is right across the stroke. With the parallel-pad drives, the force at near-open angles was much lower (6–9 N) than mid-stroke (48 N). Measure pad force against finger angle at the 10 N·m cap; raise the cap if needed. Real 2F-140: 20–125 N.
+  4. Third part size. The scene has only gears and valves (no small tube). Use a second gear orientation or add a small part.
+  5. Re-run the gear test as a regression check, then commit and mark Step 6 done. Stale `close_min` / `close_max` / `close` values (0.55 / 0.69 / 0.5 rad) should be re-checked against the new width_table (`close` = 57 mm gap).
+- **How to start a session:**
+  - Open `UR10e_Container_Assets/AIKIDO_ur10e_swapped.usd` in Isaac Sim 6.1. Enable the isaac-sim MCP extension (port 8766; `python_server` stays on 8226).
+  - In the Script Editor: `exec(open(".../generative_kitting/kitting_bridge_server.py").read())`. The bridge plays the timeline; Stop resets the scene and shuts the bridge down.
+  - Do not save the live stage: its root layer collects simulation state and runtime contact sensors.
 - **`set_finger_joints`:** rewrite it for the new drive layout. The outer finger joints are now driven (k=2000); the inner fingers are springs.
 - The inner finger joints are weak springs (k=0.002), so `zero` mode barely holds them; measured about −0.34 rad when closed.
 - With the gripper pointing down, `open` (0.0) only reached 0.054 rad (gap 123 mm instead of 141 mm).
