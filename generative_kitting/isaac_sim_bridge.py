@@ -1846,7 +1846,7 @@ def _robot_base_matrix():
         stage.GetPrimAtPath(ROBOT_ROOT_PATH)), dtype=np.float64).T
 
 
-def ik_step(pos, ori, warm=None, max_joint_jump=0.5, iterations=60):
+def ik_step(pos, ori, warm=None, max_joint_jump=0.5, iterations=60, fixed_joints=()):
     """Differential IK to a TCP pose for short Cartesian moves. Returns ``(action, ok)``.
 
     Unlike ``ik_solve`` this does not plan. Damped least squares on
@@ -1856,7 +1856,8 @@ def ik_step(pos, ori, warm=None, max_joint_jump=0.5, iterations=60):
     if it does not converge or any joint moves more than
     ``max_joint_jump`` rad. Not collision-checked: use it for the short
     straight-line moves (descent, retract, lateral slide) whose start pose
-    was reached by a planned move.
+    was reached by a planned move. ``fixed_joints``: cspace indices held
+    at their ``warm`` value (e.g. ``(0,)`` to keep the gantry).
     """
     if not STATE.cumotion_ready:
         return None, False
@@ -1883,6 +1884,7 @@ def ik_step(pos, ori, warm=None, max_joint_jump=0.5, iterations=60):
         if np.linalg.norm(dp) < 1e-4 and np.linalg.norm(dw) < 1e-3:
             break
         jac = np.array(kin.jacobian(q, CUMOTION_TOOL_FRAME))
+        jac[:, list(fixed_joints)] = 0.0
         err = np.concatenate([dp, dw])
         dq = jac.T @ np.linalg.solve(jac @ jac.T + damping * np.eye(6), err)
         q = np.clip(q + dq, lo, hi)
@@ -2358,7 +2360,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
     def _handle_home(self):
         STATE.push_command({"action": "move_home"})
-        self._send_json(STATE.pop_result(timeout=15))
+        self._send_json(STATE.pop_result(timeout=120))
 
     def _handle_gripper(self, body):
         action = body.get("action", "open")
@@ -2368,7 +2370,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
     def _handle_approach(self, body):
         """Move near a target XYZ using a cuMotion-planned trajectory."""
         STATE.push_command({"action": "approach", "params": body})
-        self._send_json(STATE.pop_result(timeout=30))
+        self._send_json(STATE.pop_result(timeout=180))
 
     def _handle_realign_gantry(self, body):
         """Slide gantry to target X while holding ee_link in place.
@@ -2383,17 +2385,17 @@ class BridgeHandler(BaseHTTPRequestHandler):
         """
         STATE.push_command({"action": "realign_gantry_hold_ee",
                             "params": body})
-        self._send_json(STATE.pop_result(timeout=30))
+        self._send_json(STATE.pop_result(timeout=120))
 
     def _handle_pick(self, body):
         """Full pick sequence at XYZ."""
         STATE.push_command({"action": "pick_object_ik", "params": body})
-        self._send_json(STATE.pop_result(timeout=60))
+        self._send_json(STATE.pop_result(timeout=300))
 
     def _handle_pick_descend(self, body):
         """Descend to grasp with open fingers, return wrist image."""
         STATE.push_command({"action": "pick_descend", "params": body})
-        self._send_json(STATE.pop_result(timeout=60))
+        self._send_json(STATE.pop_result(timeout=180))
 
     def _handle_pick_close(self, body):
         """Close gripper and confirm grasp, return wrist image."""
@@ -2403,12 +2405,12 @@ class BridgeHandler(BaseHTTPRequestHandler):
     def _handle_pick_retract(self, body):
         """Retract with grasped part."""
         STATE.push_command({"action": "pick_retract", "params": body})
-        self._send_json(STATE.pop_result(timeout=60))
+        self._send_json(STATE.pop_result(timeout=180))
 
     def _handle_place(self, body):
         """Full place sequence at XYZ."""
         STATE.push_command({"action": "place_object_ik", "params": body})
-        self._send_json(STATE.pop_result(timeout=60))
+        self._send_json(STATE.pop_result(timeout=300))
 
     def _handle_project(self, body):
         """Project normalised image coords to world XYZ via depth."""
@@ -3135,8 +3137,14 @@ async def _move_home():
                 targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, action)
                 await _apply_interpolated(targets, settle_frames=SETTLE_FRAMES)
 
-    # Interpolate to home position to prevent self-collision
-    await _apply_interpolated(home_all, settle_frames=SETTLE_FRAMES)
+    # Planned joint-space path to home; blind interpolation only without cuMotion
+    if STATE.ik_ready:
+        traj = _plan_cspace(np.array(HOME_JOINTS[:7], dtype=np.float64))
+        if traj is None:
+            return {"error": "no collision-free path to home"}
+        await _execute_trajectory(traj, finger_value=FINGER_OPEN)
+    else:
+        await _apply_interpolated(home_all, settle_frames=SETTLE_FRAMES)
     return {"status": "ok", "action": "move_home",
             "joint_positions": STATE.robot.get_joint_positions().tolist()}
 
@@ -3867,42 +3875,55 @@ async def _move_gantry_x(target_x, finger_hold=None, hold_ee_pos=None):
     # simultaneously.  X,Y are locked tight; Z has slight flexibility
     # so IK has room to find valid solutions.
     if hold_ee_pos is not None and STATE.ik_ready and abs(gantry_delta) > 0.005:
-        # The gantry is joint 0 of the XRDF cspace, so ONE pose plan
-        # covers "slide the rail while the tool stays put" — cuMotion
-        # coordinates gantry and arm itself. The old code had to predict
-        # the base pose per step and re-solve because Lula treated the
-        # gantry as an external base shift.
+        # Slide the gantry in small steps; at each step re-solve the arm with
+        # the gantry locked so the TCP stays on hold_ee_pos the whole way.
         ee_lock = np.array(hold_ee_pos, dtype=np.float64)
         locked_ori = _tool_down()
-        print(f"  [GANTRY] EE-hold slide: {gantry_current:.3f} → "
-              f"{gantry_target:.3f}, holding EE at "
+        print(f"  [GANTRY] TCP-hold slide: {gantry_current:.3f} → "
+              f"{gantry_target:.3f}, holding TCP at "
               f"({ee_lock[0]:.3f}, {ee_lock[1]:.3f}, {ee_lock[2]:.3f})")
-
-        q_goal = _current_cspace().copy()
-        q_goal[0] = gantry_target          # cspace joint 0 == gantry
-        traj = _plan_cspace(q_goal)
-        if traj is not None:
-            await _execute_trajectory(traj, finger_value=finger_hold)
-        else:
-            print("  [GANTRY] plan failed — falling back to direct joint move")
-            targets = STATE.robot.get_joint_positions().copy()
-            targets[gantry_idx] = gantry_target
+        n_steps = max(2, int(np.ceil(abs(gantry_delta) / 0.02)))
+        q = _current_cspace()
+        reached = gantry_current
+        for i in range(1, n_steps + 1):
+            seed = q.copy()
+            seed[0] = gantry_current + gantry_delta * i / n_steps
+            q_next, ok = ik_step(ee_lock, locked_ori, seed, fixed_joints=(0,))
+            if not ok:
+                print(f"  [GANTRY] arm cannot hold the TCP past gantry={reached:.3f} — stopping")
+                break
+            q, reached = q_next, float(seed[0])
+            step_targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, q)
             if finger_hold is not None:
-                targets = set_finger_joints(
-                    STATE.robot, STATE.dof_names, finger_hold, targets)
-            STATE.robot.apply_action(ArticulationAction(joint_positions=targets))
-            for _ in range(SETTLE_FRAMES):
+                step_targets = set_finger_joints(STATE.robot, STATE.dof_names, finger_hold, step_targets)
+            STATE.robot.apply_action(ArticulationAction(joint_positions=step_targets))
+            for _ in range(STREAM_FRAMES):
                 await omni.kit.app.get_app().next_update_async()
+        for _ in range(SETTLE_FRAMES):
+            await omni.kit.app.get_app().next_update_async()
 
         ee_final = get_tcp_pos()
         drift_xy = np.linalg.norm(ee_final[:2] - ee_lock[:2])
         drift_z = abs(ee_final[2] - ee_lock[2])
-        print(f"  [GANTRY] EE-hold done. EE=({ee_final[0]:.3f}, {ee_final[1]:.3f}, {ee_final[2]:.3f}) "
-              f"XY-drift={drift_xy:.4f}m  Z-drift={drift_z:.4f}m")
-        return {"status": "ok", "gantry_x": float(gantry_target),
-                "ee_drift_xy": float(drift_xy), "ee_drift_z": float(drift_z)}
+        print(f"  [GANTRY] TCP-hold done at gantry={reached:.3f}. TCP=({ee_final[0]:.3f}, "
+              f"{ee_final[1]:.3f}, {ee_final[2]:.3f}) XY-drift={drift_xy:.4f}m  Z-drift={drift_z:.4f}m")
+        result = {"status": "ok", "gantry_x": reached,
+                  "ee_drift_xy": float(drift_xy), "ee_drift_z": float(drift_z)}
+        if abs(reached - gantry_target) > 1e-3:
+            result["status"] = "partial"
+            result["gantry_target"] = float(gantry_target)
+        return result
 
-    # ── Simple mode: just move gantry without arm compensation ──
+    # ── Simple mode: the arm rides along (TCP moves with the gantry) ──
+    if STATE.ik_ready and abs(gantry_delta) > 0.005:
+        q_goal = _current_cspace().copy()
+        q_goal[0] = gantry_target          # cspace joint 0 == gantry
+        traj = _plan_cspace(q_goal)
+        if traj is None:
+            return {"error": f"no collision-free gantry slide to {gantry_target:.3f}"}
+        await _execute_trajectory(traj, finger_value=finger_hold)
+        return {"status": "ok", "gantry_x": float(gantry_target)}
+
     targets[gantry_idx] = gantry_target
     if finger_hold is not None:
         targets = set_finger_joints(STATE.robot, STATE.dof_names, finger_hold, targets)
@@ -4471,13 +4492,10 @@ async def _pick_retract(params):
         retract_warm = _get_warm_start()
         retract_action, retract_ok = ik_solve(safe_pos, locked_ori, retract_warm)
         if retract_ok:
-            targets = apply_arm_joints(STATE.robot, STATE.dof_names,
-                                       STATE.arm_names, retract_action)
-            targets = set_finger_joints(STATE.robot, STATE.dof_names,
-                                        grip_hold, targets)
-            STATE.robot.apply_action(ArticulationAction(joint_positions=targets))
-            for _ in range(150):
-                await omni.kit.app.get_app().next_update_async()
+            await _apply_interpolated(
+                apply_arm_joints(STATE.robot, STATE.dof_names,
+                                 STATE.arm_names, retract_action),
+                finger_value=grip_hold)
         steps.append({"phase": "retract",
                        "status": "ok" if retract_ok else "failed"})
         if not retract_ok:
@@ -4489,13 +4507,10 @@ async def _pick_retract(params):
         transit_warm = _get_warm_start()
         transit_action, transit_ok = ik_solve(transit_pos, locked_ori, transit_warm)
         if transit_ok:
-            targets = apply_arm_joints(STATE.robot, STATE.dof_names,
-                                       STATE.arm_names, transit_action)
-            targets = set_finger_joints(STATE.robot, STATE.dof_names,
-                                        grip_hold, targets)
-            STATE.robot.apply_action(ArticulationAction(joint_positions=targets))
-            for _ in range(120):
-                await omni.kit.app.get_app().next_update_async()
+            await _apply_interpolated(
+                apply_arm_joints(STATE.robot, STATE.dof_names,
+                                 STATE.arm_names, transit_action),
+                finger_value=grip_hold)
         steps.append({"phase": "transit_safe",
                        "status": "ok" if transit_ok else "skipped"})
 
@@ -4629,11 +4644,9 @@ async def _place_object_ik(params):
         transit_up_warm = _get_warm_start()
         transit_up_action, transit_up_ok = ik_solve(transit_up_pos, locked_ori, transit_up_warm)
         if transit_up_ok:
-            targets = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, transit_up_action)
-            targets = set_finger_joints(STATE.robot, STATE.dof_names, grip_hold, targets)
-            STATE.robot.apply_action(ArticulationAction(joint_positions=targets))
-            for _ in range(150):
-                await omni.kit.app.get_app().next_update_async()
+            await _apply_interpolated(
+                apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, transit_up_action),
+                finger_value=grip_hold)
         steps.append({"phase": "transit_up", "status": "ok" if transit_up_ok else "warn"})
 
         # 2. Move gantry to destination X — simple mode (no hold_ee_pos).
@@ -4663,15 +4676,10 @@ async def _place_object_ik(params):
             reset_warm = _get_home_warm_start()
             reset_action, reset_ok = ik_solve(reset_pos, locked_ori, reset_warm)
             if reset_ok:
-                targets = apply_arm_joints(
-                    STATE.robot, STATE.dof_names, STATE.arm_names,
-                    reset_action)
-                targets = set_finger_joints(
-                    STATE.robot, STATE.dof_names, grip_hold, targets)
-                STATE.robot.apply_action(
-                    ArticulationAction(joint_positions=targets))
-                for _ in range(90):  # ~1.5 s settle
-                    await omni.kit.app.get_app().next_update_async()
+                await _apply_interpolated(
+                    apply_arm_joints(STATE.robot, STATE.dof_names,
+                                     STATE.arm_names, reset_action),
+                    finger_value=grip_hold)
                 print(f"  [PLACE] Arm config reset to home-bias at "
                       f"({reset_pos[0]:.3f}, {reset_pos[1]:.3f}, "
                       f"{reset_pos[2]:.3f})")

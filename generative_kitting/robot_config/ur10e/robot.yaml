@@ -43,7 +43,8 @@ gantry:
   x_offset: 1.27
   limits: [-3.10, 0.0]
 
-home_joints: null   # null = capture from stage at startup
+# tool down, TCP (-0.05, -0.30, 1.08) between rack and tray; not singular
+home_joints: [-1.32, 2.037, -1.762, -2.533, -1.989, -1.105, 1.571]
 
 tcp:
   offset: 0.189     # robotiq_base_link -> pad centre along +Z, at ~55 mm grasp

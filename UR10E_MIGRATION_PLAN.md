@@ -110,18 +110,18 @@ Every step ends with a **live check** in Isaac Sim, run through the MCP tools an
     - approach 1.1 mm off target, tool vertical
     - descent stopped 0.4 mm from target z, 1.3 mm XY drift
     - close + retract lifted the gear 0.33 m; transit TCP within 1 mm
-- **Open items:**
-  - The Step 3 tool-down joint pose `[g, 0, −π/2, π/2, −π/2, −π, 0]` is a wrist singularity: vertical TCP motion is lost. Never start Cartesian moves from it. `home_joints: null` captures the straight-arm spawn pose; set a non-singular tool-down home in `robot.yaml`.
-  - `_move_gantry_x(hold_ee_pos=...)` slides only the gantry; the arm does not compensate (used by `realign_gantry` and place).
-  - The single-goal moves in retract/place (`ik_solve` followed by `apply_action`) jump to the goal joints and drop the planned collision-free path. Execute the trajectory instead.
-  - The editor's 786 sphere prims are still on the stage (visual only, unsaved root layer) and are visible to the cameras. Clear them in the editor and do not save them into the USD.
-  - The pad contact sensor did not fire on the gear (Step 6). The open fingertips reach only 19 mm below the TCP, so with `grasp_lift = 0` the grip is a top-edge grip (Step 6 / workflow grasp depth).
-  - `/api/scene_parts` returns broken bboxes for the motor valves (~117 m).
-  - The 30 s HTTP timeout on `/api/approach` is short for planned moves.
-- **One TCP convention:** targets are always the TCP. A single function converts TCP to tool frame, and feedback reads the same frame. This fixes B2 (TCP offset added twice) and B3 (`ee_link` vs TCP mixing).
-- **B4:** `zp` is undefined in `_pick_descend`.
-- Re-check the pick/place height maths: approach, descent, transit and drop heights.
-- **Check:** step-by-step live run. Move to approach, then descend with contact stop: the fingertips should stop at the expected height above a known part. Then retract and transit.
+- **Open items, resolved 2026-10-12:**
+  - ✅ Home: `robot.yaml home_joints` is a non-singular tool-down pose, TCP (−0.05, −0.30, 1.08), between rack and tray. Smallest singular value 0.23 (the Step 3 pose: 0.00014), 26 cm from the scene. `/api/home` follows a planned cspace path: from spawn through the camera world in 18 s. A straight 20 cm descent and slide from home are accurate to 1–2 mm. Never start Cartesian moves from the Step 3 pose; it is a wrist singularity.
+  - ✅ `_move_gantry_x(hold_ee_pos)` steps the gantry and re-solves the arm with the gantry locked (`ik_step(fixed_joints=(0,))`). `realign_gantry`: 0.35 m slide, 1.1 mm TCP drift. A plain gantry slide uses a planned cspace path.
+  - ✅ Retract/transit/place moves go through `_apply_interpolated`, so they follow the planned trajectory instead of jumping to the goal joints.
+  - ✅ Editor sphere prims removed from the stage via the editor's own clear (re-import `AIKIDO.editor.xrdf` to edit again).
+  - ✅ Wrong `extent` attributes (mm values, 1000× too big) fixed in 8 asset files (`UR10e_Container_Assets/SubUSDs/{floor,robot_facade_full,motor_valve,box_table,box_840,pallet,gantry,vagn}.usd`). USD bboxes (`scene_parts`, bin/tray lookups) are correct again.
+  - ✅ HTTP timeouts for planned motion endpoints raised (home 120 s, approach 180 s, pick/place 180–300 s).
+  - Remaining for Step 6:
+    - The pad contact sensor did not fire on the gear.
+    - Grasp depth: the open fingertips reach only 19 mm below the TCP.
+    - The place "arm config reset" was a Lula warm-start trick and just re-solves the same pose with cuMotion; revisit.
+  - Do not save the live stage over `AIKIDO_ur10e_swapped.usd`: its root layer holds simulation state and the bridge's runtime contact sensors.
 
 ## Step 6: Gripper re-tune
 - **`set_finger_joints`:** rewrite it for the new drive layout. The outer finger joints are now driven (k=2000); the inner fingers are springs.
