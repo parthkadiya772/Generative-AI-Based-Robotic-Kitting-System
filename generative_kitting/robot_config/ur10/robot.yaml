@@ -1,0 +1,99 @@
+# UR10 + Robotiq 2F-140 on ceiling gantry (legacy, frozen)
+
+robot:
+  name: ur10_2f140_gantry
+  arm: ur10
+  gripper: robotiq_2f140
+  stage: ${PROJECT_ROOT}/AIKIDO.usd
+
+articulation:
+  root: /World/gantry
+  num_dof: 15
+
+# relative to articulation.root
+prims:
+  arm_base: gantry_home/ur10_flattened/ur10_instanceable/base_link
+  ee: gantry_home/ur10_flattened/ur10_instanceable/ee_link
+  tool: gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/robotiq_base_link
+  gripper_root: gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit
+
+joints:
+  gantry: gantry_vagn_joint
+  arm:
+    - shoulder_pan_joint
+    - shoulder_lift_joint
+    - elbow_joint
+    - wrist_1_joint
+    - wrist_2_joint
+    - wrist_3_joint
+  gripper_drive: finger_joint
+  # drive = set to finger target, zero = hold at 0, free = leave alone
+  gripper_modes:
+    finger_joint: drive
+    right_outer_knuckle_joint: drive
+    left_outer_finger_joint: free
+    right_outer_finger_joint: free
+    left_inner_finger_joint: zero
+    right_inner_finger_joint: zero
+    left_inner_finger_pad_joint: free
+    right_inner_finger_pad_joint: free
+
+gantry:
+  x_offset: 1.27
+  limits: [-3.10, 0.0]
+
+home_joints: null   # null = capture from stage at startup
+
+tcp:
+  offset: 0.19357
+  frame: tool
+
+orientation:
+  tool_down: [1.0, 0.0, 1.0, 0.0]
+  scan: [0.5, 0.5, 0.5, -0.5]
+
+gripper:
+  stroke: 0.140
+  body_width: 0.160
+  force_limit: 40.0
+  finger:
+    open: 0.0
+    close: 0.5
+    close_min: 0.55
+    close_max: 0.69
+    max_rad: 0.695
+  grip_overshoot: 0.060
+  entry_clearance: 0.020
+  grasp_confirm_rad: 0.05
+  adaptive_close:
+    min_force: 0.5
+    step_rad: 0.02
+    max_steps: 30
+    overshoot_rad: 0.04
+  contact_sensor: gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/left_inner_finger/Fingertip_01/Fingertip/Contact_Sensor
+  finger_links:
+    - gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/left_inner_finger
+    - gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/right_inner_finger
+    - gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/left_outer_finger
+    - gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/right_outer_finger
+    - gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/robotiq_base_link
+
+# absolute paths: camera is not under the articulation root
+wrist_camera:
+  root: /World/rsd555
+  depth: /World/rsd555/Depth
+  rgb: /World/rsd555/Camera_OmniVision_OV9782_Color
+  imu: /World/rsd555/Imu_Sensor
+  mount_link: gantry_home/ur10_flattened/ur10_instanceable/ee_link
+  self_filter_radius: 0.10
+  ee_offset_xy: [0.0, 0.0]
+
+cumotion:
+  urdf: AIKIDO.urdf
+  xrdf: AIKIDO.xrdf
+  root_link: gantry
+  tool_frame: robotiq_base_link
+  max_vel: [0.5, 1.5, 1.5, 1.5, 2.0, 2.0, 2.0]
+  max_acc: [1.0, 2.0, 2.0, 2.0, 2.5, 2.5, 2.5]
+  # old XRDF sphere keys are already prim paths
+  link_prims: {}
