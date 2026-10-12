@@ -21,11 +21,11 @@ Every step ends with a **live check** in Isaac Sim, run through the MCP tools an
 
 ---
 
-## Step 0: Baseline
+## Step 0: Baseline ✅ done (commit dad5b16)
 - The working tree has many uncommitted changes, including `isaac_sim_bridge.py`, `config.yaml` and `robot_controller.py`. Commit them, or snapshot them, on a branch (e.g. `ur10e-migration`) so each later step is one reviewable diff.
 - **Check:** `git status` is clean on the new branch.
 
-## Step 1: Define `robot.yaml` and its loader
+## Step 1: Define `robot.yaml` and its loader ✅ done (commit f4516cd)
 - **Schema** (proposed sections):
   - `robot`: name, stage USD path
   - `articulation`: root prim, DOF count
@@ -45,6 +45,7 @@ Every step ends with a **live check** in Isaac Sim, run through the MCP tools an
 - **Check:** unit tests for the loader. Every prim path in `ur10e/robot.yaml` must resolve on the live stage (one MCP script).
 
 ## Step 2: Bridge reads `robot.yaml`, plus fix B1
+- Import the loader as `generative_kitting.utils.robot_config`, with the repo root on `sys.path`. Inside Isaac, a bare `utils` resolves to OpenCV's `cv2/utils`.
 - Replace the hard-coded constants in `isaac_sim_bridge.py` (L135–186 and L1447–1473) with loader values. The module-level names stay, so the ~20 call sites don't change in this step.
 - Remove the robot keys from `config.yaml` that are now unused, or make them point at `robot.yaml`.
 - **B1:** the gantry joint lookup compares the full prim path with the short DOF name, so it never matches. Fix it to use the short joint name from the YAML.
