@@ -70,6 +70,12 @@ Every step ends with a **live check** in Isaac Sim, run through the MCP tools an
 - **Progress:**
   - Self-collision check: 0 pairs at the spawn pose (jointed links are skipped by PhysX).
   - URDF exported. The exporter had a bug: nested links dumped their meshes into the parent link. Patched locally in Isaac, `isaacsim.asset.exporter.urdf/.../converter/link_reader.py` (`it.PruneChildren()`, backup `.orig`).
+  - XRDF editor cannot select the articulation's own top link (`gantry`, the whole portal frame). Patched locally: `isaacsim.robot_setup.xrdf_editor/.../sphere_generation.py` (backup `.orig`).
+  - `gantry ↔ vagn` is in the editor's auto ignore list (joint-connected), so the sliding vagn never self-collides with the frame. Because the frame is a robot link, the self-filter removes it from the depth data, so nvblox never puts it in the ESDF.
+  - The editor needs a fresh Play; a stale physics view leaves its panels empty. Fix: Stop → Play, then select the articulation.
+  - Exporter mimic bug: it copied PhysX `gearing` straight into the URDF multiplier, but PhysX means `q + gearing·q_ref + offset = 0`. Patched in `joint_reader.py` (multiplier = −gearing; backup `.orig`).
+  - XRDF editor writes default positions for continuous joints (inner fingers), and cuMotion's loader then fails with "bad optional access". Patched `xrdf_io.py` and `editor_state.py` to skip them (backups `.orig`). Also set `finger_joint` default to 0, because −0.0005 from the sim is outside its limits.
+  - Export the URDF only while no editor spheres are on the stage; otherwise they are exported as visuals. Editing editor files hot-reloads it, which drops its spheres. Restore them with Import XRDF.
   - Re-export into an **empty** folder. The exporter suffixes mesh names instead of overwriting them.
   - The gantry rail has no physics collider (user chose to skip it). The URDF has no velocity limits; check this at cuMotion init.
 - **Sphere keys:** the XRDF uses URDF link names. The self-filter maps link names to prims through `robot.yaml`, which removes the old USD-path key problem (B5).
