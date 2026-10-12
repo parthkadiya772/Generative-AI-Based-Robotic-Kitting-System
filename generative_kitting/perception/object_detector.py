@@ -81,7 +81,7 @@ class ZeroShotDetector:
         self._available = None
 
         mode = "remote" if self.detector_url else "local"
-        log.info(
+        log.debug(
             f"ZeroShotDetector init: mode={mode}, model={self.model_name}, "
             f"confidence={self.confidence_threshold}"
         )

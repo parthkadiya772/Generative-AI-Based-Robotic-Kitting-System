@@ -69,18 +69,17 @@ simulation:
 
 # ─── Perception (VLM) ───────────────────────────────────────
 perception:
-  # Gemma4 is the default for both perception and orchestration so a
-  # single small model covers the whole pipeline. Override via the
-  # Streamlit dropdown if you want Qwen-VL's higher recall on dense
-  # scenes.
-  vlm_provider: "ollama_gemma"        # Active provider (overridden by UI model selection)
-  vlm_model: "gemma4:e4b"             # Active model  (overridden by UI model selection)
-  vlm_base_url: "${OLLAMA_BASE_URL}"   # Active endpoint
+  # Qwen3-VL-8B-Instruct is the unified foundation model for both
+  # zero-shot semantic recognition and native visual grounding (bounding boxes).
+  vlm_provider: "vllm"         # Active provider (overridden by UI model selection)
+  vlm_model: "Qwen/Qwen3-VL"   # Active model  (overridden by UI model selection)
+  vlm_base_url: "${VLLM_BASE_URL}"   # Active endpoint
   max_retries: 2
   temperature: 0.0                    # Low temperature for deterministic perception
   confidence_threshold: 0.5           # Reject objects below this confidence
   vlm_num_ctx: 32768                  # Larger context for catalogue + image tokens
   vlm_num_predict: 8192               # Give the VLM headroom to finish JSON
+  use_unified_vlm_grounding: true     # Use Qwen3-VL native 2D bounding boxes
 
   # ── Available VLM Models (shown as dropdown in Streamlit UI) ──
   vlm_models:
@@ -88,11 +87,6 @@ perception:
     - name: "Gemma4 2B"
       provider: "ollama_gemma"
       model: "gemma4:e2b"
-      base_url: "${OLLAMA_BASE_URL}"
-
-    - name: "Gemma4 4B"
-      provider: "ollama_gemma"
-      model: "gemma4:e4b"
       base_url: "${OLLAMA_BASE_URL}"
 
     # vLLM serves models under their HuggingFace repo id — this must
@@ -103,21 +97,14 @@ perception:
       model: "Qwen/Qwen3-VL"
       base_url: "${VLLM_BASE_URL}"
 
-  # ── Zero-Shot Detector (precise bounding boxes — replaces VLM coord guesses) ──
+  # ── Zero-Shot Detector (Optional fallback if VLM lacks native bboxes) ──
   # detector_url: "${DETECTOR_BASE_URL}"  # set DETECTOR_BASE_URL in .env to use a remote detector
   detector_model: "owlv2"              # "owlv2" (lightweight) or "grounding_dino" (more accurate)
   detector_confidence: 0.15            # minimum detection confidence
   detector_device: "cpu"               # "cpu" or "cuda" (set to cuda if you have a local GPU)
 
-  # When true, drop any VLM-detected object that did NOT get a
-  # matching detector bbox. Without a bbox, depth projection runs
-  # on the VLM's guessed image_position which is unreliable (off
-  # by 5-15%, sometimes hallucinated entirely) and can send the
-  # robot to a divider wall. Bbox-confirmed detections are far
-  # safer because they require BOTH the VLM (correct label) AND
-  # the detector (correct location) to agree.
-  # Set false ONLY if you trust the VLM's image_position alone.
-  require_detector_bbox: true
+  # With Qwen3-VL native visual grounding, detector bbox requirement is false by default.
+  require_detector_bbox: false
 
   # ── Detector safety net (OWL-ViT2 / Grounding DINO path only) ──
   # Run OWL-ViT2 with the FULL parts_catalogue.yaml detector_queries on
@@ -200,9 +187,16 @@ perception:
   # overrides both when it fires; this is the fallback for any
   # detection that USD-snap rejects (no matching prim within
   # snap_radius) — and the path the system will take once on a real
-  # robot where USD ground truth is unavailable.
-  wrist_xy_refinement_informational_only: false
-
+  # ── Direct Telekinesis Pick & Place Execution ──
+  # When direct_cumotion_pick is true (default), the pipeline uses the direct
+  # 3D point-cloud and cuMotion trajectory pipeline: overhead VLM detects target ->
+  # 3D point cloud supplies world coordinates -> cuMotion executes pick & place.
+  # Skips redundant multi-pass wrist VLM re-queries that stall execution.
+  direct_cumotion_pick: true
+  verify_and_realign_with_wrist: false
+  close_range_rescan_xy: false
+  wrist_rescan_before_grasp: false
+  wrist_xy_refinement_informational_only: true
 
   # ── Realignment frame: gripper-over-part vs camera-over-part ──
   # The wrist projection returns the part's WORLD XY (already
@@ -304,19 +298,22 @@ orchestration:
   # only the messages differ (perception sends images, planning sends
   # text only). Switch the dropdown in the Streamlit UI to pick a
   # different planner without restarting.
-  llm_provider: "ollama_gemma"        # Active provider (overridden by UI model selection)
-  llm_model: "gemma4:e4b"             # Active model  (overridden by UI model selection)
+  llm_provider: "vllm"                # Active provider (overridden by UI model selection)
+  llm_model: "Qwen/Qwen3-VL"          # Active model  (overridden by UI model selection)
   llm_api_key_env: "OPENAI_API_KEY"
-  llm_base_url: "${OLLAMA_BASE_URL}"   # Active endpoint
+  llm_base_url: "${VLLM_BASE_URL}"    # Active endpoint
   max_retries: 3
   temperature: 0.0                    # Zero temperature for deterministic planning
   max_tokens: 4096
   max_plan_steps: 50                  # Reject plans with more steps (hallucination guard)
 
   # ── Available LLM Models (shown as dropdown in Streamlit UI) ──
-  # Gemma4 is the default planner. Llama-3.1 is retained as a
-  # fallback in case Gemma struggles on a particular command shape.
   llm_models:
+
+    - name: "Qwen3-VL (vLLM)"
+      provider: "vllm"
+      model: "Qwen/Qwen3-VL"
+      base_url: "${VLLM_BASE_URL}"
 
     - name: "Gemma4 2B"
       provider: "ollama_gemma"
@@ -327,14 +324,6 @@ orchestration:
       provider: "ollama_gemma"
       model: "gemma4:e4b"
       base_url: "${OLLAMA_BASE_URL}"
-
-    # vLLM serves models under their HuggingFace repo id — this must
-    # match the --model / --served-model-name the server was started
-    # with, or the request 404s with "model not found".
-    - name: "Qwen3-VL (vLLM)"
-      provider: "vllm"
-      model: "Qwen/Qwen3-VL"
-      base_url: "${VLLM_BASE_URL}"
 
 # ─── Execution ───────────────────────────────────────────────
 execution:

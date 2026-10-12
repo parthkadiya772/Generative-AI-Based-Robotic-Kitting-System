@@ -214,13 +214,15 @@ Useful for testing perception + planning end-to-end on a fixed scene.
      # Linux / macOS
      export KITTING_PROJECT_ROOT="$HOME/code/robot_in_air"
      ```
-   - **Edit-one-line approach**: open
-     `generative_kitting/kitting_bridge_server.py` and set the
-     `PROJECT_ROOT` constant near the top of the file to your repo's
-     absolute path. This is needed because Isaac Sim's Script Editor
-     copies scripts to a Temp folder before running them, so
-     `__file__` inside the launcher does **not** point at the
-     original file.
+   - **.env approach**: set `KITTING_PROJECT_ROOT=/absolute/path/to/robot_in_air`
+     in `.env` at the repo root (copy `.env.example` if you haven't
+     already). `kitting_bridge_server.py` walks up from your home
+     directory looking for a `.env` containing this key and loads it
+     automatically — useful when you can't export env vars in the
+     shell that launches Isaac Sim (e.g. launching it from a desktop
+     icon). This is needed because Isaac Sim's Script Editor copies
+     scripts to a Temp folder before running them, so `__file__`
+     inside the launcher does **not** point at the original file.
 3. In Isaac Sim open **Script Editor** (`Window → Script Editor`),
    open `generative_kitting/kitting_bridge_server.py`, and click
    **Run**.

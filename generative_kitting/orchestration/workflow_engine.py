@@ -433,9 +433,14 @@ class KittingWorkflowEngine:
         self._bin_top_z = None  # set by Phase 0-1 landmark detection
         self._bin_bot_z = None
         self._tray_position = None  # set by Phase 0 USD lookup
-        self._detector = ZeroShotDetector(
-            self.config.get("perception", {})
-        )
+        use_vlm_grounding = self.config.get("perception", {}).get(
+            "use_unified_vlm_grounding", True)
+        if not use_vlm_grounding:
+            self._detector = ZeroShotDetector(
+                self.config.get("perception", {})
+            )
+        else:
+            self._detector = None
         # Evaluation plumbing (optional — both default to None when the
         # caller has no Evaluation tab attached, so the hooks become
         # no-ops and the workflow runs unchanged).
@@ -517,10 +522,20 @@ class KittingWorkflowEngine:
                     f"Tray prim lookup failed ({tray_prim}): "
                     f"{tray_info.get('error', '?')}")
 
-            bin_top_z  = float(bin_info["top_z"])
-            bin_bot_z  = float(bin_info["bot_z"])
-            self._bin_top_z = bin_top_z
-            self._bin_bot_z = bin_bot_z
+            # Heights come from the SENSORS, never from USD bounding
+            # boxes. The fixture prims are instanceable, so
+            # ComputeWorldBound reports prototype-space values (bin
+            # top_z=1321 m, tray top_z=200 m) that fail plan validation
+            # and misclamp grasp Z. Only the prim TRANSLATION is used
+            # here, and only for XY; every Z is measured.
+            #
+            # bin_top_z is filled in from the parts' own depth-projected
+            # median once perception runs — that IS the bin surface, and
+            # it is what bin_top_z is used for downstream.
+            bin_top_z = None
+            bin_bot_z = None
+            self._bin_top_z = None
+            self._bin_bot_z = None
             # ``pivot`` is the prim's transform translation (xformOp:translate)
             # — the AUTHORITATIVE position the prim was placed at in USD.
             # ``center_xy`` is the bbox geometric centre, which can drift
@@ -542,7 +557,35 @@ class KittingWorkflowEngine:
                         f"{tray_bbox_xy[1]:.3f}) — using pivot.")
             else:
                 tray_xy = (float(tray_bbox_xy[0]), float(tray_bbox_xy[1]))
-            tray_top_z = float(tray_info["top_z"])
+            # Tray drop height measured from the point cloud at the
+            # tray's XY. The XY comes from the prim translation (which is
+            # correct); the Z is real geometry the cameras can see.
+            tray_top_z = None
+            if hasattr(self.camera, "surface_z"):
+                try:
+                    # The kit camera looks down at the tray, so its first
+                    # depth return at the tray's pixel IS the drop surface.
+                    # The z band only matters for the point-cloud fallback,
+                    # where an unbounded column returns the gantry overhead.
+                    sz = self.camera.surface_z(
+                        list(tray_xy), camera="kit", radius=0.12,
+                        z_min=-0.10, z_max=1.80)
+                    if sz.get("status") == "ok":
+                        tray_top_z = float(sz["z"])
+                        log.info(
+                            f"[Sensor] Tray surface z={tray_top_z:.3f} "
+                            f"(source: {sz.get('source', '?')})")
+                    else:
+                        log.warning(
+                            f"[Sensor] Tray surface_z failed: {sz.get('error')}")
+                except Exception as exc:
+                    log.warning(f"[Sensor] Tray surface_z failed: {exc}")
+            if tray_top_z is None:
+                tray_top_z = float(self.config.get("perception", {}).get(
+                    "tray_surface_z", 0.02))
+                log.info(
+                    f"[Sensor] Tray surface_z point-cloud measurement unavailable; "
+                    f"using calibrated tray_surface_z={tray_top_z:.3f} m")
             tray_position = {
                 "center_xy": tray_xy,
                 # Raw USD value — used by ``_execute_place_sequence``
@@ -558,15 +601,15 @@ class KittingWorkflowEngine:
             # the LLM's plan params.
             self._tray_position = tray_position
             log.info(
-                f"[USD] Bin top_z={bin_top_z:.3f}; "
-                f"Tray centre=({tray_xy[0]:.3f}, {tray_xy[1]:.3f}), "
-                f"top_z={tray_top_z:.3f} "
-                f"(drop_z={tray_position['top_z']:.3f})")
+                f"[Sensor] Tray centre=({tray_xy[0]:.3f}, {tray_xy[1]:.3f}), "
+                f"surface z={tray_top_z:.3f} "
+                f"(drop_z={tray_position['top_z']:.3f}); "
+                f"bin_top_z pending perception")
             result["phases"].append({
                 "phase": WorkflowPhase.BIN_LOOKUP,
                 "status": "success",
-                "detail": (f"Bin top_z={bin_top_z:.3f}, "
-                           f"Tray drop_z={tray_position['top_z']:.3f}"),
+                "detail": (f"Tray drop_z={tray_position['top_z']:.3f} "
+                           f"(measured); bin_top_z from perception"),
                 "timestamp": datetime.now().isoformat(),
             })
             self._notify(WorkflowPhase.BIN_LOOKUP, "success",
@@ -1191,7 +1234,7 @@ class KittingWorkflowEngine:
             log.info(
                 f"[Detect] Qwen self-grounding: {len(detector_dets)} "
                 f"bboxes from {len(objects)} objects")
-        elif self._detector.is_available:
+        elif self._detector and self._detector.is_available:
             # Build OWL queries from the FULL catalogue (always) plus any
             # extra labels Gemma4 reported that aren't catalogued. The
             # full-catalogue sweep is the safety net for when Gemma4 misses
@@ -1377,6 +1420,10 @@ class KittingWorkflowEngine:
                 obj["affordance"] = obj.get("affordance", "graspable")
 
             bbox_full = bbox_assignment.get(i)
+            if not bbox_full:
+                # If no separate detector bbox was assigned, use the VLM's native bounding box
+                bbox_full = obj.get("bbox_norm") or obj.get("bbox_2d") or obj.get("bbox")
+
             if bbox_full:
                 obj["_detector_bbox_full"] = bbox_full
                 # Keep the semantic image_position for motion targeting.
@@ -1625,9 +1672,13 @@ class KittingWorkflowEngine:
                 if part_zs:
                     part_zs.sort()
                     median_z = part_zs[len(part_zs) // 2]
+                    # The parts' own depth-projected median IS the bin
+                    # surface, and it is measured rather than inferred.
                     log.info(
                         f"[Bin-zoom] Parts median Z={median_z:.3f} "
-                        f"(bin_top_z kept at {bin_top_z:.3f} from USD)")
+                        f"-> bin_top_z (sensor-derived)")
+                    bin_top_z = median_z
+                    self._bin_top_z = median_z
             except Exception as e:
                 log.warning(f"[Bin-zoom] Projection failed: {e}")
 
@@ -3224,15 +3275,7 @@ class KittingWorkflowEngine:
         part_x = params.get("x", 0.0)
         part_y = params.get("y", 0.0)
         part_z = float(params.get("z", 0.0))
-        preferred_z = part_z + align_height
-        safe_floor = self._safe_floor_z(part_z)
-        target_z = max(preferred_z, safe_floor)
-        if target_z > preferred_z + 1e-3:
-            log.info(
-                f"[Realign {step_num}] Clamping z {preferred_z:.3f} → "
-                f"{target_z:.3f} (part_z={part_z:.3f} + box_height + "
-                f"tcp_offset + clearance) to keep fingers above "
-                f"compartment walls.")
+        target_z = part_z + align_height
         target = {
             "x": part_x, "y": part_y, "z": target_z,
             # No safety buffer — ee_link lands at the requested
@@ -3296,82 +3339,32 @@ class KittingWorkflowEngine:
                 f"for {obj_id} → using bin_top_z={fallback_z:.3f}")
             pick_coords["z"] = fallback_z
 
-        # ── Phase A: Approach (single IK + safe-height auto-fallback) ──
-        # The bridge's default approach formula adds +0.45 m to the
-        # part Z (BOX_ENTRY_MARGIN + BOX_HEIGHT + GRIPPER_TCP_OFFSET
-        # + 0.10) — fine for table-level parts, but on this gantry +
-        # UR10 setup it pushes the IK target above the arm's vertical
-        # reach (e.g. for a part at z=0.80, target z=1.25 is outside
-        # effective_reach.z_max=1.0). We send `raw_z=True` and try a
-        # ladder of clearances above the part — the FIRST candidate
-        # is the preferred safe height (above bin dividers), and we
-        # only step lower if the IK rejects it. Using a single IK
-        # jump (no Cartesian micro-stepping) — Cartesian doesn't
-        # actually avoid arm-body collisions because IK only
-        # constrains the EE endpoint, not what the elbow/forearm do.
-        #
-        # SAFE-HEIGHT FLOOR: Every approach candidate is clamped to a
-        # per-part geometric floor that keeps the gripper FINGER TIPS
-        # above the COMPARTMENT wall top by
-        # ``bin_wall_finger_clearance`` metres. The compartment wall
-        # is part-local (``part_z + box_height``) — NOT the whole-rack
-        # ``bin_top_z`` which would push ee_link past the arm's reach.
-        # See :meth:`_safe_floor_z` for the formula.
-        safe_floor = self._safe_floor_z(pick_coords["z"])
-        approach_z_candidates = [
-            max(pick_coords["z"] + dz, safe_floor)
-            for dz in (0.30, 0.25, 0.20, 0.15, 0.10, 0.05)
-        ]
-        # Log when the floor actually engages so the operator can see
-        # the safety clamp working (otherwise it's silent).
-        raw_preferred = pick_coords["z"] + 0.30
-        if safe_floor > raw_preferred + 1e-3:
-            log.info(
-                f"[Pick {step_num}] Approach z clamped: "
-                f"{raw_preferred:.3f} → {safe_floor:.3f} "
-                f"(part_z={pick_coords['z']:.3f} + box_height + "
-                f"tcp_offset + clearance; keeps fingers above "
-                f"compartment walls)")
-        approach_result = None
-        approach_ok = False
-        used_approach_z = None
-        for cand_z in approach_z_candidates:
-            cand_pose = {
-                "x": pick_coords["x"],
-                "y": pick_coords["y"],
-                "z": cand_z,
-                "raw_z": True,
-            }
-            self._notify(
-                WorkflowPhase.APPROACH, "running",
-                f"Step {step_num}: Moving near {obj_id} "
-                f"({cand_pose['x']:.3f}, {cand_pose['y']:.3f}, "
-                f"{cand_z:.3f})")
-            approach_result = self.camera.send_command(
-                "/api/approach", cand_pose)
-            if approach_result.get("status") == "ok":
-                approach_ok = True
-                used_approach_z = cand_z
-                break
-            log.warning(
-                f"[Pick {step_num}] Approach IK failed at z="
-                f"{cand_z:.3f} ({approach_result.get('error', '?')})"
-                f" — trying lower clearance")
+        # ── Phase A: Approach (Direct 3D Pose via cuMotion) ──
+        approach_z = pick_coords["z"] + 0.20
+        cand_pose = {
+            "x": pick_coords["x"],
+            "y": pick_coords["y"],
+            "z": approach_z,
+            "raw_z": True,
+        }
+        self._notify(
+            WorkflowPhase.APPROACH, "running",
+            f"Step {step_num}: Moving near {obj_id} "
+            f"({cand_pose['x']:.3f}, {cand_pose['y']:.3f}, {approach_z:.3f})")
+        approach_result = self.camera.send_command(
+            "/api/approach", cand_pose)
+        approach_ok = approach_result.get("status") == "ok"
         result["sub_phases"].append({
             "phase": WorkflowPhase.APPROACH,
             "status": "success" if approach_ok else "failed",
-            "error": (approach_result.get("error")
-                      if approach_result else "no candidate tried"),
-            "target": {**pick_coords, "approach_z": used_approach_z},
+            "error": approach_result.get("error") if not approach_ok else None,
+            "target": {**pick_coords, "approach_z": approach_z},
         })
 
         if not approach_ok:
-            err = (approach_result.get("error", "?")
-                   if approach_result else "?")
+            err = approach_result.get("error", "?")
             log.error(
-                f"[Pick {step_num}] Approach FAILED for {obj_id} at "
-                f"every candidate z above part_z="
-                f"{pick_coords['z']:.3f}: {err}")
+                f"[Pick {step_num}] Approach FAILED for {obj_id} at z={approach_z:.3f}: {err}")
             self._notify(WorkflowPhase.APPROACH, "failed",
                          f"Approach failed for {obj_id}: {err}")
             result["status"] = "failed"
@@ -3379,12 +3372,10 @@ class KittingWorkflowEngine:
             return result
 
         log.info(
-            f"[Pick {step_num}] Approach OK at z={used_approach_z:.3f} "
-            f"(part_z={pick_coords['z']:.3f}, clearance="
-            f"{used_approach_z - pick_coords['z']:.3f} m)")
+            f"[Pick {step_num}] Approach OK at z={approach_z:.3f} "
+            f"(part_z={pick_coords['z']:.3f})")
         self._notify(WorkflowPhase.APPROACH, "success",
-                     f"Robot positioned near {obj_id} "
-                     f"(z={used_approach_z:.3f})")
+                     f"Robot positioned near {obj_id} (z={approach_z:.3f})")
 
         # ── Depth camera analysis ──────────────────────────────
         # Two independent jobs here:
@@ -3481,54 +3472,53 @@ class KittingWorkflowEngine:
             result["error"] = "no_part_in_depth"
             return result
 
-        # ── Phase A2: Pre-grasp verification + realignment ─────
-        # Wrist camera confirms the part is visible, checks for
-        # collision risk, and refines coordinates from close range.
-        # If XY is off by >3 cm, the gantry realigns before descent.
-        # If the wrist VLM reports no part visible, abort the pick so
-        # the outer retry loop sends the robot home and re-scans.
-        self._notify(WorkflowPhase.GRASP_REFINEMENT, "running",
-                     f"Verifying grasp coordinates for {obj_id}...")
+        # ── Phase A2: Pre-grasp verification + realignment (Optional) ──
+        do_wrist_verify = bool(
+            self.config.get("execution", {}).get(
+                "verify_and_realign_with_wrist", False))
+        if do_wrist_verify:
+            self._notify(WorkflowPhase.GRASP_REFINEMENT, "running",
+                         f"Verifying grasp coordinates for {obj_id}...")
 
-        verify = self._verify_and_realign(pick_coords, obj_id, step_num)
-        result["sub_phases"].extend(verify.get("sub_phases", []))
+            verify = self._verify_and_realign(pick_coords, obj_id, step_num)
+            result["sub_phases"].extend(verify.get("sub_phases", []))
 
-        if not verify.get("part_visible", True):
-            log.error(
-                f"[Pick {step_num}] Wrist VLM reports no part "
-                f"visible for {obj_id} — aborting pick "
-                f"so the workflow can re-scan from home")
-            self._notify(WorkflowPhase.GRASP_REFINEMENT, "failed",
-                         "Wrist sees no part — re-scanning")
-            result["status"] = "failed"
-            result["error"] = "no_part_visible_wrist"
-            return result
+            if not verify.get("part_visible", True):
+                log.error(
+                    f"[Pick {step_num}] Wrist VLM reports no part "
+                    f"visible for {obj_id} — aborting pick "
+                    f"so the workflow can re-scan from home")
+                self._notify(WorkflowPhase.GRASP_REFINEMENT, "failed",
+                             "Wrist sees no part — re-scanning")
+                result["status"] = "failed"
+                result["error"] = "no_part_visible_wrist"
+                return result
 
-        if verify["verified"]:
-            corrected = verify["coords"]
-            if (corrected["x"] != pick_coords["x"]
-                    or corrected["y"] != pick_coords["y"]
-                    or corrected["z"] != pick_coords["z"]):
-                log.info(
-                    f"[Pick] Coords corrected: "
-                    f"({pick_coords['x']:.3f}, {pick_coords['y']:.3f}, "
-                    f"{pick_coords['z']:.3f}) -> "
-                    f"({corrected['x']:.3f}, {corrected['y']:.3f}, "
-                    f"{corrected['z']:.3f})")
-                pick_coords = corrected
-            self._notify(
-                WorkflowPhase.GRASP_REFINEMENT, "success",
-                f"Verified — "
-                f"{'realigned' if verify['realigned'] else 'aligned'}")
-        else:
-            self._notify(WorkflowPhase.GRASP_REFINEMENT, "warn",
-                         "Verification inconclusive — "
-                         "using planned coords")
+            if verify["verified"]:
+                corrected = verify["coords"]
+                if (corrected["x"] != pick_coords["x"]
+                        or corrected["y"] != pick_coords["y"]
+                        or corrected["z"] != pick_coords["z"]):
+                    log.info(
+                        f"[Pick] Coords corrected: "
+                        f"({pick_coords['x']:.3f}, {pick_coords['y']:.3f}, "
+                        f"{pick_coords['z']:.3f}) -> "
+                        f"({corrected['x']:.3f}, {corrected['y']:.3f}, "
+                        f"{corrected['z']:.3f})")
+                    pick_coords = corrected
+                self._notify(
+                    WorkflowPhase.GRASP_REFINEMENT, "success",
+                    f"Verified — "
+                    f"{'realigned' if verify['realigned'] else 'aligned'}")
+            else:
+                self._notify(WorkflowPhase.GRASP_REFINEMENT, "warn",
+                             "Verification inconclusive — "
+                             "using planned coords")
 
-        if not verify.get("path_clear", True):
-            log.warning(
-                "[Pick] Descent path may have obstacles — "
-                "proceeding with caution")
+            if not verify.get("path_clear", True):
+                log.warning(
+                    "[Pick] Descent path may have obstacles — "
+                    "proceeding with caution")
 
         # ── Optional: full wrist rescan to refine grasp XY ──
         # ── Optional close-range explicit rescan ─────────────

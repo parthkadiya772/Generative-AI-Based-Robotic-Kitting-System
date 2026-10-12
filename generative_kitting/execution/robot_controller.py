@@ -422,6 +422,8 @@ class RobotController:
             else self.robot.get_joint_positions()
         )
         for idx, name in enumerate(self.dof_names):
+            if "outer_finger_joint" in name:
+                continue  # passive spring joint in the USD — leave its target alone
             if "inner_finger_joint" in name:
                 targets[idx] = -value
             elif "finger_joint" in name or "knuckle_joint" in name:
@@ -792,7 +794,7 @@ class RobotController:
             grasp_detected = False
 
             for idx, name in enumerate(self.dof_names):
-                if "finger_joint" in name and "inner_finger" not in name:
+                if name == "finger_joint":
                     actual = joint_positions[idx]
                     # If finger didn't reach full close, it's contacting an object
                     if actual < self.finger_close - 0.05:

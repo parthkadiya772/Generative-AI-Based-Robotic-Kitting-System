@@ -291,6 +291,31 @@ class BridgeCameraInterface:
         """
         return self.capture_workspace_image(cam_type="kit")
 
+    def surface_z(self, xy: list, camera: str = None,
+                  radius: float = 0.10, percentile: float = 90,
+                  z_min: float = None, z_max: float = None) -> dict:
+        """World Z of the surface at an XY, measured from the point cloud.
+
+        Replaces USD bounding boxes for planning heights. The fixture
+        prims are instanceable, so ComputeWorldBound returns
+        prototype-space values (bin top_z=1321 m, tray top_z=200 m).
+
+        Pass ``camera`` ("rgb" for the bin, "kit" for the tray) to read
+        the height straight from that camera's depth buffer — a
+        downward view's first return at the pixel IS the surface. Without
+        it the merged 4-camera cloud is used, which needs a z band to
+        avoid returning the gantry overhead.
+        """
+        return self.send_command(
+            "/api/surface_z",
+            {"xy": list(xy[:2]),
+             **({} if camera is None else {"camera": camera}),
+             "radius": float(radius),
+             "percentile": float(percentile),
+             **({} if z_min is None else {"z_min": float(z_min)}),
+             **({} if z_max is None else {"z_max": float(z_max)})},
+            timeout=180)
+
     def build_collision_world(self, exclude_points: list = None,
                               carve_radius: float = None,
                               voxel_size: float = None) -> dict:
@@ -317,6 +342,29 @@ class BridgeCameraInterface:
         if voxel_size:
             payload["voxel_size"] = float(voxel_size)
         return self.send_command("/api/build_collision_world", payload,
+                                 timeout=180)
+
+    def build_static_world(self, voxel_size: float = None) -> dict:
+        """Capture the STATIC cell structure once, from a parked pose.
+
+        Move the robot out of the 4 corner cameras' view first (gantry to
+        one end, arm folded clear) — this is a one-time-per-setup call,
+        not part of the per-pick loop. The result is cached on the bridge
+        (and to disk) and reused by every subsequent
+        ``build_collision_world`` call, so the gantry rail / rack / floor
+        / walls no longer need to be re-derived — and re-self-filtered
+        against the moving arm — on every scan cycle.
+
+        Parameters
+        ----------
+        voxel_size : float
+            Downsample grid in metres (bridge default 0.03 — coarser than
+            the dynamic layer since static structure needs less fidelity).
+        """
+        payload = {}
+        if voxel_size:
+            payload["voxel_size"] = float(voxel_size)
+        return self.send_command("/api/build_static_world", payload,
                                  timeout=180)
 
     def add_wrist_obstacles(self, grasp_xy: list,

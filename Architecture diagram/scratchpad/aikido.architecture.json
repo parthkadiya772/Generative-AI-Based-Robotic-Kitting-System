@@ -1,0 +1,421 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "AIKIDO Generative Kitting — Runtime Architecture",
+    "quality_profile": "showcase",
+    "viewBox": [
+      1340,
+      480
+    ],
+    "repository": {
+      "url": "https://github.com/parthkadiya772/Generative-AI-Based-Robotic-Kitting-System",
+      "revision": "59e7e3c2c0f25983a9cf845f0ab6da8c81a6729a"
+    },
+    "views": [
+      {
+        "id": "kitting-loop",
+        "label": "Primary kitting loop",
+        "focus": [
+          "ui",
+          "engine",
+          "vlm",
+          "planner",
+          "guard",
+          "bridge",
+          "simqueue",
+          "cumotion",
+          "stage"
+        ],
+        "note": "One operator command travels through perception, planning, validation and motion, then closes back through the wrist camera."
+      },
+      {
+        "id": "grounding",
+        "label": "Perception grounding",
+        "focus": [
+          "models",
+          "vlm",
+          "engine",
+          "stage"
+        ],
+        "note": "Part coordinates come only from wrist RGB-D and depth projection, never from USD prim transforms."
+      },
+      {
+        "id": "motion",
+        "label": "Motion and collision",
+        "focus": [
+          "simqueue",
+          "cumotion",
+          "stage"
+        ],
+        "note": "cuMotion plans against a point-cloud collision world with the robot's own geometry filtered out."
+      },
+      {
+        "id": "trust",
+        "label": "Trust boundary",
+        "focus": [
+          "planner",
+          "guard",
+          "bridge"
+        ],
+        "note": "Model output is whitelisted and bounds-checked before any command reaches the simulator."
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "ui",
+      "type": "frontend",
+      "label": "Operator Console",
+      "sublabel": "Streamlit · command + feed",
+      "pos": [
+        36,
+        165
+      ],
+      "size": [
+        180,
+        72
+      ],
+      "sources": [
+        {
+          "path": "generative_kitting/ui/streamlit_app.py",
+          "label": "streamlit_app.py"
+        }
+      ]
+    },
+    {
+      "id": "engine",
+      "type": "backend",
+      "label": "Workflow Engine",
+      "sublabel": "14-phase kitting loop",
+      "pos": [
+        302,
+        165
+      ],
+      "size": [
+        180,
+        72
+      ],
+      "sources": [
+        {
+          "path": "generative_kitting/orchestration/workflow_engine.py",
+          "label": "workflow_engine.py"
+        }
+      ]
+    },
+    {
+      "id": "vlm",
+      "type": "backend",
+      "label": "VLM Perception",
+      "sublabel": "Qwen3-VL · bbox grounding",
+      "pos": [
+        568,
+        165
+      ],
+      "size": [
+        180,
+        72
+      ],
+      "sources": [
+        {
+          "path": "generative_kitting/perception/vlm_perception.py",
+          "label": "vlm_perception.py"
+        }
+      ]
+    },
+    {
+      "id": "planner",
+      "type": "backend",
+      "label": "LLM Task Planner",
+      "sublabel": "atomic pick/place plan",
+      "pos": [
+        834,
+        165
+      ],
+      "size": [
+        180,
+        72
+      ],
+      "sources": [
+        {
+          "path": "generative_kitting/orchestration/llm_planner.py",
+          "label": "llm_planner.py"
+        }
+      ]
+    },
+    {
+      "id": "guard",
+      "type": "security",
+      "label": "Plan Validator",
+      "sublabel": "whitelist + workspace bounds",
+      "tag": "plans ≤ 50 steps",
+      "pos": [
+        1100,
+        165
+      ],
+      "size": [
+        180,
+        72
+      ],
+      "sources": [
+        {
+          "path": "generative_kitting/orchestration/validators.py",
+          "label": "validators.py"
+        },
+        {
+          "path": "generative_kitting/execution/safety.py",
+          "label": "safety.py"
+        }
+      ]
+    },
+    {
+      "id": "models",
+      "type": "external",
+      "label": "Model Endpoints",
+      "sublabel": "Ollama :11434 · vLLM · OpenAI",
+      "pos": [
+        701,
+        16
+      ],
+      "size": [
+        180,
+        72
+      ]
+    },
+    {
+      "id": "bridge",
+      "type": "backend",
+      "label": "Isaac Sim Bridge",
+      "sublabel": "HTTPServer :8600 · REST",
+      "tag": "localhost only",
+      "pos": [
+        1100,
+        370
+      ],
+      "size": [
+        180,
+        72
+      ],
+      "sources": [
+        {
+          "path": "generative_kitting/isaac_sim_bridge.py",
+          "label": "isaac_sim_bridge.py"
+        }
+      ]
+    },
+    {
+      "id": "simqueue",
+      "type": "messagebus",
+      "label": "Sim Command Queue",
+      "sublabel": "HTTP thread → sim main loop",
+      "pos": [
+        834,
+        370
+      ],
+      "size": [
+        180,
+        72
+      ]
+    },
+    {
+      "id": "cumotion",
+      "type": "backend",
+      "label": "cuMotion Planner",
+      "sublabel": "GPU trajectory · sphere world",
+      "pos": [
+        568,
+        370
+      ],
+      "size": [
+        180,
+        72
+      ],
+      "sources": [
+        {
+          "path": "generative_kitting/robot_control_cumotion.py",
+          "label": "robot_control_cumotion.py"
+        }
+      ]
+    },
+    {
+      "id": "stage",
+      "type": "cloud",
+      "label": "Isaac Sim Stage",
+      "sublabel": "UR10 on gantry · wrist camera",
+      "tag": "7-DOF inverted",
+      "pos": [
+        302,
+        370
+      ],
+      "size": [
+        180,
+        72
+      ],
+      "sources": [
+        {
+          "path": "AIKIDO.usd",
+          "label": "AIKIDO.usd"
+        }
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "Operator host — Python .aikido venv",
+      "wraps": [
+        "ui",
+        "engine",
+        "vlm",
+        "planner",
+        "guard"
+      ]
+    },
+    {
+      "kind": "region",
+      "label": "NVIDIA Isaac Sim 6.0.1 process — GPU",
+      "wraps": [
+        "bridge",
+        "simqueue",
+        "cumotion",
+        "stage"
+      ]
+    },
+    {
+      "kind": "security-group",
+      "label": "Deterministic control sandbox",
+      "wraps": [
+        "planner",
+        "guard"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "operator-command",
+      "from": "ui",
+      "to": "engine",
+      "label": "task command",
+      "variant": "emphasis"
+    },
+    {
+      "id": "wrist-frame",
+      "from": "engine",
+      "to": "vlm",
+      "label": "wrist RGB",
+      "variant": "emphasis"
+    },
+    {
+      "id": "grounded-parts",
+      "from": "vlm",
+      "to": "planner",
+      "label": "parts + XYZ",
+      "variant": "emphasis"
+    },
+    {
+      "id": "plan-json",
+      "from": "planner",
+      "to": "guard",
+      "label": "plan JSON",
+      "variant": "emphasis"
+    },
+    {
+      "id": "validated-skills",
+      "from": "guard",
+      "to": "bridge",
+      "label": "validated skill calls · HTTP :8600",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [
+        1190,
+        303
+      ]
+    },
+    {
+      "id": "queued-command",
+      "from": "bridge",
+      "to": "simqueue",
+      "label": "queued cmd",
+      "variant": "emphasis"
+    },
+    {
+      "id": "motion-request",
+      "from": "simqueue",
+      "to": "cumotion",
+      "label": "pose goal",
+      "variant": "emphasis"
+    },
+    {
+      "id": "joint-trajectory",
+      "from": "cumotion",
+      "to": "stage",
+      "label": "trajectory",
+      "variant": "emphasis"
+    },
+    {
+      "id": "sensor-feedback",
+      "from": "stage",
+      "to": "engine",
+      "label": "RGB-D + depth projection",
+      "fromSide": "top",
+      "toSide": "bottom",
+      "labelAt": [
+        392,
+        303
+      ]
+    },
+    {
+      "id": "vision-inference",
+      "from": "models",
+      "to": "vlm",
+      "label": "vision completions",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "chat-inference",
+      "from": "models",
+      "to": "planner",
+      "label": "chat completions",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Perception — camera only",
+      "items": [
+        "Qwen3-VL-8B does recognition and 2D grounding in one pass; no separate detector runs in the live path.",
+        "Part XYZ comes from /api/project_to_world depth ray-casting — USD is read only for the static bin and tray."
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Motion — staged skills",
+      "items": [
+        "cuMotion plans transit against GPU spheres from AIKIDO.xrdf; descent is a constrained Cartesian move.",
+        "Corner-camera point clouds build the obstacle world with /World/gantry filtered out, so the arm is not its own obstacle."
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "Isaac Sim boundary",
+      "items": [
+        "The bridge is exec'd in the Isaac Sim Script Editor — it shares the simulator process, not the operator venv.",
+        "Its HTTP thread never touches USD; every mutation is queued and drained by the simulation main loop."
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Trust, state and evidence",
+      "items": [
+        "Only whitelisted actions cross the boundary — never joint angles or torques; plans over 50 steps are truncated.",
+        "kitting.db holds parts and kits; eval.db plus per-session JSONL record perception, pick, place and task events."
+      ]
+    }
+  ]
+}

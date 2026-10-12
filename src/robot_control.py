@@ -255,6 +255,8 @@ def set_finger_joints(robot, dof_names, value, base_targets=None):
     """
     targets = base_targets if base_targets is not None else robot.get_joint_positions()
     for idx, name in enumerate(dof_names):
+        if "outer_finger_joint" in name:
+            continue  # passive spring joint in the USD — leave its target alone
         if "inner_finger_joint" in name:
             # Opposite sign keeps finger pads parallel (clapping)
             targets[idx] = -value
@@ -769,7 +771,7 @@ async def run_perfect_pick():
         final_joints = robot.get_joint_positions()
         print("\n--- FINGER JOINTS AFTER CLOSE ---")
         for idx, name in enumerate(dof_names):
-            if "finger_joint" in name or "knuckle_joint" in name:
+            if ("finger_joint" in name or "knuckle_joint" in name) and "outer_finger_joint" not in name:
                 actual = final_joints[idx]
                 if   actual < FINGER_CLOSE - 0.05: status = "✅ stopped on part surface"
                 elif actual >= FINGER_CLOSE - 0.05: status = "✅ closed freely"

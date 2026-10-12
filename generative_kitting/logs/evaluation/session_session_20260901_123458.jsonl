@@ -1,0 +1,1 @@
+{"event": "task", "timestamp": "2026-09-01T12:41:29.779265", "session_id": "session_20260901_123458", "task_id": 1, "command": "Pick motor valve and place it in the kitting tray", "vlm_model": "Qwen/Qwen3-VL", "llm_model": "Qwen/Qwen3-VL", "targeted_count": 0, "placed_count": 0, "success": false, "end_to_end_s": 6.150013}

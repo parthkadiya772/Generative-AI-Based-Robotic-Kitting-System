@@ -1,0 +1,185 @@
+format: "xrdf"
+
+format_version: 2.0
+
+default_joint_positions: 
+  gantry_vagn_joint: -0.0
+  shoulder_pan_joint: -0.0003
+  shoulder_lift_joint: -0.0
+  elbow_joint: -0.0
+  wrist_1_joint: 0.0001
+  wrist_2_joint: -0.0002
+  wrist_3_joint: -0.0001
+  finger_joint: 0.0009
+  left_outer_finger_joint: 0.0004
+  right_outer_finger_joint: 0.0003
+  left_inner_finger_joint: 0.0
+  right_inner_finger_joint: 0.0
+  left_inner_finger_pad_joint: 0.0
+  right_inner_finger_pad_joint: 0.0
+
+cspace: 
+  joint_names: 
+    - "gantry_vagn_joint"
+    - "shoulder_pan_joint"
+    - "shoulder_lift_joint"
+    - "elbow_joint"
+    - "wrist_1_joint"
+    - "wrist_2_joint"
+    - "wrist_3_joint"
+  acceleration_limits: [10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0]
+  jerk_limits: [10000.0, 10000.0, 10000.0, 10000.0, 10000.0, 10000.0, 10000.0]
+
+world_collision: 
+  geometry: "auto_generated_collision_sphere_group"
+
+self_collision: 
+  geometry: "auto_generated_collision_sphere_group"
+  ignore: 
+    gantry: 
+      - "vagn"
+    base_link: 
+      - "shoulder_link"
+    vagn: 
+      - "base_link"
+    shoulder_link: 
+      - "upper_arm_link"
+    upper_arm_link: 
+      - "forearm_link"
+    forearm_link: 
+      - "wrist_1_link"
+    wrist_1_link: 
+      - "wrist_2_link"
+    wrist_2_link: 
+      - "wrist_3_link"
+    wrist_3_link: 
+      - "ee_link"
+    robotiq_base_link: 
+      - "left_outer_knuckle"
+      - "right_outer_knuckle"
+      - "left_inner_knuckle"
+      - "right_inner_knuckle"
+    left_outer_knuckle: 
+      - "left_outer_finger"
+      - "right_outer_knuckle"
+      - "left_inner_knuckle"
+      - "right_inner_knuckle"
+    right_outer_knuckle: 
+      - "right_outer_finger"
+      - "left_inner_knuckle"
+      - "right_inner_knuckle"
+    left_outer_finger: 
+      - "left_inner_finger"
+    right_outer_finger: 
+      - "right_inner_finger"
+    right_inner_finger: 
+      - "right_inner_knuckle"
+    left_inner_finger: 
+      - "left_inner_knuckle"
+    ee_link: 
+      - "robotiq_base_link"
+    left_inner_knuckle: 
+      - "right_inner_knuckle"
+
+geometry: 
+  auto_generated_collision_sphere_group: 
+    spheres: 
+      gantry_home/ur10_flattened/ur10_instanceable/shoulder_link: 
+        - center: [-0.0, 0.012, 0.002]
+          radius: 0.105
+        - center: [0.0, 0.0, 0.0]
+          radius: 0.03
+      gantry_home/ur10_flattened/ur10_instanceable/upper_arm_link: 
+        - center: [-0.001, -0.046, 0.46]
+          radius: 0.0833
+        - center: [-0.0, -0.045, 0.264]
+          radius: 0.0833
+        - center: [-0.0, -0.045, 0.143]
+          radius: 0.0833
+        - center: [-0.0, -0.045, 0.369]
+          radius: 0.0833
+        - center: [-0.0, -0.045, 0.211]
+          radius: 0.0833
+        - center: [0.002, -0.047, 0.496]
+          radius: 0.0803
+        - center: [-0.001, -0.046, 0.314]
+          radius: 0.0833
+        - center: [-0.001, -0.045, 0.406]
+          radius: 0.0833
+        - center: [0.001, -0.048, 0.009]
+          radius: 0.108
+        - center: [-0.001, -0.049, 0.594]
+          radius: 0.0899
+      gantry_home/ur10_flattened/ur10_instanceable/forearm_link: 
+        - center: [-0.001, -0.0, 0.444]
+          radius: 0.0721
+        - center: [-0.0, -0.0, 0.311]
+          radius: 0.0721
+        - center: [-0.0, -0.0, 0.176]
+          radius: 0.0721
+        - center: [-0.001, -0.0, 0.106]
+          radius: 0.0721
+        - center: [0.0, -0.001, 0.241]
+          radius: 0.0721
+        - center: [-0.001, -0.002, 0.374]
+          radius: 0.0721
+        - center: [-0.002, -0.002, 0.477]
+          radius: 0.0712
+        - center: [-0.0, -0.0, 0.277]
+          radius: 0.0721
+        - center: [-0.001, 0.008, 0.006]
+          radius: 0.0872
+        - center: [-0.001, 0.007, 0.566]
+          radius: 0.078
+      gantry_home/ur10_flattened/ur10_instanceable/wrist_1_link: 
+        - center: [0.001, 0.11, -0.002]
+          radius: 0.066
+      gantry_home/ur10_flattened/ur10_instanceable/wrist_2_link: 
+        - center: [-0.0, -0.001, 0.099]
+          radius: 0.068
+      gantry_home/ur10_flattened/ur10_instanceable/wrist_3_link: 
+        - center: [0.0, 0.062, -0.001]
+          radius: 0.05
+      gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/robotiq_base_link: 
+        - center: [0.0, 0.0, 0.022]
+          radius: 0.0402
+      gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/left_outer_knuckle: 
+        - center: [-0.052, 0.053, 0.0]
+          radius: 0.0245
+        - center: [-0.061, 0.051, -0.0]
+          radius: 0.0245
+      gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/left_outer_finger: 
+        - center: [-0.074, 0.082, 0.001]
+          radius: 0.0261
+        - center: [-0.09, 0.113, 0.0]
+          radius: 0.0253
+      gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/left_inner_finger: 
+        - center: [0.149, 0.077, -0.003]
+          radius: 0.024
+        - center: [0.188, 0.075, -0.002]
+          radius: 0.024
+      gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/left_inner_knuckle: 
+        - center: [-0.033, 0.084, 0.0]
+          radius: 0.0257
+        - center: [-0.061, 0.115, -0.001]
+          radius: 0.0257
+      gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/right_outer_finger: 
+        - center: [-0.078, 0.079, -0.005]
+          radius: 0.0261
+        - center: [-0.09, 0.118, -0.0]
+          radius: 0.0253
+      gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/right_outer_knuckle: 
+        - center: [-0.052, 0.053, 0.0]
+          radius: 0.0245
+        - center: [-0.061, 0.051, -0.0]
+          radius: 0.0245
+      gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/right_inner_finger: 
+        - center: [0.187, -0.077, 0.001]
+          radius: 0.024
+        - center: [0.149, -0.078, 0.002]
+          radius: 0.024
+      gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/right_inner_knuckle: 
+        - center: [-0.034, 0.09, -0.002]
+          radius: 0.0257
+        - center: [-0.065, 0.119, -0.003]
+          radius: 0.0257
