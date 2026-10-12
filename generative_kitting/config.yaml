@@ -3,33 +3,18 @@
 # ============================================================
 
 simulation:
-  usd_scene_path: "${PROJECT_ROOT}/AIKIDO.usd"
+  # Robot hardware (prims, joints, TCP, gripper, cuMotion files):
+  # robot_config/<robot>/robot.yaml, selected by ROBOT_CONFIG_PATH.
   robot_prim_path: "/World/gantry"
   ur10_base_path: "/World/gantry/gantry_home/ur10_flattened/ur10_instanceable/base_link"
   ee_path: "/World/gantry/gantry_home/ur10_flattened/ur10_instanceable/ee_link"
   camera_prim_path: "/World/Camera"
-  depth_camera_prim_path: "/World/rsd555/Depth"
-  imu_sensor_prim_path: "/World/rsd555/Imu_Sensor"
   physics_dt: 0.01667          # 1/60
   rendering_dt: 0.01667        # 1/60
 
   # Gantry configuration
   gantry_x_joint: "/World/gantry/gantry_home/vagn/gantry_vagn_joint"
   gantry_x_offset: 1.27
-
-  # ── cuMotion robot description ──────────────────────────────
-  # Directory holding the URDF + XRDF + meshes/, exported from Isaac
-  # Sim. The XRDF `cspace:` block defines the planned joints and their
-  # order, and its `geometry:` spheres are the robot's own collision
-  # model — the planner's idea of the arm comes from here, not the USD.
-  # The bridge keeps its own copy of these names (it runs standalone in
-  # the Script Editor and does not read this file).
-  robot_config_path: "${ROBOT_CONFIG_PATH}"
-  robot_urdf_filename: "AIKIDO.urdf"
-  robot_xrdf_filename: "AIKIDO.xrdf"
-  # Tool frame cuMotion plans for. Poses are converted from the TCP
-  # target using execution.gripper_tcp_offset before planning.
-  cumotion_tool_frame: "robotiq_base_link"
 
   # Gripper finger prim paths (Robotiq 2F-140)
   gripper_finger_paths:
@@ -48,7 +33,6 @@ simulation:
   # come from these USD prims (no overhead VLM landmark detection).
   bin_prim_path:  "/World/robot_facade_full"
   tray_prim_path: "/World/box_840"
-  wrist_rgb_camera_prim_path: "/World/rsd555/Camera_OmniVision_OV9782_Color"
 
   # Scan-pose marker prim REMOVED from the scene — the workflow now
   # derives the safe ee_link Z geometrically from
@@ -58,14 +42,6 @@ simulation:
   # path here only if you want to override the geometric formula with
   # a static USD transform.
   # scan_pose_prim_path: "/World/robo_eye"
-
-  # ee_link orientation [w, x, y, z] applied at every realign before
-  # a pick. Default rotates the standard downward pose by -90° yaw
-  # about world Z so the wrist camera ends up on the FRONT side of
-  # the gripper (not the back). Tweak the sign of z if the camera
-  # ends up on the wrong side. Keep the quaternion normalised; null
-  # / missing → bridge falls back to DOWNWARD_ORIENTATION.
-  scan_pose_orientation: [0.5, 0.5, 0.5, -0.5]
 
 # ─── Perception (VLM) ───────────────────────────────────────
 perception:
@@ -352,7 +328,6 @@ execution:
   # Robotiq 2F-140 parameters
   gripper_tcp_offset: 0.170           # metres: ee_link → finger contact pad
   gripper_body_width: 0.160           # metres: widest dimension (fingers open)
-  gripper_max_width: 0.085            # 85mm finger aperture
   gripper_force: 40.0                 # Newtons
   finger_open_rad: 0.0               # radians — fully open
   finger_close_rad: 0.5              # radians — ~50mm part

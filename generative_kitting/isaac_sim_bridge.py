@@ -123,6 +123,30 @@ else:
 
 
 # ═════════════════════════════════════════════════════════════
+# ROBOT CONFIG — robot_config/<robot>/robot.yaml, chosen by
+# ROBOT_CONFIG_PATH. Single source of truth for robot hardware.
+# ═════════════════════════════════════════════════════════════
+
+_PROJECT_ROOT = (os.path.dirname(_ENV_FILE) if _ENV_FILE
+                 else os.environ.get("KITTING_PROJECT_ROOT", ""))
+if _PROJECT_ROOT and _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+# Package-qualified import: inside Isaac Sim a bare `utils` is cv2.utils.
+import importlib
+import generative_kitting.utils.config_loader as _config_loader_mod
+import generative_kitting.utils.robot_config as _robot_config_mod
+importlib.reload(_config_loader_mod)
+importlib.reload(_robot_config_mod)
+
+ROBOT_CFG = _robot_config_mod.load_robot_config()
+print(f"[robot] {ROBOT_CFG.name} ({ROBOT_CFG.config_dir})")
+if ROBOT_CFG.missing():
+    print(f"[robot] WARNING: not set in robot.yaml: {', '.join(ROBOT_CFG.missing())} "
+          "— motions that need them will refuse to run")
+
+
+# ═════════════════════════════════════════════════════════════
 # CONFIGURATION (mirrors the constants in robot_control.py)
 # ═════════════════════════════════════════════════════════════
 
@@ -132,48 +156,50 @@ else:
 # subnet call /api/execute, so the safe default is 127.0.0.1.
 BRIDGE_HOST = os.environ.get("BRIDGE_HOST", "127.0.0.1")
 BRIDGE_PORT = int(os.environ.get("BRIDGE_PORT", "8600"))
-ROBOT_PRIM  = "/World/gantry"
+ROBOT_PRIM  = ROBOT_CFG.root
 
 # Dual cameras
 CAMERA_RGB_PRIM   = "/World/Camera"
-CAMERA_DEPTH_PRIM = "/World/rsd555/Depth"
-CAMERA_WRIST_PRIM = "/World/rsd555/Camera_OmniVision_OV9782_Color"
+CAMERA_DEPTH_PRIM = ROBOT_CFG.wrist_camera["depth"]
+CAMERA_WRIST_PRIM = ROBOT_CFG.wrist_camera["rgb"]
 # Tray-overlook camera — used after place to verify the part actually
 # landed in the kitting tray. Independent of the robot pose so the VLM
 # always gets a clean top-down view of the destination.
 CAMERA_KIT_PRIM   = "/World/Camera_Kit"
-IMU_PRIM          = "/World/rsd555/Imu_Sensor"
+IMU_PRIM          = ROBOT_CFG.wrist_camera["imu"]
 
 # Robot geometry
-UR10_BASE_PATH = "/World/gantry/gantry_home/ur10_flattened/ur10_instanceable/base_link"
-EE_PATH        = "/World/gantry/gantry_home/ur10_flattened/ur10_instanceable/ee_link"
+ARM_BASE_PATH  = ROBOT_CFG.arm_base_prim
+EE_PATH        = ROBOT_CFG.ee_prim
 PLACE_BOX_PATH = "/World/box_840"
 
 
-CONTACT_SENSOR_PRIM     = "/World/gantry/gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/left_inner_finger/Fingertip_01/Fingertip/Contact_Sensor"
+CONTACT_SENSOR_PRIM     = ROBOT_CFG.contact_sensor_prim
 CONTACT_SENSOR_TIP_PRIM = CONTACT_SENSOR_PRIM
 
-# HOME_JOINTS is captured from the USD scene at startup (see _init_robot).
-HOME_JOINTS = None  # set by _init_robot()
+# robot.yaml home_joints, or captured from the USD scene at startup when null.
+HOME_JOINTS = ROBOT_CFG.home_joints
 
 # Gantry
-GANTRY_X_JOINT  = "/World/gantry/gantry_home/vagn/gantry_vagn_joint"
-GANTRY_X_OFFSET = 1.27
-GANTRY_MIN_X    = -3.10
-GANTRY_MAX_X    = 0.00
+GANTRY_X_JOINT  = ROBOT_CFG.gantry_joint
+GANTRY_X_OFFSET = ROBOT_CFG.gantry_x_offset
+GANTRY_MIN_X, GANTRY_MAX_X = ROBOT_CFG.gantry_limits
 
 # Gripper / finger joints
-FINGER_OPEN  = 0.0
-FINGER_CLOSE = 0.5       # matches robot_control.py — physics stops fingers on part contact
-FINGER_CLOSE_MIN = 0.55  # minimum grip (large parts ~80mm)
-FINGER_CLOSE_MAX = 0.69  # near-closed grip (small parts ~15mm)
-ROBOTIQ_MAX_STROKE = 0.140  # 140mm max opening
-ROBOTIQ_MAX_RAD = 0.695     # joint rad at fully closed
-GRIP_OVERSHOOT = 0.060   # 60mm extra closing past part width for firm contact
-ENTRY_CLEARANCE = 0.020  # 20mm extra gap over part width for bin-entry pre-shape
+GRIPPER_DRIVE_JOINT = ROBOT_CFG.gripper_drive_joint
+GRIPPER_JOINT_MODES = ROBOT_CFG.gripper_modes
+FINGER_OPEN      = ROBOT_CFG.finger["open"]
+FINGER_CLOSE     = ROBOT_CFG.finger["close"]
+FINGER_CLOSE_MIN = ROBOT_CFG.finger["close_min"]   # large parts
+FINGER_CLOSE_MAX = ROBOT_CFG.finger["close_max"]   # small parts
+ROBOTIQ_MAX_STROKE = ROBOT_CFG.gripper["stroke"]
+ROBOTIQ_MAX_RAD    = ROBOT_CFG.finger["max_rad"]
+GRIP_OVERSHOOT   = ROBOT_CFG.gripper["grip_overshoot"]
+ENTRY_CLEARANCE  = ROBOT_CFG.gripper["entry_clearance"]
+GRASP_CONFIRM_RAD = ROBOT_CFG.gripper["grasp_confirm_rad"]
 
-GRIPPER_TCP_OFFSET   = 0.19357
-GRIPPER_BODY_WIDTH   = 0.160
+GRIPPER_TCP_OFFSET   = ROBOT_CFG.tcp_offset           # None until measured
+GRIPPER_BODY_WIDTH   = ROBOT_CFG.gripper["body_width"]
 GRIPPER_HALF_WIDTH   = GRIPPER_BODY_WIDTH / 2.0
 HOVER_CLEARANCE      = 0.020
 GRASP_LIFT           = 0.000  
@@ -183,7 +209,22 @@ BOX_ENTRY_MARGIN     = 0.15
 PLACE_DROP_HEIGHT    = 0.02
 PLACE_RETRACT_HEIGHT = 0.25
 TRANSIT_SAFE_HEIGHT  = 0.14
-DOWNWARD_ORIENTATION = np.array([1.0, 0.0, 1.0, 0.0])
+DOWNWARD_ORIENTATION = (None if ROBOT_CFG.tool_down is None
+                        else np.array(ROBOT_CFG.tool_down, dtype=np.float64))
+
+
+def _tcp_offset():
+    """GRIPPER_TCP_OFFSET, or a clear error while robot.yaml has it null."""
+    if GRIPPER_TCP_OFFSET is None:
+        raise RuntimeError("robot.yaml tcp.offset is not set — measure it first")
+    return GRIPPER_TCP_OFFSET
+
+
+def _tool_down():
+    """Normalised tool-down quaternion, or a clear error while unset."""
+    if DOWNWARD_ORIENTATION is None:
+        raise RuntimeError("robot.yaml orientation.tool_down is not set — measure it first")
+    return normalize_quat(DOWNWARD_ORIENTATION)
 
 INTERP_MAX_STEP  = 0.15   
 INTERP_THRESHOLD = 0.5  
@@ -308,12 +349,11 @@ def set_finger_joints(robot, dof_names, value, base_targets=None):
     """
     targets = base_targets if base_targets is not None else robot.get_joint_positions()
     for idx, name in enumerate(dof_names):
-        if "outer_finger_joint" in name:
-            continue  # passive spring joint in the USD — leave its target alone
-        if "inner_finger_joint" in name:
-            targets[idx] = 0.0  # encompassing: inner pad follows outer phalanx direction
-        elif "finger_joint" in name or "knuckle_joint" in name:
+        mode = GRIPPER_JOINT_MODES.get(name, "free")   # robot.yaml joints.gripper_modes
+        if mode == "drive":
             targets[idx] = value
+        elif mode == "zero":
+            targets[idx] = 0.0
     return targets
 
 
@@ -609,12 +649,12 @@ def _filter_robot_self_points(points, max_z=1.35, sphere_margin=0.02):
     #    /World/rsd555 is the sensor housing prim (parent of the RGB/depth
     #    sub-prims), matching the validated pattern in
     #    robot_control_cumotion.py's build_collision_world().
-    cam_prim = stage.GetPrimAtPath("/World/rsd555")
+    cam_prim = stage.GetPrimAtPath(ROBOT_CFG.wrist_camera["root"])
     if cam_prim.IsValid():
         cam_pos = np.array(
             omni.usd.get_world_transform_matrix(cam_prim).ExtractTranslation())
         d_cam = np.linalg.norm(pts - cam_pos, axis=1)
-        keep &= (d_cam > 0.10)
+        keep &= (d_cam > ROBOT_CFG.wrist_camera["self_filter_radius"])
 
     pts = pts[keep]
     n_removed = n_initial - len(pts)
@@ -688,8 +728,7 @@ async def _plan_test(params=None):
     t = tool_mat.ExtractTranslation()
     lift = float(params.get("lift", 0.15))
 
-    ori = params.get("orientation") or normalize_quat(
-        DOWNWARD_ORIENTATION).tolist()
+    ori = params.get("orientation") or _tool_down().tolist()
     ori = np.array(ori, dtype=np.float64)
     q0 = _current_cspace()
     tool = np.array([float(t[0]), float(t[1]), float(t[2])])
@@ -1444,12 +1483,10 @@ async def _add_wrist_obstacles(params):
 #   can never be replayed.
 # ═════════════════════════════════════════════════════════════
 
-ROBOT_CONFIG_PATH = os.environ.get("ROBOT_CONFIG_PATH", "")
-# Exported from Isaac Sim. Mirrors simulation.robot_{urdf,xrdf}_filename
-# in config.yaml — the bridge runs standalone and cannot read that file.
-ROBOT_URDF_FILENAME = "AIKIDO.urdf"
-ROBOT_XRDF_FILENAME = "AIKIDO.xrdf"
-CUMOTION_TOOL_FRAME = "robotiq_base_link"
+ROBOT_CONFIG_PATH   = str(ROBOT_CFG.config_dir)
+ROBOT_URDF_FILENAME = ROBOT_CFG.urdf_path.name
+ROBOT_XRDF_FILENAME = ROBOT_CFG.xrdf_path.name
+CUMOTION_TOOL_FRAME = ROBOT_CFG.cumotion_tool_frame
 
 # Fixed rail mount — the URDF root, above gantry_vagn_joint. See
 # _robot_base_pose_arrays for why this must not be base_link.
@@ -1459,18 +1496,16 @@ CUMOTION_TOOL_FRAME = "robotiq_base_link"
 # (== GANTRY_X_OFFSET) while the rail base is at x=-2.000. Using the
 # carriage double-counts gantry travel, offsetting every planned pose
 # by the current gantry position.
-ROBOT_ROOT_PATH = "/World/gantry"
+ROBOT_ROOT_PATH = ROBOT_CFG.root
 
 # USD prim for CUMOTION_TOOL_FRAME. Used only by /api/verify_planner to
 # compare cuMotion's idea of the tool pose against the scene's.
-TOOL_FRAME_PRIM = ("/World/gantry/gantry_home/ur10_flattened/"
-                   "robotiq_fixed_physics/Robotiq_2F_140_physics_edit/"
-                   "robotiq_base_link")
+TOOL_FRAME_PRIM = ROBOT_CFG.tool_prim
 
 # Per-joint limits for time-parameterising a planned path.
 # Order follows the XRDF <cspace>: gantry, pan, lift, elbow, w1, w2, w3.
-CUMOTION_MAX_VEL = np.array([0.5, 1.5, 1.5, 1.5, 2.0, 2.0, 2.0])
-CUMOTION_MAX_ACC = np.array([1.0, 2.0, 2.0, 2.0, 2.5, 2.5, 2.5])
+CUMOTION_MAX_VEL = np.array(ROBOT_CFG.max_vel)
+CUMOTION_MAX_ACC = np.array(ROBOT_CFG.max_acc)
 
 TRAJECTORY_DT = 1.0 / 60.0        # sampling step when streaming
 
@@ -1602,7 +1637,7 @@ def _current_cspace():
         vals = [float(v) for v in q[:7]]
     # Clamp gantry joint 0 strictly within unmodified URDF limits [-3.0999999, 0.0]
     # (prevents float precision jitter like +1e-9 from triggering "Invalid initial robot configuration")
-    vals[0] = float(np.clip(vals[0], -3.09999, -1e-6))
+    vals[0] = float(np.clip(vals[0], GANTRY_MIN_X + 1e-5, GANTRY_MAX_X - 1e-6))
     return np.array(vals, dtype=np.float64)
 
 
@@ -1617,7 +1652,7 @@ def _tool_pose_from_tcp(tcp_pos, orientation):
     part by the offset.
     """
     pos = np.array(tcp_pos, dtype=np.float64).copy()
-    pos[2] += GRIPPER_TCP_OFFSET
+    pos[2] += _tcp_offset()
     return pos, np.array(orientation, dtype=np.float64)
 
 
@@ -2991,7 +3026,7 @@ async def _move_home():
         ee_pos = get_world_pos(EE_PATH)
         if ee_pos[2] < 1.6:
             safe_z = min(ee_pos[2] + TRANSIT_SAFE_HEIGHT, 1.8)
-            locked_ori = normalize_quat(DOWNWARD_ORIENTATION)
+            locked_ori = _tool_down()
             warm = _get_warm_start()
             action, ok = ik_solve(np.array([ee_pos[0], ee_pos[1], safe_z]),
                                   locked_ori, warm)
@@ -3051,7 +3086,7 @@ async def _close_gripper_slow(target_value, n_steps=12):
     current_joints = STATE.robot.get_joint_positions()
     current_finger = 0.0
     for idx, name in enumerate(STATE.dof_names):
-        if name == "finger_joint":
+        if name == GRIPPER_DRIVE_JOINT:
             current_finger = float(current_joints[idx])
             break
 
@@ -3099,8 +3134,8 @@ def _force_grip(finger_value):
 
 
 async def _verify_grasp():
-    finger_pos = STATE.robot.get_joint_positions()[7]
-    is_grasping = abs(finger_pos) > 0.05
+    finger_pos = STATE.robot.get_joint_positions()[STATE.dof_names.index(GRIPPER_DRIVE_JOINT)]
+    is_grasping = abs(finger_pos) > GRASP_CONFIRM_RAD
     return {"status": "ok", "is_grasping": bool(is_grasping), "finger_pos": float(finger_pos)}
 
 
@@ -3229,7 +3264,7 @@ async def _ik_move_to(target_xyz, orientation=None, settle_frames=SETTLE_FRAMES)
         return {"error": _planner_unavailable_reason()}
 
     target_pos = np.array(target_xyz, dtype=np.float64)
-    ori = orientation if orientation is not None else normalize_quat(DOWNWARD_ORIENTATION)
+    ori = orientation if orientation is not None else _tool_down()
 
     warm = _get_warm_start()
     action, ok = ik_solve(target_pos, ori, warm)
@@ -3701,7 +3736,7 @@ async def _move_gantry_x(target_x, finger_hold=None, hold_ee_pos=None):
     targets = STATE.robot.get_joint_positions()
     gantry_idx = None
     for idx, name in enumerate(STATE.dof_names):
-        if GANTRY_X_JOINT in name:
+        if name == GANTRY_X_JOINT:
             gantry_idx = idx
             break
 
@@ -3733,7 +3768,7 @@ async def _move_gantry_x(target_x, finger_hold=None, hold_ee_pos=None):
         # the base pose per step and re-solve because Lula treated the
         # gantry as an external base shift.
         ee_lock = np.array(hold_ee_pos, dtype=np.float64)
-        locked_ori = normalize_quat(DOWNWARD_ORIENTATION)
+        locked_ori = _tool_down()
         print(f"  [GANTRY] EE-hold slide: {gantry_current:.3f} → "
               f"{gantry_target:.3f}, holding EE at "
               f"({ee_lock[0]:.3f}, {ee_lock[1]:.3f}, {ee_lock[2]:.3f})")
@@ -3811,7 +3846,7 @@ async def _approach_target(params):
         except Exception as e:
             return {"error": f"Invalid orientation {orientation}: {e}"}
     else:
-        ori = normalize_quat(DOWNWARD_ORIENTATION)
+        ori = _tool_down()
 
     if cartesian:
         # Step-by-step Cartesian motion — keeps the arm in the same
@@ -3888,7 +3923,7 @@ def _pick_z_positions(z, grasp_lift_override=None):
     TCP exactly at part top (default), which lets the contact-aware
     descent stop on first touch and lift back a clean 5 mm.
     """
-    tcp_z_offset = 0.0 if STATE.target_frame == "gripper_tcp" else GRIPPER_TCP_OFFSET
+    tcp_z_offset = 0.0 if STATE.target_frame == "gripper_tcp" else _tcp_offset()
     grasp_lift = GRASP_LIFT
     if grasp_lift_override is not None:
         try:
@@ -3931,8 +3966,8 @@ async def _pick_descend(params):
     STATE.is_executing = True
     steps = []
     try:
-        locked_ori = normalize_quat(DOWNWARD_ORIENTATION)
-        grasp_target_z = z + GRIPPER_TCP_OFFSET
+        locked_ori = _tool_down()
+        grasp_target_z = z + _tcp_offset()
 
         print(f"  [DESCEND] target=({x:.3f}, {y:.3f}, {z:.3f}) grasp_z={grasp_target_z:.3f}")
 
@@ -4249,7 +4284,7 @@ async def _pick_close(params):
 
                 actual_joints = STATE.robot.get_joint_positions()
                 for idx, name in enumerate(STATE.dof_names):
-                    if name == "finger_joint":
+                    if name == GRIPPER_DRIVE_JOINT:
                         actual_finger = float(actual_joints[idx])
                         break
 
@@ -4306,7 +4341,7 @@ async def _pick_retract(params):
     STATE.is_executing = True
     steps = []
     try:
-        locked_ori = normalize_quat(DOWNWARD_ORIENTATION)
+        locked_ori = _tool_down()
         zp = _pick_z_positions(z)
         safe_pos = np.array([x, y, zp["safe_z"]])
         transit_pos = np.array([x, y, zp["transit_z"]])
@@ -4452,8 +4487,8 @@ async def _place_object_ik(params):
     STATE.is_executing = True
     steps = []
     try:
-        locked_ori = normalize_quat(DOWNWARD_ORIENTATION)
-        tcp_z_offset = 0.0 if STATE.target_frame == "gripper_tcp" else GRIPPER_TCP_OFFSET
+        locked_ori = _tool_down()
+        tcp_z_offset = 0.0 if STATE.target_frame == "gripper_tcp" else _tcp_offset()
 
         # Use the passed coordinates directly (from VLM + depth projection)
         dest_x, dest_y, dest_top_z = x, y, z
@@ -4822,8 +4857,8 @@ async def start_bridge():
 
     # Capture the robot's initial rest pose as HOME_JOINTS
     global HOME_JOINTS
-    initial_joints = robot.get_joint_positions()
-    HOME_JOINTS = initial_joints.tolist()[:7]
+    if HOME_JOINTS is None:
+        HOME_JOINTS = robot.get_joint_positions().tolist()[:len(ROBOT_CFG.cspace_joints)]
     print(f"[OK] Robot ready — {STATE.num_dof} DOFs")
     print(f"[OK] Home joints captured: {[f'{j:.3f}' for j in HOME_JOINTS]}")
 
