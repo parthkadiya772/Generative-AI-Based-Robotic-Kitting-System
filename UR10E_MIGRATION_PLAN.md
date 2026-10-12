@@ -51,7 +51,7 @@ Every step ends with a **live check** in Isaac Sim, run through the MCP tools an
 - **B1:** the gantry joint lookup compares the full prim path with the short DOF name, so it never matches. Fix it to use the short joint name from the YAML.
 - **Check:** the bridge starts on the UR10e stage. The joint report lists 15 DOFs, the contact sensor initialises, and a home move and a gantry jog both work.
 
-## Step 3: Measure the new geometry live
+## Step 3: Measure the new geometry live ✅ done
 - **TCP:** the offset from `robotiq_base_link` to the finger-pad midpoint, and the axis it lies along. This replaces the five conflicting values.
 - **Tool-down quaternion** for the new tool frame (it replaces `[1,0,1,0]`). Check the scan orientation too.
 - **Fingers:** the closed angle and the width-to-angle curve of `finger_joint` on the new drives.
@@ -83,6 +83,8 @@ Every step ends with a **live check** in Isaac Sim, run through the MCP tools an
 ## Step 6: Gripper re-tune
 - **`set_finger_joints`:** rewrite it for the new drive layout. The outer finger joints are now driven (k=2000); the inner fingers are springs.
 - The inner finger joints are weak springs (k=0.002), so `zero` mode barely holds them; measured about −0.34 rad when closed.
+- With the gripper pointing down, `open` (0.0) only reached 0.054 rad (gap 123 mm instead of 141 mm).
+- Replace the linear width→angle mapping with `gripper.width_table`. Re-check `close_min` (0.55 rad ≈ 42 mm, not the 80 mm its old comment claims).
 - Re-tune adaptive close, the grasp-confirm threshold, the overshoot and the settle frames. All of these move into the YAML.
 - Make grasp verification read the driver joint by name, not a hard-coded index.
 - **Check:** grasp at least 3 part sizes (small tube, motor valve, large gear). Record contact force and finger angle each time.

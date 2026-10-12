@@ -1,5 +1,5 @@
 # UR10e + Robotiq 2F-140 on ceiling gantry
-# null = not measured yet (see UR10E_MIGRATION_PLAN.md step)
+# measured on the live stage 2026-10-12, gripper pointing down
 
 robot:
   name: ur10e_2f140_gantry
@@ -46,12 +46,12 @@ gantry:
 home_joints: null   # null = capture from stage at startup
 
 tcp:
-  offset: null      # robotiq_base_link -> finger pad centre [m], step 3
+  offset: 0.189     # robotiq_base_link -> pad centre along +Z, at ~55 mm grasp
   frame: tool
 
 orientation:
-  tool_down: null   # [w, x, y, z], step 3
-  scan: null        # step 3
+  tool_down: [0.0, 1.0, 0.0, 0.0]          # tool +Z -> world -Z, camera +X
+  scan: [0.0, 0.70711, -0.70711, 0.0]      # tool_down yawed -90 deg
 
 gripper:
   stroke: 0.140
@@ -62,7 +62,17 @@ gripper:
     close: 0.5
     close_min: 0.55
     close_max: 0.69
-    max_rad: 0.695
+    max_rad: 0.76       # pads touch
+  # finger_joint [rad] -> pad gap [m]
+  width_table:
+    - [0.0, 0.141]
+    - [0.210, 0.104]
+    - [0.392, 0.073]
+    - [0.486, 0.055]
+    - [0.582, 0.036]
+    - [0.679, 0.017]
+    - [0.730, 0.006]
+    - [0.760, 0.0]
   grip_overshoot: 0.060
   entry_clearance: 0.020
   grasp_confirm_rad: 0.05
@@ -87,7 +97,7 @@ wrist_camera:
   imu: /World/rsd555/Imu_Sensor
   mount_link: gantry_home/ur10e/wrist_3_link
   self_filter_radius: 0.10
-  ee_offset_xy: null  # camera -> TCP calibration, step 3
+  ee_offset_xy: [0.0, 0.0]   # empirical, tune from pick results
 
 cumotion:
   urdf: AIKIDO.urdf   # relative to this folder, step 4

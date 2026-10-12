@@ -37,12 +37,15 @@ class TestShippedConfigs:
         assert cfg.missing() == []
         cfg.require_complete()
 
-    def test_ur10e_lists_unmeasured_values(self):
+    def test_ur10e_is_complete(self):
         cfg = load_robot_config(UR10E_DIR)
-        assert set(cfg.missing()) == {
-            "tcp.offset", "orientation.tool_down", "orientation.scan",
-            "wrist_camera.ee_offset_xy",
-        }
+        assert cfg.missing() == []
+        cfg.require_complete()
+
+    def test_null_value_blocks_require_complete(self, tmp_path):
+        d = _write_variant(tmp_path, UR10E_DIR, lambda c: c["tcp"].update(offset=None))
+        cfg = load_robot_config(d)
+        assert cfg.missing() == ["tcp.offset"]
         with pytest.raises(RobotConfigError, match="tcp.offset"):
             cfg.require_complete()
 

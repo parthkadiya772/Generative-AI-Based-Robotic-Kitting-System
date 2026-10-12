@@ -49,7 +49,7 @@ tcp:
   frame: tool
 
 orientation:
-  tool_down: [1.0, 0.0, 1.0, 0.0]
+  tool_down: [1.0, 0.0, 1.0, 0.0]   # Lula-era, for ee_link; not down for robotiq_base_link
   scan: [0.5, 0.5, 0.5, -0.5]
 
 gripper:
