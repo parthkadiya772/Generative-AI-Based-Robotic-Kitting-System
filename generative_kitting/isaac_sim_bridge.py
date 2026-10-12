@@ -562,13 +562,15 @@ def _load_xrdf_collision_spheres():
 
     Cached for the process lifetime — the XRDF only changes when the user
     regenerates it from Isaac Sim, which requires restarting the bridge
-    anyway. Returns {link_rel_path: [{"center": [x,y,z], "radius": r}, ...]}.
+    anyway. Reads the self-filter XRDF (spheres in USD link frames, see
+    robot.yaml cumotion.self_filter_xrdf). Returns
+    {link: [{"center": [x,y,z], "radius": r}, ...]}.
     """
     global _XRDF_SPHERES_CACHE
     if _XRDF_SPHERES_CACHE is not None:
         return _XRDF_SPHERES_CACHE
     import yaml
-    xrdf_file = os.path.join(ROBOT_CONFIG_PATH, ROBOT_XRDF_FILENAME)
+    xrdf_file = SELF_FILTER_XRDF_PATH
     try:
         with open(xrdf_file, "r") as f:
             xrdf_data = yaml.safe_load(f)
@@ -582,7 +584,7 @@ def _load_xrdf_collision_spheres():
     n_links = len(spheres)
     n_spheres = sum(len(v) for v in spheres.values())
     print(f"  [self-filter] loaded {n_spheres} XRDF collision spheres "
-          f"across {n_links} links from {ROBOT_XRDF_FILENAME}")
+          f"across {n_links} links from {os.path.basename(xrdf_file)}")
     return spheres
 
 
@@ -626,8 +628,9 @@ def _filter_robot_self_points(points, max_z=1.35, sphere_margin=0.02):
 
     keep = np.ones(len(pts), dtype=bool)
     n_links_hit = 0
-    for link_rel_path, sphere_list in spheres_data.items():
-        prim_path = f"{ROBOT_ROOT_PATH}/{link_rel_path}"
+    for link, sphere_list in spheres_data.items():
+        # URDF link name via robot.yaml; legacy XRDFs keyed spheres by prim path
+        prim_path = LINK_PRIMS.get(link, f"{ROBOT_ROOT_PATH}/{link}")
         prim = stage.GetPrimAtPath(prim_path)
         if not prim.IsValid():
             continue
@@ -665,9 +668,9 @@ def _filter_robot_self_points(points, max_z=1.35, sphere_margin=0.02):
               "start state is in collision. ***")
     elif n_links_hit == 0:
         print(f"  [self-filter] *** 0 of {len(spheres_data)} link sphere "
-              f"groups matched any point — check ROBOT_ROOT_PATH "
-              f"({ROBOT_ROOT_PATH}) against the XRDF's link_rel_path "
-              f"prefixes; self-filtering is silently doing nothing. ***")
+              f"groups matched any point — check robot.yaml "
+              f"cumotion.link_prims against the XRDF sphere keys; "
+              f"self-filtering is silently doing nothing. ***")
     return pts, n_removed
 
 
@@ -1486,6 +1489,8 @@ async def _add_wrist_obstacles(params):
 ROBOT_CONFIG_PATH   = str(ROBOT_CFG.config_dir)
 ROBOT_URDF_FILENAME = ROBOT_CFG.urdf_path.name
 ROBOT_XRDF_FILENAME = ROBOT_CFG.xrdf_path.name
+SELF_FILTER_XRDF_PATH = str(ROBOT_CFG.self_filter_xrdf_path)
+LINK_PRIMS = ROBOT_CFG.link_prims
 CUMOTION_TOOL_FRAME = ROBOT_CFG.cumotion_tool_frame
 
 # Fixed rail mount — the URDF root, above gantry_vagn_joint. See
@@ -1676,7 +1681,7 @@ def _plan_cspace(q_target):
     """Plan a collision-free path to a joint configuration."""
     q0 = _current_cspace()
     path = STATE.cumotion_planner.plan_to_cspace_target(
-        q_initial=q0, q_target=np.array(q_target, dtype=np.float64))
+        q_initial=q0, q_final=np.array(q_target, dtype=np.float64))
     if path is None:
         print(f"  [plan] NO PATH to cspace target")
         return None

@@ -47,7 +47,8 @@ _REQUIRED_KEYS = (
     "wrist_camera.root", "wrist_camera.depth", "wrist_camera.rgb",
     "wrist_camera.imu", "wrist_camera.mount_link",
     "wrist_camera.self_filter_radius", "wrist_camera.ee_offset_xy",
-    "cumotion.urdf", "cumotion.xrdf", "cumotion.root_link", "cumotion.tool_frame",
+    "cumotion.urdf", "cumotion.xrdf", "cumotion.self_filter_xrdf",
+    "cumotion.root_link", "cumotion.tool_frame",
     "cumotion.max_vel", "cumotion.max_acc", "cumotion.link_prims",
 )
 
@@ -94,9 +95,11 @@ class RobotConfig:
                 f"{self.config_dir / ROBOT_YAML}: values not set: {', '.join(missing)}")
 
     def prim(self, path: str) -> str:
-        """Resolve a path relative to the articulation root; absolute paths pass through."""
+        """Resolve a path relative to the articulation root; absolute paths pass through, "." is the root."""
         if path.startswith("/"):
             return path
+        if path == ".":
+            return self.root
         return f"{self.root.rstrip('/')}/{path}"
 
     # ── robot / articulation ────────────────────────────────────
@@ -221,6 +224,10 @@ class RobotConfig:
     @property
     def xrdf_path(self) -> Path:
         return self.config_dir / self.raw["cumotion"]["xrdf"]
+
+    @property
+    def self_filter_xrdf_path(self) -> Path:
+        return self.config_dir / self.raw["cumotion"]["self_filter_xrdf"]
 
     @property
     def cumotion_tool_frame(self) -> str:

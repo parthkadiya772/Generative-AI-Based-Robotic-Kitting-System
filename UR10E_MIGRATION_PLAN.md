@@ -59,7 +59,17 @@ Every step ends with a **live check** in Isaac Sim, run through the MCP tools an
 - Write the results into `ur10e/robot.yaml`.
 - **Check:** with the arm at home, place a debug marker at the TCP computed from the YAML. It should sit between the finger pads in the viewport and in a capture.
 
-## Step 4: Rebuild cuMotion inputs with Isaac Sim's own tools (no hand-written URDF or spheres)
+## Step 4: Rebuild cuMotion inputs with Isaac Sim's own tools (no hand-written URDF or spheres) ✅ done
+- **Result:**
+  - URDF + XRDF load in cuMotion with 7 cspace joints. FK matches the stage within 0.77 mm.
+  - No self-collision at spawn or tool-down.
+  - `plan_test` from tool-down finds paths to all 5 targets, with and without the 6000-sphere camera world.
+  - Self-filter: 786 spheres from `AIKIDO.editor.xrdf` via `cumotion.link_prims`. With the arm below z 1.35, the start state is clear of the camera world (min 5 mm).
+  - Also fixed: `_plan_cspace` passed `q_target=`, but the API takes `q_final=`.
+- **Follow-ups:**
+  - About 29 robot surface points (forearm, wrist_3) survive the self-filter. Fix by raising `sphere_margin` (0.02) or adding forearm spheres.
+  - Planning is slow: 20–30 s per target, 5 min to bin height, with 786 robot spheres × 6000 obstacles. Idea: point XRDF `world_collision` at a group without the gantry/vagn spheres (static; only needed for self-collision).
+  - `plan_test` default targets are unreachable from the straight-arm spawn pose; start it from a tool-down pose.
 - **Robot colliders:** inspect and fix the USD physics colliders on every robot link (gantry, vagn, UR10e links, 2F-140) using Isaac Sim's robot setup tools: `isaacsim.robot_setup.collision_detector` and the physics collider debug view. Every link should have a proper collider, and there should be no self-collisions at home pose.
 - **URDF:** export it with the **URDF Exporter** extension (`isaacsim.asset.exporter.urdf` / `.ui`) from `/World/gantry`, giving the chain gantry → vagn → ur10e → robotiq. Review the exporter output; any cleanup is done by changing the exporter settings or the stage, not by hand-editing the file.
 - **XRDF:** build it in the **Robot Description Editor** (`isaacsim.robot_setup.xrdf_editor`):

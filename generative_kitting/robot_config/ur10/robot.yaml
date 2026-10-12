@@ -91,6 +91,7 @@ wrist_camera:
 cumotion:
   urdf: AIKIDO.urdf
   xrdf: AIKIDO.xrdf
+  self_filter_xrdf: AIKIDO.xrdf
   root_link: gantry
   tool_frame: robotiq_base_link
   max_vel: [0.5, 1.5, 1.5, 1.5, 2.0, 2.0, 2.0]

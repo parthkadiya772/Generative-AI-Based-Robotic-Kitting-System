@@ -82,6 +82,20 @@ class TestShippedConfigs:
         assert cfg.urdf_path.is_file()
         assert cfg.xrdf_path.is_file()
 
+    def test_ur10e_link_prims(self):
+        cfg = load_robot_config(UR10E_DIR)
+        assert cfg.link_prims["gantry"] == "/World/gantry"
+        assert cfg.link_prims["left_inner_finger"] == (
+            "/World/gantry/gantry_home/ur10e_robotiq_2f140/left_inner_finger")
+        assert cfg.self_filter_xrdf_path == UR10E_DIR / "AIKIDO.editor.xrdf"
+
+    def test_ur10e_xrdf_sphere_links_have_prims(self):
+        cfg = load_robot_config(UR10E_DIR)
+        for path in (cfg.xrdf_path, cfg.self_filter_xrdf_path):
+            data = yaml.safe_load(path.read_text())
+            links = set(data["geometry"]["auto_generated_collision_sphere_group"]["spheres"])
+            assert links <= set(cfg.link_prims), f"{path.name}: {links - set(cfg.link_prims)}"
+
     def test_project_root_expanded(self):
         cfg = load_robot_config(UR10E_DIR)
         assert "${" not in cfg.stage_path

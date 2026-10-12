@@ -100,11 +100,30 @@ wrist_camera:
   ee_offset_xy: [0.0, 0.0]   # empirical, tune from pick results
 
 cumotion:
-  urdf: AIKIDO.urdf   # relative to this folder, step 4
-  xrdf: AIKIDO.xrdf
+  urdf: AIKIDO.urdf          # relative to this folder
+  xrdf: AIKIDO.xrdf          # spheres in URDF link frames, for cuMotion
+  self_filter_xrdf: AIKIDO.editor.xrdf   # spheres in USD link frames
   root_link: gantry
   tool_frame: robotiq_base_link
   max_vel: [0.5, 1.5, 1.5, 1.5, 2.0, 2.0, 2.0]
   max_acc: [1.0, 2.0, 2.0, 2.0, 2.5, 2.5, 2.5]
-  # URDF link -> prim, for point-cloud self-filter; filled in step 4
-  link_prims: {}
+  # URDF link -> prim, for the point-cloud self-filter
+  link_prims:
+    gantry: .
+    vagn: gantry_home/vagn
+    base_link: gantry_home/ur10e/base_link
+    shoulder_link: gantry_home/ur10e/shoulder_link
+    upper_arm_link: gantry_home/ur10e/upper_arm_link
+    forearm_link: gantry_home/ur10e/forearm_link
+    wrist_1_link: gantry_home/ur10e/wrist_1_link
+    wrist_2_link: gantry_home/ur10e/wrist_2_link
+    wrist_3_link: gantry_home/ur10e/wrist_3_link
+    robotiq_base_link: gantry_home/ur10e_robotiq_2f140/robotiq_base_link
+    left_outer_knuckle: gantry_home/ur10e_robotiq_2f140/left_outer_knuckle
+    right_outer_knuckle: gantry_home/ur10e_robotiq_2f140/right_outer_knuckle
+    left_outer_finger: gantry_home/ur10e_robotiq_2f140/left_outer_finger
+    right_outer_finger: gantry_home/ur10e_robotiq_2f140/right_outer_finger
+    left_inner_finger: gantry_home/ur10e_robotiq_2f140/left_inner_finger
+    right_inner_finger: gantry_home/ur10e_robotiq_2f140/right_inner_finger
+    left_inner_knuckle: gantry_home/ur10e_robotiq_2f140/left_inner_knuckle
+    right_inner_knuckle: gantry_home/ur10e_robotiq_2f140/right_inner_knuckle
