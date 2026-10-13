@@ -207,7 +207,15 @@ Target pipeline: 4 corner depth cameras → robot self-masking → nvblox (TSDF 
   1. ~~Venv + service skeleton.~~ Done 2026-10-13: `generative_kitting/nvblox_service/` (`requirements.txt`, `setup_venv.sh`, `run.sh`, venv in `.venv/`, git-ignored). torch 2.9.1+cu128, nvblox_torch 0.0.10.
      - Gotchas: the wheel's metadata version (0.0.10.dev1) does not match its filename, so `uv` needs `UV_SKIP_WHEEL_FILENAME_CHECK=1`. `libnvblox_lib.so` needs NPP (`nvidia-npp-cu12`) and has no RPATH to pip's `nvidia/` folders, so start python through `run.sh` (sets `LD_LIBRARY_PATH`).
      - nvblox tests with Isaac running: the 16 files we need pass (frame integration, masking, TSDF layer, ESDF update/query/gradients). 3 fail on CUDA out-of-memory (dummy maps of ~191k blocks; dense-layer export of 206 MB); 2 crash in mesh saving (not used).
-     - **GPU budget:** Isaac Sim holds ~5.3 GB of the 7.6 GB, leaving nvblox ~2 GB. Keep the mapped box and voxel size small (the work cell at 2 cm is ~3M voxels, ~12 MB dense) and never build whole-scene dense layers.
+     - **GPU budget (measured 2026-10-13, RTX 4070 Laptop 8 GB):** Isaac Sim with the scene, bridge, cameras and cuMotion: 5.4 GB. nvblox process, synthetic 4-camera cell (floor + bin-sized box), dense export box 3 × 2 × 1.5 m:
+
+       | Voxel | After mapper init | After ESDF + dense export | ESDF update |
+       |---|---|---|---|
+       | 5 cm | 504 MiB | 524 MiB | 29 ms |
+       | 2 cm | 504 MiB | 740 MiB | 89 ms |
+       | 1 cm | 504 MiB | 1508 MiB | 278 ms |
+
+       The real cell has more surface than the synthetic one (walls, gantry, tray, parts), so expect ~1.0–1.3 GB at 2 cm. Use 2 cm: Isaac + nvblox ≈ 6.5–6.7 GB of 8 GB. 1 cm does not fit beside Isaac. Limit integration to the workspace (max integration distance / crop) and never build whole-scene dense layers. The VLM runs on a remote server and does not use this GPU.
   2. Bridge: capture depth + intrinsics + pose per camera (the existing `pcd` annotators), plus a robot mask from the XRDF spheres at the current joint state (reuse the self-filter).
   3. ESDF → cuMotion SDF obstacle; `inspect_sdf` clean; voxel size and box from `robot.yaml` (no constants in code).
   4. Replace the sphere world in `build_collision_world`; the target part stays in the ESDF and the grasp descent is handled by the Cartesian descent (decide: mask the target in depth, or disable the SDF near the grasp).
