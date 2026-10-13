@@ -123,7 +123,7 @@ Every step ends with a **live check** in Isaac Sim, run through the MCP tools an
     - The place "arm config reset" was a Lula warm-start trick and just re-solves the same pose with cuMotion; revisit.
   - Do not save the live stage over `AIKIDO_ur10e_swapped.usd`: its root layer holds simulation state and the bridge's runtime contact sensors.
 
-## Step 6: Gripper re-tune 🟡 in progress (items 1 and 3 done 2026-10-13)
+## Step 6: Gripper re-tune 🟡 in progress (items 1–3 done 2026-10-13)
 - **Done:**
   - **Passive four-bar + armature** (2026-10-13, replaces the earlier parallel-pad drives). The asset leaves the inner finger and pad joints unactuated, and with the outer finger joints `free` each side's loop had 5 revolutes (2 DOF), so the pads flopped and re-opened only to 122 mm. Now:
     - Modes: outer finger = `zero` (rigid, as on the real 2F-140); inner and pad = `free`. No inner/pad drives: they held the linkage at the contact angle (`STATE.pad_hold`) and ate the squeeze.
@@ -161,7 +161,11 @@ Every step ends with a **live check** in Isaac Sim, run through the MCP tools an
     - Follow-ups: (a) the grasp check needs to ignore non-part contacts (filter the sensor to the target body, or require both pads in contact); (b) the descent should keep the closing pad arc above the floor (`grasp_z` ≥ floor + pad drop for the expected width + margin).
 - **Resume here (next session):**
   1. ~~Valve: measure contacts at the last attempt.~~ Done 2026-10-13, see above. The valve now grasps flat at (−0.632, −0.732, top 0.8655, `grasp_lift −0.0245`) but slips because the pad force is too low.
-  2. Add grasp yaw: `pick_descend` and `pick_retract` lock `_tool_down()`. Add an optional `yaw` (or orientation) parameter so the pads can align to the part (from perception). Retry the valve with yaw ≈ part yaw.
+  2. ~~Grasp yaw.~~ Done 2026-10-13.
+     - `approach` and `pick_descend` take an optional `yaw` [rad] about world +Z (0 = pads close along world Y), folded into ±90° because the gripper is symmetric. `pick_descend` re-aligns with a planned move if XY or orientation is off. `pick_retract` lifts at the current tool orientation, so it never twists a held part. `pick_test.sh` takes `YAW_DEG` as a 5th argument. The workflow engine passes `pick_coords` through, so a perception `yaw` will reach the bridge (perception does not produce one yet).
+     - `_tool_quat()` reads the orientation from cuMotion FK of the XRDF tool frame, the frame the IK targets.
+     - `_ik_move_to` now fails if the arm ends > 20 mm or > 5° from the target. It used to return "ok" from anywhere.
+     - Valve at 4°: by hand it picks (0.04° yaw error, 49 N, hold OK). `pick_test.sh` from a fresh start failed 3/3. The approach's gantry pre-slide always fails ("NO PATH to cspace target", and the error is ignored). The pose planner then picks the gantry and arm configuration itself: at yaw 0 it reliably lands on gantry −1.86, but with any yaw it often picks gantry ≈ −0.85 with wrist_1 ≈ +2.85, and the arm physically stops ~1.4 rad short. Not fixed here; the collision world moves to nvblox in Step 7 (see there).
   3. ~~Pad force across the stroke.~~ Done 2026-10-13.
      - **Root cause: solver, not drive layout.** The driven `left_outer_knuckle` is 9 g with I ≈ 2e-7 kg·m², inside a closed loop. PhysX passed only ~1 N·m of the drive to the pads: pad force was identical at caps of 1, 10, 30 and 100 N·m, and a 40 N push opened the finger fully. Not the cause: joint limits, joint friction, self-collision, sleeping, 8 velocity iterations, 240 Hz.
      - **Fix: joint armature 1e-3 kg·m² on the gripper joints.** Same 10 N·m cap: 94 mm block 15.6 → 58.7 N per pad, holds an 80 N side push (0.6 mm). Armature 1e-4 lets the pads tilt (0.05–0.07 rad); 1e-2 halves the force. 128 position iterations raise the force but tilt the pads 0.3–0.6 rad.
@@ -193,7 +197,22 @@ Every step ends with a **live check** in Isaac Sim, run through the MCP tools an
 - Make grasp verification read the driver joint by name, not a hard-coded index.
 - **Check:** grasp at least 3 part sizes (small tube, motor valve, large gear). Record contact force and finger angle each time.
 
-## Step 7: Secondary consumers
+## Step 7: nvblox collision world for cuMotion
+Target pipeline: 4 corner depth cameras → robot self-masking → nvblox (TSDF → ESDF) → one cuMotion SDF obstacle → planner. It replaces the point-cloud → sphere world: the 6000-sphere cap (93 831 voxels were cut to 6000 on 2026-10-13), the target carve-out, and the static-world scan.
+- **Constraints found 2026-10-13:**
+  - cuMotion 1.1.0a2 (bundled with Isaac 6.1) supports SDF obstacles: `create_obstacle(Obstacle.Type.SDF)` with an `Obstacle.Grid(nx, ny, nz, voxel_size, host_precision, device_precision)`, filled by `World.set_sdf_grid_values_from_host(values)` (z fastest) and checked with `World.inspect_sdf`.
+  - nvblox: `nvblox_torch 0.0.10+cu12ubuntu24` (GitHub release, matches Ubuntu 24.04 / CUDA 12.8). It requires `torch<=2.9.1` and `numpy<1.27`, and `libpy_nvblox.so` links libtorch directly. Isaac 6.1 runs torch 2.11 / numpy 2.x, so nvblox cannot load inside Isaac's process.
+- **Design:** nvblox runs as a separate local service in its own venv (torch 2.9.1 + cu128). Per world update the bridge sends, for each depth camera: depth image, intrinsics, world pose and a robot mask. The service integrates them and returns a dense ESDF over the workspace box, and the bridge writes it into the cuMotion SDF obstacle.
+- **Steps:**
+  1. Venv + service skeleton; nvblox_torch's own tests pass on this GPU (8 GB, shared with Isaac).
+  2. Bridge: capture depth + intrinsics + pose per camera (the existing `pcd` annotators), plus a robot mask from the XRDF spheres at the current joint state (reuse the self-filter).
+  3. ESDF → cuMotion SDF obstacle; `inspect_sdf` clean; voxel size and box from `robot.yaml` (no constants in code).
+  4. Replace the sphere world in `build_collision_world`; the target part stays in the ESDF and the grasp descent is handled by the Cartesian descent (decide: mask the target in depth, or disable the SDF near the grasp).
+  5. Remove the dead paths: sphere cap, static-world scan, carve-out; and the approach's separate gantry pre-slide whose failure is ignored.
+- **Check:** ESDF distance at known points (bin wall, floor, tray) within one voxel; planned approaches at yaw 0 and ±30° reach the target (`_ik_move_to` check) in 5/5 fresh runs; gear and valve picks still pass.
+- **Later (user, 2026-10-13):** calibrate all cameras (intrinsics + extrinsics) so detected part coordinates and the nvblox map share one frame; then test the VLM pipeline end to end (part detection → 3D grasp target → planned pick). Camera poses come from USD until calibration replaces them.
+
+## Step 8: Secondary consumers
 - **`execution/robot_controller.py`:**
   - Load `robot.yaml`.
   - Drop the stock-UR10 URDF patching.
@@ -207,14 +226,14 @@ Every step ends with a **live check** in Isaac Sim, run through the MCP tools an
 - **LLM prompts:** change "UR10" → "UR10e" and "RSD455" → "D555". Re-check the camera-height text.
 - **Check:** `pytest tests/` passes; mock-mode CLI runs.
 
-## Step 8: Docs and cleanup
+## Step 9: Docs and cleanup
 - Update `CLAUDE.md`, `AGENTS.md` and `GEMINI.md`: robot description and the scene reference table.
 - Update the header of `robot_self_filtering_spec.md`.
 - `PIPELINE_UPDATES_PENDING.md` §4–5: re-measure on the new stage which prims move with the robot, and the label placement.
 - Archive `src/` (legacy) and `robot_config/ur10/AIKIDO.yaml` (dead Lula config).
 - Fix `gripper_max_width` (0.085 → 0.140) or remove it.
 
-## Step 9: End-to-end validation
+## Step 10: End-to-end validation
 - Full UI run: "Pick all motor valves and place them into tray compartment 1". Record success rate and failure modes using the evaluation recorder, and compare against the UR10 baseline in `THESIS_EVALUATION_RESULTS.md`.
 
 ---

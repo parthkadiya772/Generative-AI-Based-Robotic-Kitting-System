@@ -220,11 +220,56 @@ def _tcp_offset():
     return GRIPPER_TCP_OFFSET
 
 
-def _tool_down():
-    """Normalised tool-down quaternion, or a clear error while unset."""
+def _tool_down(yaw=0.0):
+    """Normalised tool-down quaternion turned ``yaw`` rad about world +Z.
+
+    yaw 0 = pads close along world Y. The 2F-140 is symmetric, so yaw is
+    folded into [-pi/2, pi/2) to keep the wrist turn small.
+    """
     if DOWNWARD_ORIENTATION is None:
         raise RuntimeError("robot.yaml orientation.tool_down is not set — measure it first")
-    return normalize_quat(DOWNWARD_ORIENTATION)
+    q = normalize_quat(DOWNWARD_ORIENTATION)
+    yaw = (float(yaw) + np.pi / 2) % np.pi - np.pi / 2
+    if yaw == 0.0:
+        return q
+    c, s = np.cos(yaw / 2), np.sin(yaw / 2)
+    w, x, y, z = q   # world-frame turn: q_z(yaw) * q
+    return normalize_quat(np.array([c * w - s * z, c * x - s * y, c * y + s * x, c * z + s * w]))
+
+
+def _tool_quat():
+    """Current tool orientation [w, x, y, z] in world, in the IK's frame.
+
+    From cuMotion FK of the XRDF tool frame (what ik_solve / ik_step
+    target), not the USD prim: the USD robotiq_base_link frame is turned
+    about the approach axis relative to the URDF one.
+    """
+    kin = STATE.cumotion_robot.kinematics
+    pose = np.array(kin.pose(_current_cspace(), CUMOTION_TOOL_FRAME).matrix())
+    return _matrix_to_quat(_robot_base_matrix()[:3, :3] @ pose[:3, :3])
+
+
+def _matrix_to_quat(m):
+    """[w, x, y, z] from a 3x3 rotation matrix (Shepperd; stable near w = 0)."""
+    t = np.trace(m)
+    if t > max(m[0, 0], m[1, 1], m[2, 2]):
+        s = 2.0 * np.sqrt(1.0 + t)
+        q = [s / 4, (m[2, 1] - m[1, 2]) / s, (m[0, 2] - m[2, 0]) / s, (m[1, 0] - m[0, 1]) / s]
+    elif m[0, 0] >= m[1, 1] and m[0, 0] >= m[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2])
+        q = [(m[2, 1] - m[1, 2]) / s, s / 4, (m[0, 1] + m[1, 0]) / s, (m[0, 2] + m[2, 0]) / s]
+    elif m[1, 1] >= m[2, 2]:
+        s = 2.0 * np.sqrt(1.0 - m[0, 0] + m[1, 1] - m[2, 2])
+        q = [(m[0, 2] - m[2, 0]) / s, (m[0, 1] + m[1, 0]) / s, s / 4, (m[1, 2] + m[2, 1]) / s]
+    else:
+        s = 2.0 * np.sqrt(1.0 - m[0, 0] - m[1, 1] + m[2, 2])
+        q = [(m[1, 0] - m[0, 1]) / s, (m[0, 2] + m[2, 0]) / s, (m[1, 2] + m[2, 1]) / s, s / 4]
+    return normalize_quat(np.array(q, dtype=np.float64))
+
+
+def _quat_angle(a, b):
+    """Rotation angle [rad] between two unit quaternions."""
+    return 2.0 * float(np.arccos(min(1.0, abs(float(np.dot(a, b))))))
 
 
 def _quat_to_matrix(q):
@@ -3431,7 +3476,15 @@ async def _ik_move_to(target_xyz, orientation=None, settle_frames=SETTLE_FRAMES)
     target_joints = apply_arm_joints(STATE.robot, STATE.dof_names, STATE.arm_names, action)
     await _apply_interpolated(target_joints, settle_frames=settle_frames)
 
+    # The planner sometimes picks a contorted goal the arm cannot physically
+    # finish (wrist stops ~1 rad short); report that instead of "ok".
     ee_pos = get_tcp_pos()
+    pos_err = float(np.linalg.norm(ee_pos - target_pos))
+    ori_err = float(np.degrees(_quat_angle(_tool_quat(), normalize_quat(ori))))
+    if pos_err > 0.02 or ori_err > 5.0:
+        return {"error": f"move did not reach target {list(target_xyz)}: "
+                         f"TCP off {pos_err * 1000:.0f} mm, {ori_err:.1f} deg",
+                "ee_position": ee_pos.tolist()}
     return {"status": "ok", "target": list(target_xyz), "ee_position": ee_pos.tolist()}
 
 
@@ -4008,7 +4061,7 @@ async def _approach_target(params):
         except Exception as e:
             return {"error": f"Invalid orientation {orientation}: {e}"}
     else:
-        ori = _tool_down()
+        ori = _tool_down(params.get("yaw", 0.0))
 
     if cartesian:
         # Step-by-step Cartesian motion — keeps the arm in the same
@@ -4128,7 +4181,7 @@ async def _pick_descend(params):
     STATE.is_executing = True
     steps = []
     try:
-        locked_ori = _tool_down()
+        locked_ori = _tool_down(params.get("yaw", 0.0))   # yaw: align pads to the part
         zp = _pick_z_positions(z, params.get("grasp_lift"))
         grasp_target_z = zp["grasp_target_z"]
 
@@ -4138,16 +4191,19 @@ async def _pick_descend(params):
         await _set_gripper(FINGER_OPEN)
         steps.append({"phase": "open_gripper", "status": "ok"})
 
-        # 2. XY alignment. The gantry is a cuMotion cspace joint, so do not
-        #    slide it on its own (that drags the TCP off target); if the TCP
-        #    is not above (x, y), make one planned move there at this height.
+        # 2. XY + yaw alignment. The gantry is a cuMotion cspace joint, so do
+        #    not slide it on its own (that drags the TCP off target); if the
+        #    TCP is not above (x, y) or not at the grasp yaw, make one planned
+        #    move there at this height (the descent below holds orientation).
         tcp_now = get_tcp_pos()
         xy_off = float(np.hypot(tcp_now[0] - x, tcp_now[1] - y))
-        if xy_off > 0.005:
+        ori_off = _quat_angle(_tool_quat(), locked_ori)
+        if xy_off > 0.005 or ori_off > np.radians(1.0):
             align = await _ik_move_to([x, y, float(tcp_now[2])], orientation=locked_ori)
             if "error" in align:
-                return {"error": f"XY align failed: {align['error']}", "steps": steps}
-        steps.append({"phase": "xy_align", "status": "ok", "offset_mm": xy_off * 1000})
+                return {"error": f"XY/yaw align failed: {align['error']}", "steps": steps}
+        steps.append({"phase": "xy_align", "status": "ok", "offset_mm": xy_off * 1000,
+                      "yaw_off_deg": float(np.degrees(ori_off))})
 
         # 3. Direct smooth descent to grasp target with contact stop
         contact_min_force = float(params.get("descent_contact_min_force", 0.5))
@@ -4458,7 +4514,7 @@ async def _pick_retract(params):
     STATE.is_executing = True
     steps = []
     try:
-        locked_ori = _tool_down()
+        locked_ori = _tool_quat()   # lift at the grasp orientation (any yaw)
         zp = _pick_z_positions(z)
         safe_pos = np.array([x, y, zp["safe_z"]])
         transit_pos = np.array([x, y, zp["transit_z"]])
