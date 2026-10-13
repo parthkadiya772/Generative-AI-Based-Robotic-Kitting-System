@@ -123,14 +123,14 @@ Every step ends with a **live check** in Isaac Sim, run through the MCP tools an
     - The place "arm config reset" was a Lula warm-start trick and just re-solves the same pose with cuMotion; revisit.
   - Do not save the live stage over `AIKIDO_ur10e_swapped.usd`: its root layer holds simulation state and the bridge's runtime contact sensors.
 
-## Step 6: Gripper re-tune 🟡 in progress (paused 2026-10-12)
+## Step 6: Gripper re-tune 🟡 in progress (items 1 and 3 done 2026-10-13)
 - **Done:**
-  - **Parallel pads.** The asset leaves the inner finger and pad joints unactuated (inner k = 0.002, pad k = 0), so the pads flopped, depended on history, and re-opened only to 122 mm. The bridge now gives them drives at start (`gripper.joint_gains`).
-    - Modes: inner = `mirror` (−pad angle), pad = `pad` (+pad angle).
-    - While holding a part, the pad angle follows the measured finger angle (`STATE.pad_hold`).
-    - Pads parallel within 0.3°; re-open repeatable at 143.8 mm.
+  - **Passive four-bar + armature** (2026-10-13, replaces the earlier parallel-pad drives). The asset leaves the inner finger and pad joints unactuated, and with the outer finger joints `free` each side's loop had 5 revolutes (2 DOF), so the pads flopped and re-opened only to 122 mm. Now:
+    - Modes: outer finger = `zero` (rigid, as on the real 2F-140); inner and pad = `free`. No inner/pad drives: they held the linkage at the contact angle (`STATE.pad_hold`) and ate the squeeze.
+    - `gripper.armature: 0.001` on all 8 gripper joints (bridge start, `set_armatures`). See item 3 below for why.
+    - Free air: pads parallel to 0.0002 rad, re-open repeatable to finger 0.0. Holding: pads parallel within 0.03 rad (<2°), mimic lag ≤ 0.009 rad.
   - `gripper.width_table` re-measured with parallel pads: `[finger rad, pad gap m, pad-face centre depth m]`. Loader has `gap_for_finger()` / `finger_for_gap()` (linear fallback for UR10). Bridge mappings use them.
-  - `finger_joint` torque capped at 10 N·m (`joint_gains`, about 40 N per pad, `force_limit`). The asset's 1000 N·m was unrealistic.
+  - `finger_joint` torque capped at 10 N·m (`joint_gains`; 30–60 N per pad over the stroke, see item 3). The asset's 1000 N·m was unrealistic.
   - **Contact sensor fixed.** The bridge called `get_current_frame()`, which does not exist in Isaac 6.1's experimental ContactSensor, so it always read 0. It now uses `get_data()`.
   - Adaptive close:
     - starts from the current angle
@@ -144,8 +144,8 @@ Every step ends with a **live check** in Isaac Sim, run through the MCP tools an
 
   | Part | Result |
   |---|---|
-  | `large_gear_1` (95 mm, 42 mm tall, 0.15 kg) | Picks and lifts reliably. Contact (sensor) at 0.319 rad, hold 48 N, hold check after lift OK. Run: `pick_test.sh -1.5206 -0.7157 0.8345` |
-  | `motor_valve_1` (0.33 kg) | Not solved. Grip confirmed (up to 40 N), but the valve slips out during the lift. |
+  | `large_gear_1` (95 mm, 42 mm tall, 0.15 kg) | Picks and lifts reliably. Contact (sensor) at 0.319 rad, hold 48 N (47 N after item 3), hold check after lift OK. Run: `pick_test.sh -1.5206 -0.7157 0.8345` |
+  | `motor_valve_1` (0.33 kg) | Picks and lifts (2026-10-13, after item 3). Contact (sensor) at 0.297 rad, hold 49.5 N, valve lifted ~0.4 m with the gripper. Run: `pick_test.sh -0.632 -0.732 0.8655 -0.0245` |
 
 - **Motor valve notes:**
   - The flat band across the pads is only z 0.807–0.831 (about 102 mm wide; centre x −0.580, y −0.717 at spawn). Above and below it the valve is narrower or rounded.
@@ -162,7 +162,23 @@ Every step ends with a **live check** in Isaac Sim, run through the MCP tools an
 - **Resume here (next session):**
   1. ~~Valve: measure contacts at the last attempt.~~ Done 2026-10-13, see above. The valve now grasps flat at (−0.632, −0.732, top 0.8655, `grasp_lift −0.0245`) but slips because the pad force is too low.
   2. Add grasp yaw: `pick_descend` and `pick_retract` lock `_tool_down()`. Add an optional `yaw` (or orientation) parameter so the pads can align to the part (from perception). Retry the valve with yaw ≈ part yaw.
-  3. Check that pad force is right across the stroke. With the parallel-pad drives, the force at near-open angles was much lower (6–9 N) than mid-stroke (48 N). Measure pad force against finger angle at the 10 N·m cap; raise the cap if needed. Real 2F-140: 20–125 N.
+  3. ~~Pad force across the stroke.~~ Done 2026-10-13.
+     - **Root cause: solver, not drive layout.** The driven `left_outer_knuckle` is 9 g with I ≈ 2e-7 kg·m², inside a closed loop. PhysX passed only ~1 N·m of the drive to the pads: pad force was identical at caps of 1, 10, 30 and 100 N·m, and a 40 N push opened the finger fully. Not the cause: joint limits, joint friction, self-collision, sleeping, 8 velocity iterations, 240 Hz.
+     - **Fix: joint armature 1e-3 kg·m² on the gripper joints.** Same 10 N·m cap: 94 mm block 15.6 → 58.7 N per pad, holds an 80 N side push (0.6 mm). Armature 1e-4 lets the pads tilt (0.05–0.07 rad); 1e-2 halves the force. 128 position iterations raise the force but tilt the pads 0.3–0.6 rad.
+     - With armature the inner/pad drives are not needed for parallel pads, and they were acting as a brake: with frozen `pad_hold` targets, commanding the finger open to 0.25 rad left it at 0.300 rad.
+     - Pad force against finger angle (floating 0.3 kg block, 10 N·m cap, contact report on both pads):
+
+       | Block | Finger rad | Pad force L / R |
+       |---|---|---|
+       | 130 mm | 0.104 | 29.5 / 29.5 N |
+       | 110 mm | 0.223 | 33.8 / 33.8 N |
+       | 94 mm | 0.314 | 38.7 / 38.7 N |
+       | 75 mm | 0.418 | 49.8 / 49.8 N |
+       | 57 mm | 0.515 | 59.8 / 60.0 N |
+       | 37 mm | 0.615 | 55.6 / 56.0 N |
+
+       All inside the real 2F-140's 20–125 N, so the cap stays at 10 N·m.
+     - Left unused: the `pad` / `mirror` modes and `STATE.pad_hold` in the bridge. Remove them, or keep them for another gripper.
   4. Third part size. The scene has only gears and valves (no small tube). Use a second gear orientation or add a small part.
   5. Re-run the gear test as a regression check, then commit and mark Step 6 done. Stale `close_min` / `close_max` / `close` values (0.55 / 0.69 / 0.5 rad) should be re-checked against the new width_table (`close` = 57 mm gap).
 - **How to start a session:**

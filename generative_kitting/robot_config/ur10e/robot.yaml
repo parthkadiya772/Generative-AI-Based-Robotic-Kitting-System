@@ -33,12 +33,14 @@ joints:
   gripper_modes:
     finger_joint: drive
     right_outer_knuckle_joint: drive
-    left_outer_finger_joint: free
-    right_outer_finger_joint: free
-    left_inner_finger_joint: mirror      # keeps the pads parallel
-    right_inner_finger_joint: mirror
-    left_inner_finger_pad_joint: pad
-    right_inner_finger_pad_joint: pad
+    left_outer_finger_joint: zero        # rigid on the real 2F-140; free let the loop collapse
+    right_outer_finger_joint: zero
+    # passive four-bar: with gripper.armature the loop alone keeps the pads
+    # parallel (<2 deg); drives here held the linkage and ate the squeeze
+    left_inner_finger_joint: free
+    right_inner_finger_joint: free
+    left_inner_finger_pad_joint: free
+    right_inner_finger_pad_joint: free
 
 gantry:
   x_offset: 1.27
@@ -77,14 +79,14 @@ gripper:
     - [0.6, 0.0370, 0.1994]
     - [0.7, 0.0171, 0.2002]
     - [0.76, 0.0051, 0.2002]
-  # applied at bridge start; the asset leaves these joints unactuated
-  # [stiffness N*m/rad, damping, max force N*m]
+  # applied at bridge start; [stiffness N*m/rad, damping, max force N*m]
   joint_gains:
-    finger_joint: [114591.6, 11459.2, 10.0]   # ~40 N per pad (force_limit)
-    left_inner_finger_joint: [1000.0, 10.0, 50.0]
-    right_inner_finger_joint: [1000.0, 10.0, 50.0]
-    left_inner_finger_pad_joint: [1000.0, 10.0, 50.0]
-    right_inner_finger_pad_joint: [1000.0, 10.0, 50.0]
+    finger_joint: [114591.6, 11459.2, 10.0]   # 30-60 N per pad over the stroke
+  # joint armature [kg m^2] on every gripper_modes joint, applied at bridge start.
+  # The driven knuckle is 9 g (I ~2e-7), so without it the solver passes only
+  # ~1 N*m of the drive through the closed loop (pads 2-15 N at any cap).
+  # 1e-3 measured best 2026-10-13: 1e-4 lets pads tilt, 1e-2 halves the force.
+  armature: 0.001
   grip_overshoot: 0.060
   entry_clearance: 0.020
   grasp_confirm_rad: 0.02   # held if finger stops this far short of target

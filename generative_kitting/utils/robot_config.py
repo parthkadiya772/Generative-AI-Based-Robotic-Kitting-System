@@ -207,6 +207,11 @@ class RobotConfig:
         """Joint -> [stiffness, damping, max force] applied at bridge start."""
         return self.raw["gripper"].get("joint_gains") or {}
 
+    @property
+    def gripper_armature(self) -> float:
+        """Joint armature [kg m^2] for every gripper_modes joint (0 = leave the asset's)."""
+        return float(self.raw["gripper"].get("armature") or 0.0)
+
     def gap_for_finger(self, finger_rad: float) -> float:
         """Pad gap [m] at a finger_joint angle (width_table, else linear in stroke)."""
         table = self.width_table
@@ -304,6 +309,9 @@ class RobotConfig:
             if joint not in modes or len(gains) != 3:
                 errors.append(f"gripper.joint_gains.{joint}: needs a gripper_modes joint "
                               "and [stiffness, damping, max_force]")
+        armature = self.raw["gripper"].get("armature")
+        if armature is not None and (not isinstance(armature, (int, float)) or armature < 0):
+            errors.append("gripper.armature: needs a number >= 0 [kg m^2]")
 
         n_cspace = len(self.cspace_joints)
         for key in ("cumotion.max_vel", "cumotion.max_acc"):

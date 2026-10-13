@@ -104,13 +104,13 @@ class TestShippedConfigs:
         assert {"gantry", "vagn"} <= set(self_)
         assert set(world) == set(self_) - {"gantry", "vagn"}
 
-    def test_ur10e_parallel_pad_modes(self):
+    def test_ur10e_passive_four_bar(self):
         cfg = load_robot_config(UR10E_DIR)
-        assert cfg.gripper_modes["left_inner_finger_joint"] == "mirror"
-        assert cfg.gripper_modes["left_inner_finger_pad_joint"] == "pad"
-        assert set(cfg.gripper_joint_gains) == {
-            "finger_joint", "left_inner_finger_joint", "right_inner_finger_joint",
-            "left_inner_finger_pad_joint", "right_inner_finger_pad_joint"}
+        assert cfg.gripper_modes["left_outer_finger_joint"] == "zero"
+        assert cfg.gripper_modes["left_inner_finger_joint"] == "free"
+        assert cfg.gripper_modes["left_inner_finger_pad_joint"] == "free"
+        assert set(cfg.gripper_joint_gains) == {"finger_joint"}
+        assert cfg.gripper_armature == pytest.approx(0.001)
 
     def test_width_table_mapping(self):
         cfg = load_robot_config(UR10E_DIR)
@@ -200,6 +200,12 @@ class TestValidation:
         def edit(c):
             c["gripper"]["joint_gains"]["no_such_joint"] = [1.0, 0.1, 1.0]
         with pytest.raises(RobotConfigError, match="joint_gains"):
+            load_robot_config(_write_variant(tmp_path, UR10E_DIR, edit))
+
+    def test_armature_must_be_non_negative(self, tmp_path):
+        def edit(c):
+            c["gripper"]["armature"] = -0.001
+        with pytest.raises(RobotConfigError, match="armature"):
             load_robot_config(_write_variant(tmp_path, UR10E_DIR, edit))
 
     def test_absolute_paths_pass_through(self):

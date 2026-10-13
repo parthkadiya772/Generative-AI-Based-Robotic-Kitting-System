@@ -383,22 +383,29 @@ def _finger_angle():
 
 
 def _apply_gripper_gains():
-    """Give the asset's unactuated finger joints drives (robot.yaml gripper.joint_gains)."""
+    """Apply robot.yaml gripper.joint_gains (drive gains) and gripper.armature."""
     gains = ROBOT_CFG.gripper_joint_gains
-    if not gains:
-        return
-    ctrl = STATE.robot.get_articulation_controller()
-    kp, kd = (np.array(v, dtype=np.float64) for v in ctrl.get_gains())
-    max_force = np.array(ctrl.get_max_efforts(), dtype=np.float64)
-    for name, (stiffness, damping, force) in gains.items():
-        if name not in STATE.dof_names:
-            print(f"[WARN] gripper.joint_gains: no DOF named '{name}'")
-            continue
-        i = STATE.dof_names.index(name)
-        kp[i], kd[i], max_force[i] = stiffness, damping, force
-    ctrl.set_gains(kps=kp, kds=kd)
-    ctrl.set_max_efforts(max_force)
-    print(f"[OK] Gripper joint gains applied: {', '.join(sorted(gains))}")
+    if gains:
+        ctrl = STATE.robot.get_articulation_controller()
+        kp, kd = (np.array(v, dtype=np.float64) for v in ctrl.get_gains())
+        max_force = np.array(ctrl.get_max_efforts(), dtype=np.float64)
+        for name, (stiffness, damping, force) in gains.items():
+            if name not in STATE.dof_names:
+                print(f"[WARN] gripper.joint_gains: no DOF named '{name}'")
+                continue
+            i = STATE.dof_names.index(name)
+            kp[i], kd[i], max_force[i] = stiffness, damping, force
+        ctrl.set_gains(kps=kp, kds=kd)
+        ctrl.set_max_efforts(max_force)
+        print(f"[OK] Gripper joint gains applied: {', '.join(sorted(gains))}")
+    # Light finger links in the closed loop need armature, or the solver
+    # passes only a fraction of the drive torque to the pads.
+    armature = ROBOT_CFG.gripper_armature
+    if armature > 0:
+        joints = [j for j in GRIPPER_JOINT_MODES if j in STATE.dof_names]
+        STATE.robot._articulation_view.set_armatures(
+            np.full((1, len(joints)), armature, dtype=np.float32), joint_names=joints)
+        print(f"[OK] Gripper armature {armature} kg*m^2 on {len(joints)} joints")
 
 # ═════════════════════════════════════════════════════════════
 # COLLISION WORLD  (4-camera point cloud → cuMotion sphere colliders)
