@@ -1,0 +1,8 @@
+# nvblox service venv (separate from Isaac Sim: nvblox_torch links libtorch <= 2.9.1,
+# Isaac Sim 6.1 ships torch 2.11). Install with setup_venv.sh.
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.9.1+cu128
+torchvision==0.24.1+cu128
+nvblox_torch @ https://github.com/nvidia-isaac/nvblox/releases/download/v0.0.10/nvblox_torch-0.0.10+cu12ubuntu24-py3-none-linux_x86_64.whl
+nvidia-npp-cu12        # libnppc.so.12, needed by libpy_nvblox.so; torch does not ship it
+pytest
