@@ -185,12 +185,8 @@ GRIPPER_DRIVE_JOINT = ROBOT_CFG.gripper_drive_joint
 GRIPPER_JOINT_MODES = ROBOT_CFG.gripper_modes
 FINGER_OPEN      = ROBOT_CFG.finger["open"]
 FINGER_CLOSE     = ROBOT_CFG.finger["close"]
-FINGER_CLOSE_MIN = ROBOT_CFG.finger["close_min"]   # large parts
-FINGER_CLOSE_MAX = ROBOT_CFG.finger["close_max"]   # small parts
 ROBOTIQ_MAX_STROKE = ROBOT_CFG.gripper["stroke"]
 ROBOTIQ_MAX_RAD    = ROBOT_CFG.finger["max_rad"]
-GRIP_OVERSHOOT   = ROBOT_CFG.gripper["grip_overshoot"]
-ENTRY_CLEARANCE  = ROBOT_CFG.gripper["entry_clearance"]
 GRASP_CONFIRM_RAD = ROBOT_CFG.gripper["grasp_confirm_rad"]
 
 GRIPPER_TCP_OFFSET   = ROBOT_CFG.tcp_offset           # None until measured
@@ -350,31 +346,6 @@ def compute_grasp_geometry(stage, part_path, depth_frac=0.5):
         "part_width": part_width,
         "grasp_z": grasp_z,
     }
-
-
-def compute_adaptive_finger_close(part_width):
-    """Finger angle that squeezes a part of ``part_width`` [m].
-
-    Targets a pad gap GRIP_OVERSHOOT narrower than the part, so the drive
-    keeps pushing once the pads touch. Mapped through robot.yaml
-    gripper.width_table, then clamped to [close_min, close_max].
-    """
-    desired_gap = max(0.0, part_width - GRIP_OVERSHOOT)
-    finger_rad = ROBOT_CFG.finger_for_gap(desired_gap)
-    clamped = float(np.clip(finger_rad, FINGER_CLOSE_MIN, FINGER_CLOSE_MAX))
-    print(f"  [GRIP] part_width={part_width*1000:.1f}mm overshoot={GRIP_OVERSHOOT*1000:.0f}mm "
-          f"-> finger_close={clamped:.3f} rad")
-    return clamped
-
-
-def compute_entry_finger_shape(part_width):
-    """Finger angle for bin entry: pads ENTRY_CLEARANCE wider than the part.
-
-    Pre-shapes the gripper before descending so the open (144 mm) fingers
-    cannot clip the bin walls. Stays wider than close_min.
-    """
-    finger_rad = ROBOT_CFG.finger_for_gap(part_width + ENTRY_CLEARANCE)
-    return float(np.clip(finger_rad, FINGER_OPEN, FINGER_CLOSE_MIN - 0.05))
 
 
 def apply_arm_joints(robot, dof_names, arm_names, ik_result):
@@ -3365,37 +3336,6 @@ async def _close_gripper_slow(target_value, n_steps=12):
             await omni.kit.app.get_app().next_update_async()
 
     return {"status": "ok", "finger_value": target_value}
-
-
-def _force_grip(finger_value):
-    """Lock gripper on part with maximum holding force.
-
-    Three-step grip lock:
-      1. set_joint_positions  — teleport fingers to closed position (instant)
-      2. set_joint_velocities — zero out any opening velocity from contacts
-      3. apply_action with FINGER_CLOSE_MAX — sets PD target BEYOND the
-         part surface so the controller continuously pushes fingers inward
-         (like a real gripper commanding full close against a part)
-
-    Call this AFTER every apply_action that moves the arm while holding a part.
-    """
-    from isaacsim.core.utils.types import ArticulationAction
-
-    current = STATE.robot.get_joint_positions()
-
-    # Step 1: teleport fingers to the requested position
-    gripped = set_finger_joints(STATE.robot, STATE.dof_names, finger_value, current.copy())
-    STATE.robot.set_joint_positions(gripped)
-
-    # Step 2: zero out all joint velocities so no residual drift
-    zero_vel = np.zeros_like(current)
-    STATE.robot.set_joint_velocities(zero_vel)
-
-    # Step 3: command PD target at FINGER_CLOSE_MAX (beyond part surface)
-    #   PD error = FINGER_CLOSE_MAX - actual_finger_pos > 0
-    #   → controller applies continuous closing torque → firm grip
-    grip_targets = set_finger_joints(STATE.robot, STATE.dof_names, FINGER_CLOSE_MAX, gripped.copy())
-    STATE.robot.apply_action(ArticulationAction(joint_positions=grip_targets))
 
 
 async def _verify_grasp():

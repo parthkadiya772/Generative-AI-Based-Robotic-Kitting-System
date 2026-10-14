@@ -123,7 +123,7 @@ Every step ends with a **live check** in Isaac Sim, run through the MCP tools an
     - The place "arm config reset" was a Lula warm-start trick and just re-solves the same pose with cuMotion; revisit.
   - Do not save the live stage over `AIKIDO_ur10e_swapped.usd`: its root layer holds simulation state and the bridge's runtime contact sensors.
 
-## Step 6: Gripper re-tune 🟡 in progress (items 1–3 done 2026-10-13)
+## Step 6: Gripper re-tune ✅ done (2026-10-14; real third part size pending, user adds parts later)
 - **Done:**
   - **Passive four-bar + armature** (2026-10-13, replaces the earlier parallel-pad drives). The asset leaves the inner finger and pad joints unactuated, and with the outer finger joints `free` each side's loop had 5 revolutes (2 DOF), so the pads flopped and re-opened only to 122 mm. Now:
     - Modes: outer finger = `zero` (rigid, as on the real 2F-140); inner and pad = `free`. No inner/pad drives: they held the linkage at the contact angle (`STATE.pad_hold`) and ate the squeeze.
@@ -183,8 +183,10 @@ Every step ends with a **live check** in Isaac Sim, run through the MCP tools an
 
        All inside the real 2F-140's 20–125 N, so the cap stays at 10 N·m.
      - Left unused: the `pad` / `mirror` modes and `STATE.pad_hold` in the bridge. Remove them, or keep them for another gripper.
-  4. Third part size. The scene has only gears and valves (no small tube). Use a second gear orientation or add a small part.
-  5. Re-run the gear test as a regression check, then commit and mark Step 6 done. Stale `close_min` / `close_max` / `close` values (0.55 / 0.69 / 0.5 rad) should be re-checked against the new width_table (`close` = 57 mm gap).
+  4. ~~Third part size.~~ Checked 2026-10-14 with a **temporary stand-in** (the user's bin has only motor valves and large gears; real small parts come later): a 30 mm × 100 mm dynamic cylinder spawned in the sim at the free floor patch (−2.02, −0.71), never saved to the USD and removed afterwards. Grasp at `grasp_lift −0.027`: contact at 0.638 rad, held at a 27 mm pad gap with 52 N, hold OK after lift.
+     - **Minimum grasp height:** the finger bottom is ~47 mm below the pad centre and closing lowers the pads another 16–24 mm, so the pad centre must be ≥ ~5 cm above the surface the part stands on. A 30 × 50 mm tube could not be gripped: the left finger landed on the bin floor at an 80 mm gap (PhysX overlap: `robot_facade_full`) while the pad sensor read 0 N. The adaptive close then stopped on a lag/stall at 0.247 rad. Input for the later grasp-point layer.
+     - Do not delete physics prims while the timeline plays: it invalidated the physics views (bridge "Failed to get DOF positions"); recovery was stop, `World.clear_instance()`, play + stop, restart the bridge.
+  5. ~~Re-run the gear test; re-check the stale close values.~~ Done 2026-10-14. `close_min` / `close_max` (and `grip_overshoot` / `entry_clearance`) only fed dead code (`compute_adaptive_finger_close`, `compute_entry_finger_shape`, `_force_grip`, no callers); all removed. `close` (0.5 rad = 57 mm) was the default hold for `pick_retract` / place without `grip_hold` and the blind `gripper close`: it re-opened the fingers on the held 30 mm stand-in and dropped it. Now `close: 0.76` (= `max_rad`, full close; the drive stops on the part) and the same retract holds. Regression on fresh scenes: `large_gear_1` 50.5 N hold OK, `motor_valve_1` 42.0 N hold OK.
 - **How to start a session:**
   - Open `UR10e_Container_Assets/AIKIDO_ur10e_swapped.usd` in Isaac Sim 6.1. Enable the isaac-sim MCP extension (port 8766; `python_server` stays on 8226).
   - In the Script Editor: `exec(open(".../generative_kitting/kitting_bridge_server.py").read())`. The bridge plays the timeline; Stop resets the scene and shuts the bridge down.
