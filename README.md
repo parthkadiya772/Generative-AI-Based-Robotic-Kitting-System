@@ -201,34 +201,27 @@ Useful for testing perception + planning end-to-end on a fixed scene.
 
 ### D. Connect to Isaac Sim (full pipeline with real robot motion)
 
-1. Open Isaac Sim and load `AIKIDO.usd`.
-2. Tell the bridge launcher where your repo lives. Pick **one**:
-   - **Env-var approach** (recommended): set `KITTING_PROJECT_ROOT`
-     to your repo root **before** launching Isaac Sim, e.g.
-     ```powershell
-     # Windows PowerShell — run this in the same shell you'll use
-     # to launch isaac-sim.bat
-     $env:KITTING_PROJECT_ROOT = "C:/path/to/robot_in_air"
-     ```
-     ```bash
-     # Linux / macOS
-     export KITTING_PROJECT_ROOT="$HOME/code/robot_in_air"
-     ```
-   - **.env approach**: set `KITTING_PROJECT_ROOT=/absolute/path/to/robot_in_air`
-     in `.env` at the repo root (copy `.env.example` if you haven't
-     already). `kitting_bridge_server.py` walks up from your home
-     directory looking for a `.env` containing this key and loads it
-     automatically — useful when you can't export env vars in the
-     shell that launches Isaac Sim (e.g. launching it from a desktop
-     icon). This is needed because Isaac Sim's Script Editor copies
-     scripts to a Temp folder before running them, so `__file__`
-     inside the launcher does **not** point at the original file.
-3. In Isaac Sim open **Script Editor** (`Window → Script Editor`),
-   open `generative_kitting/kitting_bridge_server.py`, and click
-   **Run**.
-4. You should see `[OK] Bridge v2 on http://127.0.0.1:8600` in the
+1. Open Isaac Sim and load the scene set in `robot.yaml` (`robot.stage`,
+   currently `UR10e_Container_Assets/AIKIDO_ur10e_swapped.usd`). The scene's
+   assets use relative paths, so the repo can live anywhere.
+2. Copy `.env.example` to `.env` if you have not. Paths in it use
+   `${PROJECT_ROOT}`, which is filled in automatically; no absolute paths.
+3. Start the nvblox service (collision world) from the repo root, once per
+   session (first time: `generative_kitting/nvblox_service/setup_venv.sh`):
+   ```bash
+   generative_kitting/nvblox_service/run.sh generative_kitting/nvblox_service/server.py
+   ```
+4. In Isaac Sim's **Script Editor** (`Window → Script Editor`) run
+   ```python
+   exec(open("/path/to/robot_in_air/generative_kitting/kitting_bridge_server.py").read())
+   ```
+   The launcher finds the repo by itself (from the open stage, the current
+   directory or `$HOME`); no environment variable is needed. To force a
+   checkout, put `KITTING_PROJECT_ROOT = "/path/to/robot_in_air"` before
+   the `exec`, or export it before starting Isaac Sim.
+5. You should see `[OK] Bridge v2 on http://127.0.0.1:8600` in the
    Isaac Sim console.
-5. In another terminal, launch the Streamlit UI (option A above). It
+6. In another terminal, launch the Streamlit UI (option A above). It
    will detect the bridge automatically.
 
 The bridge exposes a small HTTP API (`/api/ping`, `/api/status`,

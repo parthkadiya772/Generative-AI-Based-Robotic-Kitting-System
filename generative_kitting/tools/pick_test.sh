@@ -4,7 +4,10 @@
 #   home -> collision world (target carved) -> approach 0.25 m above -> contact descent
 #   -> adaptive close -> straight lift. Prints grasp/hold results.
 #   YAW_DEG: gripper turn about world +Z (0 = pads close along world Y).
-B=http://localhost:8600/api; L=$(ls -t "$HOME"/.nvidia-omniverse/logs/Kit/Isaac-Sim*/*/kit_*.log | head -1)   # newest Kit log
+# Bridge from BRIDGE_HOST/BRIDGE_PORT (as in .env); Kit logs from KIT_LOG_DIR (default: Linux location).
+B=http://${BRIDGE_HOST:-127.0.0.1}:${BRIDGE_PORT:-8600}/api
+L=$(ls -t "${KIT_LOG_DIR:-$HOME/.nvidia-omniverse/logs/Kit}"/Isaac-Sim*/*/kit_*.log 2>/dev/null | head -1)   # newest Kit log
+[ -n "$L" ] || L=/dev/null                                        # no Kit log: skip the ADAPTIVE lines
 X=$1; Y=$2; Z=$3; GL=${4:-0.0}; AZ=$(python3 -c "print($Z + 0.25)")
 YAW=$(python3 -c "import math; print(math.radians(${5:-0.0}))")
 timeout 40 bash -c "until curl -s -m 2 $B/ping >/dev/null; do sleep 1; done"

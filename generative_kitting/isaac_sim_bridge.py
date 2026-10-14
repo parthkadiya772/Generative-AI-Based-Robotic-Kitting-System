@@ -38,7 +38,7 @@ API on port 8600 that the Streamlit dashboard consumes for:
 
 Usage in Isaac Sim Script Editor:
   exec(open("/path/to/robot_in_air/generative_kitting/kitting_bridge_server.py").read())
-  # kitting_bridge_server.py auto-discovers KITTING_PROJECT_ROOT from your .env
+  # kitting_bridge_server.py finds the repo (no machine-specific setting)
   # and then exec()s this file — do not run isaac_sim_bridge.py directly.
 """
 
@@ -55,66 +55,68 @@ import numpy as np
 #   returns "" and anything configured through .env (notably
 #   ROBOT_CONFIG_PATH for cuMotion) silently comes up unset.
 #
-#   exec(open(...).read()) leaves __file__ undefined, so the project
-#   root is discovered by walking up from whatever anchors exist.
+#   The project root is the folder holding generative_kitting/
+#   isaac_sim_bridge.py, found from this file (kitting_bridge_server.py
+#   sets __file__), KITTING_PROJECT_ROOT, the open USD stage or the cwd.
+#   Nothing machine-specific is needed; .env is optional and holds only
+#   settings (paths in it use ${PROJECT_ROOT}).
 # ═════════════════════════════════════════════════════════════
 
-def _load_env_file():
-    """Load <project_root>/.env into os.environ. Returns the path or None.
+_BRIDGE_MARKER = os.path.join("generative_kitting", "isaac_sim_bridge.py")
 
-    Existing environment variables are NOT overwritten — a real shell
-    export wins over the file, matching dotenv precedence and
-    utils.config_loader's behaviour.
-    """
-    candidates = []
-    try:
-        candidates.append(os.path.dirname(os.path.abspath(__file__)))
-    except NameError:
-        pass  # exec'd from the Script Editor — no __file__
 
-    # The open USD scene (AIKIDO.usd) lives in the project root, which
-    # makes it the most reliable anchor: Isaac Sim's cwd is usually its
-    # own install directory, nowhere near this project.
+def _find_project_root():
+    """Repo root: the first candidate (or parent) that contains this bridge file."""
+    candidates = [globals().get("__file__"), os.environ.get("KITTING_PROJECT_ROOT", "")]
     try:
         import omni.usd
-        stage_url = omni.usd.get_context().get_stage_url() or ""
-        if stage_url:
-            local = stage_url.replace("file:///", "").replace("file://", "")
-            candidates.append(os.path.dirname(os.path.abspath(local)))
+        url = omni.usd.get_context().get_stage_url() or ""
+        for prefix in ("file:///", "file://", "file:"):
+            if url.startswith(prefix):
+                url = url[len(prefix):] if os.name == "nt" else "/" + url[len(prefix):].lstrip("/")
+                break
+        candidates.append(os.path.dirname(url) if url else "")
     except Exception:
         pass
-
-    candidates.append(os.environ.get("KITTING_PROJECT_ROOT", ""))
     candidates.append(os.getcwd())
-
     for start in candidates:
         if not start:
             continue
         d = os.path.abspath(start)
-        for _ in range(6):                      # walk up a few levels
-            env_path = os.path.join(d, ".env")
-            if os.path.isfile(env_path):
-                for raw in open(env_path, encoding="utf-8").read().splitlines():
-                    line = raw.strip()
-                    if not line or line.startswith("#") or "=" not in line:
-                        continue
-                    key, _, value = line.partition("=")
-                    os.environ.setdefault(key.strip(), value.strip().strip('"\''))
-                return env_path
+        if os.path.isfile(d):
+            d = os.path.dirname(d)
+        for _ in range(8):
+            if os.path.isfile(os.path.join(d, _BRIDGE_MARKER)):
+                return d
             parent = os.path.dirname(d)
             if parent == d:
                 break
             d = parent
-    return None
+    return ""
 
 
-_ENV_FILE = _load_env_file()
-if _ENV_FILE:
-    print(f"[env] loaded {_ENV_FILE}")
-else:
-    print("[env] WARNING: no .env found — ROBOT_CONFIG_PATH and friends "
-          "must be set as real environment variables, or cuMotion will "
-          "not initialise")
+def _load_env_file(root):
+    """Load <root>/.env into os.environ (existing variables win). Returns the path or None."""
+    env_path = os.path.join(root, ".env") if root else ""
+    if not (env_path and os.path.isfile(env_path)):
+        return None
+    for raw in open(env_path, encoding="utf-8").read().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        os.environ.setdefault(key.strip(), value.strip().strip('"\''))
+    return env_path
+
+
+_PROJECT_ROOT = _find_project_root()
+if not _PROJECT_ROOT:
+    raise RuntimeError("isaac_sim_bridge: cannot find the robot_in_air repo; start it "
+                       "through generative_kitting/kitting_bridge_server.py")
+os.environ.setdefault("KITTING_PROJECT_ROOT", _PROJECT_ROOT)
+_ENV_FILE = _load_env_file(_PROJECT_ROOT)
+print(f"[env] project {_PROJECT_ROOT}; "
+      + (f"loaded {_ENV_FILE}" if _ENV_FILE else "no .env (defaults and real env vars only)"))
 
 
 # ═════════════════════════════════════════════════════════════
@@ -122,8 +124,6 @@ else:
 # ROBOT_CONFIG_PATH. Single source of truth for robot hardware.
 # ═════════════════════════════════════════════════════════════
 
-_PROJECT_ROOT = (os.path.dirname(_ENV_FILE) if _ENV_FILE
-                 else os.environ.get("KITTING_PROJECT_ROOT", ""))
 if _PROJECT_ROOT and _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
@@ -466,7 +466,6 @@ POINTCLOUD_CAMERAS = {
     "/World/Camera_Kit": (480, 640),
 }
 
-_PROJECT_ROOT = os.path.dirname(_ENV_FILE) if _ENV_FILE else os.getcwd()
 
 _pc_annotators = {}               # cam_path -> replicator annotator
 # The render product itself, kept so a second annotator (e.g. semantic
