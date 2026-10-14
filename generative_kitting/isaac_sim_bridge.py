@@ -571,18 +571,12 @@ def _voxel_downsample(points, voxel_size):
     return points[idx]
 
 
-async def _capture_pointcloud(cameras=None, ticks=5):
-    """Render the corner cameras and return merged world-frame points (N,3).
-
-    Replicator's ``pointcloud`` annotator already returns WORLD-frame
-    points, so no camera transform is applied here.
-    """
+def _ensure_pointcloud_annotators(cameras):
+    """Create each camera's render product + pointcloud annotator once."""
     import omni.replicator.core as rep
     import omni.usd
 
-    cameras = cameras or POINTCLOUD_CAMERAS
     stage = omni.usd.get_context().get_stage()
-
     for cam_path, res in cameras.items():
         if cam_path in _pc_annotators:
             continue
@@ -597,6 +591,16 @@ async def _capture_pointcloud(cameras=None, ticks=5):
         _pc_render_products[cam_path] = rp
         print(f"  [pcd] attached annotator to {cam_path} @ {res}")
 
+
+async def _capture_pointcloud(cameras=None, ticks=5):
+    """Render the corner cameras and return merged world-frame points (N,3).
+
+    Replicator's ``pointcloud`` annotator already returns WORLD-frame
+    points, so no camera transform is applied here.
+    """
+    import omni.replicator.core as rep
+
+    _ensure_pointcloud_annotators(cameras or POINTCLOUD_CAMERAS)
     if not _pc_annotators:
         return np.empty((0, 3))
 
@@ -683,6 +687,63 @@ def _load_xrdf_collision_spheres():
     return spheres
 
 
+def _robot_spheres_world(sphere_margin, link_margins=None):
+    """XRDF collision spheres at the links' LIVE world poses, plus the wrist camera.
+
+    The arm moves, so a cached transform would fall behind as soon as a
+    joint leaves the pose the cache was built at. The wrist depth camera
+    housing (wrist_camera.root) has no XRDF sphere of its own; it gets one
+    of radius wrist_camera.self_filter_radius.
+
+    Returns (centers (n,3), radii (n,), links (n,)), radii including
+    sphere_margin, or link_margins[link] where given (not the housing);
+    links name each sphere's link, "wrist_camera" for the housing.
+    """
+    link_margins = link_margins or {}
+    import omni.usd
+    from pxr import Gf
+    stage = omni.usd.get_context().get_stage()
+
+    centers, radii, links = [], [], []
+    for link, sphere_list in _load_xrdf_collision_spheres().items():
+        # URDF link name via robot.yaml; legacy XRDFs keyed spheres by prim path
+        prim = stage.GetPrimAtPath(LINK_PRIMS.get(link, f"{ROBOT_ROOT_PATH}/{link}"))
+        if not prim.IsValid():
+            continue
+        mat = omni.usd.get_world_transform_matrix(prim)
+        for s in sphere_list:
+            centers.append(mat.Transform(Gf.Vec3d(*s["center"])))
+            radii.append(float(s["radius"]) + float(link_margins.get(link, sphere_margin)))
+            links.append(link)
+    cam_prim = stage.GetPrimAtPath(ROBOT_CFG.wrist_camera["root"])
+    if cam_prim.IsValid():
+        centers.append(omni.usd.get_world_transform_matrix(cam_prim).ExtractTranslation())
+        radii.append(float(ROBOT_CFG.wrist_camera["self_filter_radius"]))
+        links.append("wrist_camera")
+    return (np.array(centers, dtype=np.float64).reshape(-1, 3),
+            np.array(radii, dtype=np.float64), np.array(links))
+
+
+def _points_in_spheres(points, centers, radii):
+    """Index of a sphere containing each point (d <= radius), -1 for none."""
+    from scipy.spatial import cKDTree
+
+    hit = np.full(len(points), -1, dtype=np.int64)
+    if len(points) == 0 or len(centers) == 0:
+        return hit
+    # Only points inside the spheres' bounding box can be hit.
+    lo = (centers - radii[:, None]).min(axis=0)
+    hi = (centers + radii[:, None]).max(axis=0)
+    cand = np.flatnonzero(((points >= lo) & (points <= hi)).all(axis=1))
+    if len(cand) == 0:
+        return hit
+    tree = cKDTree(points[cand])
+    for i, idx in enumerate(tree.query_ball_point(centers, radii)):
+        if idx:
+            hit[cand[idx]] = i
+    return hit
+
+
 def _filter_robot_self_points(points, max_z=1.35, sphere_margin=0.02):
     """Filter the robot's own sensed body out of the merged point cloud.
 
@@ -713,48 +774,13 @@ def _filter_robot_self_points(points, max_z=1.35, sphere_margin=0.02):
     if len(pts) == 0:
         return pts, n_initial
 
-    # 2. Carve every XRDF-declared sphere, transformed to its link's LIVE
-    #    world pose (the arm moves — a cached transform would fall behind
-    #    as soon as a joint moves out of the pose the cache was built at).
-    import omni.usd
-    from pxr import Gf
-    stage = omni.usd.get_context().get_stage()
+    # 2. Carve every XRDF-declared sphere at its link's LIVE world pose,
+    #    plus the wrist camera housing.
     spheres_data = _load_xrdf_collision_spheres()
-
-    keep = np.ones(len(pts), dtype=bool)
-    n_links_hit = 0
-    for link, sphere_list in spheres_data.items():
-        # URDF link name via robot.yaml; legacy XRDFs keyed spheres by prim path
-        prim_path = LINK_PRIMS.get(link, f"{ROBOT_ROOT_PATH}/{link}")
-        prim = stage.GetPrimAtPath(prim_path)
-        if not prim.IsValid():
-            continue
-        mat = omni.usd.get_world_transform_matrix(prim)
-        hit_this_link = False
-        for s in sphere_list:
-            local_center = Gf.Vec3d(*s["center"])
-            world_center = np.array(mat.Transform(local_center))
-            radius = float(s["radius"]) + sphere_margin
-            d = np.linalg.norm(pts - world_center, axis=1)
-            inside = d <= radius
-            if inside.any():
-                hit_this_link = True
-            keep &= ~inside
-        if hit_this_link:
-            n_links_hit += 1
-
-    # 3. The wrist depth camera housing has no XRDF sphere of its own.
-    #    /World/rsd555 is the sensor housing prim (parent of the RGB/depth
-    #    sub-prims), matching the validated pattern in
-    #    robot_control_cumotion.py's build_collision_world().
-    cam_prim = stage.GetPrimAtPath(ROBOT_CFG.wrist_camera["root"])
-    if cam_prim.IsValid():
-        cam_pos = np.array(
-            omni.usd.get_world_transform_matrix(cam_prim).ExtractTranslation())
-        d_cam = np.linalg.norm(pts - cam_pos, axis=1)
-        keep &= (d_cam > ROBOT_CFG.wrist_camera["self_filter_radius"])
-
-    pts = pts[keep]
+    centers, radii, links = _robot_spheres_world(sphere_margin)
+    hit = _points_in_spheres(pts, centers, radii)
+    n_links_hit = len(set(links[hit[hit >= 0]]) - {"wrist_camera"})
+    pts = pts[hit < 0]
     n_removed = n_initial - len(pts)
     if not spheres_data:
         print("  [self-filter] *** XRDF sphere data is EMPTY — the robot's "
@@ -767,6 +793,153 @@ def _filter_robot_self_points(points, max_z=1.35, sphere_margin=0.02):
               f"cumotion.link_prims against the XRDF sphere keys; "
               f"self-filtering is silently doing nothing. ***")
     return pts, n_removed
+
+
+# ═════════════════════════════════════════════════════════════
+# NVBLOX COLLISION WORLD  (Step 7: depth cameras → nvblox ESDF)
+#
+#   nvblox runs in its own venv (nvblox_service/server.py, see
+#   robot.yaml nvblox). Per update the bridge renders depth on the same
+#   render products as the pointcloud annotators, masks out pixels that
+#   land on the robot (XRDF spheres at the live joint state) or outside
+#   the workspace box, and posts depth + mask + intrinsics + optical-frame
+#   pose per camera. The service rebuilds its TSDF and ESDF from them.
+# ═════════════════════════════════════════════════════════════
+
+_depth_annotators = {}            # cam_path -> distance_to_image_plane annotator
+NVBLOX_DUMP = os.path.join(_PROJECT_ROOT, "generative_kitting", "logs", "nvblox_frames.npz")
+
+
+async def _capture_depth_frames(cameras, ticks=5):
+    """Depth (H,W float32 m, 0 = no hit), K and T_w_c (optical -> world) per camera."""
+    import omni.replicator.core as rep
+
+    _ensure_pointcloud_annotators({c: POINTCLOUD_CAMERAS[c] for c in cameras})
+    for cam in cameras:
+        if cam not in _depth_annotators and cam in _pc_render_products:
+            annot = rep.AnnotatorRegistry.get_annotator("distance_to_image_plane")
+            annot.attach(_pc_render_products[cam])
+            _depth_annotators[cam] = annot
+            print(f"  [nvblox] attached depth annotator to {cam}")
+
+    for _ in range(ticks):
+        await rep.orchestrator.step_async()
+
+    frames = []
+    for cam in cameras:
+        annot = _depth_annotators.get(cam)
+        if annot is None:
+            continue
+        depth = np.asarray(annot.get_data(), dtype=np.float32)
+        if depth.ndim != 2 or depth.size == 0:
+            print(f"  [nvblox] {cam}: empty depth buffer {depth.shape}")
+            continue
+        # Rays that hit nothing come back inf.
+        depth = np.where(np.isfinite(depth) & (depth > 0), depth, 0.0).astype(np.float32)
+        frames.append({
+            "camera": cam,
+            "depth": depth,
+            "K": _intrinsics_matrix(cam, depth.shape),
+            "T_w_c": np.linalg.inv(_view_matrix_ros(cam)),
+        })
+    return frames
+
+
+def _nvblox_frame_mask(frame, centers, radii, ws_min, ws_max):
+    """uint8 mask, 1 = integrate. 0 for no depth, robot body, or outside the box."""
+    depth = frame["depth"]
+    h, w = depth.shape
+    v, u = np.mgrid[0:h, 0:w]
+    valid = depth > 0
+    uv1 = np.stack([u[valid], v[valid], np.ones(int(valid.sum()))]).astype(np.float64)
+    cam = np.linalg.inv(frame["K"]) @ (uv1 * depth[valid])
+    T = frame["T_w_c"]
+    world = (T[:3, :3] @ cam + T[:3, 3:4]).T
+
+    inside = ((world >= ws_min) & (world <= ws_max)).all(axis=1)
+    robot = _points_in_spheres(world, centers, radii) >= 0
+    mask = np.zeros((h, w), dtype=np.uint8)
+    mask[valid] = inside & ~robot
+    return mask, int(robot.sum()), int((~inside).sum())
+
+
+def _nvblox_post(path, body, content_type):
+    import urllib.request
+    import urllib.error
+
+    url = ROBOT_CFG.nvblox["url"].rstrip("/") + path
+    req = urllib.request.Request(url, data=body, headers={"Content-Type": content_type})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        return json.loads(e.read() or b"{}") or {"error": f"HTTP {e.code}"}
+    except urllib.error.URLError as e:
+        return {"error": f"nvblox service not reachable at {url} ({e.reason}); start it with "
+                         "generative_kitting/nvblox_service/run.sh "
+                         "generative_kitting/nvblox_service/server.py"}
+
+
+async def _nvblox_update(params=None):
+    """Capture the nvblox cameras, mask the robot, and rebuild the nvblox map.
+
+    Params:
+        clear: rebuild from these frames only (default False: integrate into
+               the existing map, see nvblox_service/server.py)
+        dump:  also save the request to logs/nvblox_frames.npz
+    """
+    params = params or {}
+    nv = ROBOT_CFG.nvblox
+    if nv is None:
+        return {"error": "robot.yaml has no nvblox section"}
+    unknown = [c for c in nv["cameras"] if c not in POINTCLOUD_CAMERAS]
+    if unknown:
+        return {"error": f"nvblox.cameras not in POINTCLOUD_CAMERAS: {unknown}"}
+
+    t0 = time.perf_counter()
+    frames = await _capture_depth_frames(nv["cameras"])
+    if not frames:
+        return {"error": "no depth frames captured"}
+    t1 = time.perf_counter()
+
+    centers, radii, _ = _robot_spheres_world(float(nv["robot_mask_margin"]),
+                                             nv.get("robot_mask_link_margins"))
+    ws_min = np.asarray(nv["workspace_min"], dtype=np.float64)
+    ws_max = np.asarray(nv["workspace_max"], dtype=np.float64)
+    arrays = {"num_cameras": len(frames), "clear": bool(params.get("clear", False))}
+    cams = []
+    for i, f in enumerate(frames):
+        mask, n_robot, n_outside = _nvblox_frame_mask(f, centers, radii, ws_min, ws_max)
+        arrays.update({f"depth_{i}": f["depth"], f"mask_{i}": mask,
+                       f"K_{i}": f["K"], f"T_w_c_{i}": f["T_w_c"]})
+        cams.append({"camera": f["camera"], "depth_pixels": int((f["depth"] > 0).sum()),
+                     "robot_pixels": n_robot, "outside_pixels": n_outside,
+                     "integrated_pixels": int(mask.sum())})
+    t2 = time.perf_counter()
+
+    buf = io.BytesIO()
+    np.savez(buf, **arrays)
+    if params.get("dump"):
+        with open(NVBLOX_DUMP, "wb") as fh:
+            fh.write(buf.getvalue())
+    reply = await asyncio.get_event_loop().run_in_executor(
+        None, _nvblox_post, "/integrate", buf.getvalue(), "application/octet-stream")
+    t3 = time.perf_counter()
+
+    for c in cams:
+        print(f"  [nvblox] {c['camera']}: {c['integrated_pixels']} integrated, "
+              f"{c['robot_pixels']} robot, {c['outside_pixels']} outside box")
+    result = {
+        "status": "ok" if "error" not in reply else "error",
+        "cameras": cams,
+        "capture_ms": round(1e3 * (t1 - t0), 1),
+        "mask_ms": round(1e3 * (t2 - t1), 1),
+        "service_ms": round(1e3 * (t3 - t2), 1),
+        "service": reply,
+    }
+    if params.get("dump"):
+        result["dump"] = NVBLOX_DUMP
+    return result
 
 
 def _spheres_from_points(points, prefix, radius, margin=COLLISION_SAFETY_MARGIN):
@@ -2192,6 +2365,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
         elif path == "/api/probe_pointcloud_semantic_fields":
             STATE.push_command({"action": "probe_pointcloud_semantic_fields", "params": body})
             self._send_json(STATE.pop_result(timeout=60))
+        elif path == "/api/nvblox_update":
+            STATE.push_command({"action": "nvblox_update", "params": body})
+            self._send_json(STATE.pop_result(timeout=120))
         elif path == "/api/wrist_obstacles":
             STATE.push_command({"action": "wrist_obstacles", "params": body})
             self._send_json(STATE.pop_result(timeout=60))
@@ -2680,6 +2856,12 @@ def _intrinsics_matrix(prim_path, resolution):
 
     Focal length and apertures share the same tenths-of-a-unit scaling,
     so it cancels in the ratio — no unit conversion needed.
+
+    The renderer keeps the horizontal aperture and draws square pixels
+    at any resolution, so fy = fx. verticalAperture is not used: only
+    CameraSensor syncs it to the aspect, and the pointcloud cameras keep
+    an authored value for another aspect (15.29 vs 15.72 at 480x640),
+    which put their floors 10-40 cm apart (measured 2026-10-14).
     """
     import omni.usd
     from pxr import UsdGeom
@@ -2691,16 +2873,15 @@ def _intrinsics_matrix(prim_path, resolution):
 
     focal = float(usd_cam.GetFocalLengthAttr().Get() or 0.0)
     h_ap = float(usd_cam.GetHorizontalApertureAttr().Get() or 0.0)
-    v_ap = float(usd_cam.GetVerticalApertureAttr().Get() or 0.0)
-    if focal <= 0 or h_ap <= 0 or v_ap <= 0:
+    if focal <= 0 or h_ap <= 0:
         raise RuntimeError(
-            f"{prim_path} has invalid optics "
-            f"(focal={focal}, h_aperture={h_ap}, v_aperture={v_ap})")
+            f"{prim_path} has invalid optics (focal={focal}, h_aperture={h_ap})")
 
     h_res, w_res = resolution
+    f_px = w_res * focal / h_ap
     return np.array([
-        [w_res * focal / h_ap, 0.0, w_res / 2.0],
-        [0.0, h_res * focal / v_ap, h_res / 2.0],
+        [f_px, 0.0, w_res / 2.0],
+        [0.0, f_px, h_res / 2.0],
         [0.0, 0.0, 1.0],
     ])
 
@@ -5145,6 +5326,8 @@ async def _process_commands_loop():
                 result = await _probe_shared_segmentation(cmd.get("params", {}))
             elif action == "probe_pointcloud_semantic_fields":
                 result = await _probe_pointcloud_semantic_fields(cmd.get("params", {}))
+            elif action == "nvblox_update":
+                result = await _nvblox_update(cmd.get("params", {}))
             elif action == "wrist_obstacles":
                 result = await _add_wrist_obstacles(cmd.get("params", {}))
             elif action == "approach":

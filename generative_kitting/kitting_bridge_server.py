@@ -20,14 +20,15 @@ def _parse_env_file(path):
 # 1. Use env var if already exported before launching Isaac Sim (e.g. in ~/.bashrc).
 _root = _os.environ.get("KITTING_PROJECT_ROOT", "")
 
-# 2. If not set, walk $HOME up to 3 levels deep to find a .env containing it.
+# 2. If not set, walk $HOME up to 4 levels deep to find a .env containing it
+#    (~/Documents/CIT/AIKIDO/robot_in_air is 4 deep).
 #    Isaac Sim's Script Editor copies scripts to /tmp/carb.*/ so __file__ is
 #    unreliable — project root cannot be derived from the script path.
 if not _root:
     _home = _os.path.expanduser("~")
     for _dp, _dns, _fns in _os.walk(_home):
         _rel = _os.path.relpath(_dp, _home)
-        if _rel != '.' and _rel.count(_os.sep) >= 3:
+        if _rel != '.' and _rel.count(_os.sep) >= 4:
             _dns[:] = []
             continue
         _dns[:] = [d for d in _dns if not d.startswith('.')]

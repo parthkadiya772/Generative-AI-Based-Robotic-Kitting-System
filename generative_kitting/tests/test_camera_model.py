@@ -7,6 +7,8 @@ isaacsim.sensors.camera.Camera used, using pure numpy — no Isaac Sim.
 
 Reference formulas (isaacsim/sensors/camera/camera.py, 6.0.1):
     get_intrinsics_matrix        fx = w*focal/h_ap, cx = w/2
+                                 fy = fx (square pixels; the bridge
+                                 ignores verticalAperture)
     get_view_matrix_ros          R_U_TRANSFORM @ inv(local_to_world.T)
     get_camera_points_from_image_coords
                                  inv(K) @ (uv1.T * depth)
@@ -25,12 +27,17 @@ R_U_TRANSFORM = np.array([[1.0, 0.0, 0.0, 0.0],
                           [0.0, 0.0, 0.0, 1.0]])
 
 
-def intrinsics(resolution, focal, h_ap, v_ap):
-    """Mirror of the bridge's _intrinsics_matrix (resolution is (h, w))."""
+def intrinsics(resolution, focal, h_ap):
+    """Mirror of the bridge's _intrinsics_matrix (resolution is (h, w)).
+
+    Square pixels: the renderer keeps the horizontal aperture at any
+    resolution, so verticalAperture is not an input.
+    """
     h_res, w_res = resolution
+    f_px = w_res * focal / h_ap
     return np.array([
-        [w_res * focal / h_ap, 0.0, w_res / 2.0],
-        [0.0, h_res * focal / v_ap, h_res / 2.0],
+        [f_px, 0.0, w_res / 2.0],
+        [0.0, f_px, h_res / 2.0],
         [0.0, 0.0, 1.0],
     ])
 
@@ -60,7 +67,6 @@ def pixels_from_world(K, view, points):
 # Matches the real /World/Camera: 1920x1080, focal 15.9, aperture 20.955.
 FOCAL, H_AP = 15.9, 20.955
 RESOLUTION = (1080, 1920)                       # (h, w)
-V_AP = H_AP * RESOLUTION[0] / RESOLUTION[1]     # square pixels
 
 
 @pytest.fixture
@@ -71,30 +77,31 @@ def overhead():
     # except for the translation.
     camera_to_world = np.eye(4)
     camera_to_world[:3, 3] = [0.0, 0.0, 5.10]
-    K = intrinsics(RESOLUTION, FOCAL, H_AP, V_AP)
+    K = intrinsics(RESOLUTION, FOCAL, H_AP)
     return K, view_matrix_ros(camera_to_world)
 
 
 class TestIntrinsics:
     def test_square_pixels_give_equal_focal_lengths(self):
-        K = intrinsics(RESOLUTION, FOCAL, H_AP, V_AP)
+        K = intrinsics(RESOLUTION, FOCAL, H_AP)
         assert K[0, 0] == pytest.approx(K[1, 1])
 
     def test_matches_measured_values_from_live_scene(self):
         # Diagnostic run against /World/Camera reported fx = fy = 1456.836
-        K = intrinsics(RESOLUTION, FOCAL, H_AP, V_AP)
+        K = intrinsics(RESOLUTION, FOCAL, H_AP)
         assert K[0, 0] == pytest.approx(1456.836, abs=1e-3)
         assert K[1, 1] == pytest.approx(1456.836, abs=1e-3)
 
     def test_principal_point_is_image_centre(self):
-        K = intrinsics(RESOLUTION, FOCAL, H_AP, V_AP)
+        K = intrinsics(RESOLUTION, FOCAL, H_AP)
         assert (K[0, 2], K[1, 2]) == (960.0, 540.0)
 
-    def test_non_square_pixels_give_different_focal_lengths(self):
-        # A verticalAperture left at a 4:3 default with a 16:9 render is
-        # exactly the aperture bug enforce_square_pixels prevents.
-        K = intrinsics(RESOLUTION, FOCAL, H_AP, 15.2955)
-        assert K[0, 0] != pytest.approx(K[1, 1])
+    def test_corner_camera_at_480x640(self):
+        # cam1-4: focal 18.148, h_ap 20.955, authored v_ap 15.29 (not 4:3).
+        # Their depth only lines up across cameras with fy = fx.
+        K = intrinsics((480, 640), 18.14756, H_AP)
+        assert K[0, 0] == pytest.approx(K[1, 1])
+        assert (K[0, 2], K[1, 2]) == (320.0, 240.0)
 
 
 class TestViewMatrix:
@@ -189,7 +196,7 @@ class TestRotatedCamera:
 
     @pytest.mark.parametrize("yaw", [0, 45, 90, 180, 270])
     def test_round_trip_holds_at_any_yaw(self, yaw):
-        K = intrinsics(RESOLUTION, FOCAL, H_AP, V_AP)
+        K = intrinsics(RESOLUTION, FOCAL, H_AP)
         view = view_matrix_ros(self._yaw(yaw))
         points = [[0.5, -0.3, 0.02], [-1.2, 0.8, 0.05]]
         pixels = pixels_from_world(K, view, points)
@@ -198,7 +205,7 @@ class TestRotatedCamera:
             np.array(points), abs=1e-9)
 
     def test_180_yaw_mirrors_both_axes(self):
-        K = intrinsics(RESOLUTION, FOCAL, H_AP, V_AP)
+        K = intrinsics(RESOLUTION, FOCAL, H_AP)
         upright = view_matrix_ros(self._yaw(0))
         flipped = view_matrix_ros(self._yaw(180))
         point = [[0.4, 0.25, 0.02]]

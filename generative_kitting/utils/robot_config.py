@@ -282,6 +282,13 @@ class RobotConfig:
     def link_prims(self) -> dict[str, str]:
         return {k: self.prim(v) for k, v in (self.raw["cumotion"]["link_prims"] or {}).items()}
 
+    # ── nvblox collision world ──────────────────────────────────
+
+    @property
+    def nvblox(self) -> dict | None:
+        """nvblox service settings, or None when this robot has no nvblox section."""
+        return self.raw.get("nvblox")
+
     # ── validation ──────────────────────────────────────────────
 
     def _validate(self) -> None:
@@ -337,6 +344,24 @@ class RobotConfig:
 
         if not self.root.startswith("/"):
             errors.append("articulation.root must be an absolute prim path")
+
+        nv = self.nvblox
+        if nv is not None:
+            for key in ("url", "voxel_size", "cameras", "workspace_min", "workspace_max",
+                        "robot_mask_margin", "max_integration_distance",
+                        "esdf_max_site_distance_vox"):
+                if nv.get(key) is None:
+                    errors.append(f"nvblox.{key}: not set")
+            lo, hi = nv.get("workspace_min") or [], nv.get("workspace_max") or []
+            if len(lo) != 3 or len(hi) != 3 or any(a >= b for a, b in zip(lo, hi)):
+                errors.append("nvblox.workspace_min/max: need [x, y, z] with min < max")
+            if (nv.get("voxel_size") or 0) <= 0:
+                errors.append("nvblox.voxel_size: needs a number > 0 [m]")
+            link_margins = nv.get("robot_mask_link_margins") or {}
+            unknown = set(link_margins) - set(self.raw["cumotion"]["link_prims"] or {})
+            if unknown:
+                errors.append(f"nvblox.robot_mask_link_margins: not in cumotion.link_prims: "
+                              f"{sorted(unknown)}")
 
         if errors:
             raise RobotConfigError(f"{src}:\n  " + "\n  ".join(errors))

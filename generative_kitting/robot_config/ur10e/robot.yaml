@@ -142,3 +142,39 @@ cumotion:
     right_inner_finger: gantry_home/ur10e_robotiq_2f140/right_inner_finger
     left_inner_knuckle: gantry_home/ur10e_robotiq_2f140/left_inner_knuckle
     right_inner_knuckle: gantry_home/ur10e_robotiq_2f140/right_inner_knuckle
+
+# collision world: corner depth cameras -> robot mask -> nvblox TSDF/ESDF
+# (nvblox_service/, separate venv). Measured on the live stage 2026-10-14.
+nvblox:
+  url: http://127.0.0.1:8610
+  voxel_size: 0.02            # 2 cm fits beside Isaac in 8 GB, 1 cm does not
+  cameras:                    # must be bridge pointcloud cameras (shared render products)
+    - /World/pointcloud_view/cam1
+    - /World/pointcloud_view/cam2
+    - /World/pointcloud_view/cam3
+    - /World/pointcloud_view/cam4
+    # the rack hides the bin parts from cam1-4 (71-100% occluded, 2026-10-14)
+    - /World/Camera             # overhead, above the rack
+    - /World/Camera_Kit         # overhead, above the tray
+  # world box that is integrated; pixels landing outside are masked out.
+  # floor z=0, rack top z=1.81, gantry x [-2.40, 2.56], pallet y [-1.52, 1.59]
+  workspace_min: [-2.6, -1.6, -0.05]
+  workspace_max: [2.6, 1.6, 2.1]
+  # m added to each XRDF sphere when masking depth. Measured 2026-10-14 by
+  # hiding the robot: real surface lies up to 4.2 cm outside the vagn
+  # spheres and <= 3.6 cm outside the arm's. The static frame (gantry link)
+  # sticks out up to 8.8 cm; that rim stays in the map as real structure
+  # (cuMotion skips world collision for gantry/vagn). A 10 cm frame margin
+  # erased the rack end next to the frame column at x -2.35.
+  robot_mask_margin: 0.04
+  robot_mask_link_margins:
+    vagn: 0.05                # moves with the gantry, must not stay in the map
+  max_integration_distance: 9.0   # corner cams are ~3.7 m up, cell diagonal ~8 m
+  # surface band that seeds the ESDF. 1.0 (nvblox default) read up to 4+ cm
+  # too far near small parts; 2.0: median +1.0 cm, p90 +2.1 cm (2026-10-14)
+  esdf_max_site_distance_vox: 2.0
+  # per-update weight decay (null = off). Measured offline 2026-10-14 by hiding
+  # motor_valve_2: off never fully clears it (far cameras add tiny weights);
+  # 0.5 clears it in 2 updates and an unseen region (e.g. under the arm)
+  # lasts ~10 updates; 0.2 clears in 1 but forgets unseen space in ~4.
+  tsdf_decay_factor: 0.5

@@ -208,6 +208,17 @@ class TestValidation:
         with pytest.raises(RobotConfigError, match="armature"):
             load_robot_config(_write_variant(tmp_path, UR10E_DIR, edit))
 
+    def test_nvblox_section_is_optional(self):
+        assert load_robot_config(UR10_DIR).nvblox is None
+        nv = load_robot_config(UR10E_DIR).nvblox
+        assert nv["voxel_size"] == 0.02 and "/World/Camera" in nv["cameras"]
+
+    def test_nvblox_workspace_must_be_a_box(self, tmp_path):
+        def edit(c):
+            c["nvblox"]["workspace_max"][2] = c["nvblox"]["workspace_min"][2]
+        with pytest.raises(RobotConfigError, match="nvblox.workspace"):
+            load_robot_config(_write_variant(tmp_path, UR10E_DIR, edit))
+
     def test_absolute_paths_pass_through(self):
         cfg = load_robot_config(UR10E_DIR)
         assert cfg.prim("/World/rsd555") == "/World/rsd555"
