@@ -6,8 +6,7 @@ Orchestrates the full closed-loop pipeline:
     2. Send image to VLM → get scene description
     3. Send (user_command + scene) to LLM → get task plan
     4. Validate task plan
-    5. Execute task plan via RobotController
-    6. (Optional) Post-execution VLM verification
+    5. (UI only) Execute it on the robot through the Isaac Sim bridge
 
 Can run in:
     - Interactive CLI mode (terminal REPL)
@@ -16,7 +15,6 @@ Can run in:
 """
 
 import argparse
-import asyncio
 import json
 import os
 import subprocess
@@ -31,7 +29,7 @@ from utils.config_loader import load_config
 from utils.logger import setup_logger, get_session_id, log
 from utils.image_utils import save_debug_image
 from perception.vlm_perception import VLMPerception
-from perception.camera_interface import CameraInterface, MockCameraInterface
+from perception.camera_interface import MockCameraInterface
 from orchestration.llm_planner import LLMPlanner
 from knowledge.parts_database import PartsDatabase
 from knowledge.seed_data import seed_database
@@ -80,9 +78,6 @@ class KittingApplication:
         # Camera (Isaac Sim or mock)
         self.camera = None
 
-        # Execution Layer (initialised async when in sim mode)
-        self.controller = None
-
         # State
         self.last_scene_description = None
         self.last_task_plan = None
@@ -100,42 +95,13 @@ class KittingApplication:
             seed_kits(db)
         return db
 
-    async def init_sim(self):
-        """
-        Initialise Isaac Sim components (robot controller + camera).
-        Must be called within an Isaac Sim async context.
-        """
-        from execution.robot_controller import RobotController
-
-        self.controller = RobotController(self.config)
-        await self.controller.init_sim()
-
-        # Set up camera
-        camera_path = self.config.get("simulation", {}).get(
-            "camera_prim_path", "/World/Camera_Top"
-        )
-        self.camera = CameraInterface(camera_prim_path=camera_path)
-
-        if not self.camera.is_available:
-            log.warning("Isaac Sim camera not available — using mock")
-            self.camera = MockCameraInterface()
-
-        # Register perception callback for request_perception_update
-        async def perception_callback():
-            return await asyncio.coroutine(self._capture_and_analyze)()
-
-        self.controller.set_perception_callback(perception_callback)
-
-        log.info("Isaac Sim initialisation complete")
-
     def init_standalone(self, mock_image_path: str = None):
         """
         Initialise for standalone mode (no Isaac Sim).
         Useful for testing perception + orchestration layers independently.
         """
         self.camera = MockCameraInterface(image_path=mock_image_path)
-        self.controller = None
-        log.info("Standalone mode initialised (no robot controller)")
+        log.info("Standalone mode initialised (plans only, no robot)")
 
     # ═════════════════════════════════════════════════════════
     # CORE PIPELINE
@@ -241,35 +207,16 @@ class KittingApplication:
                 f"LLM generated {task_plan['total_steps']}-step plan in {llm_time:.1f}s"
             )
 
-            # ── Step 4: Execute Task Plan ────────────────────
-            if self.controller is not None:
-                log.info("═══ Step 4: Executing task plan ═══")
-                # Run the async executor
-                exec_report = asyncio.get_event_loop().run_until_complete(
-                    self.controller.execute_plan(task_plan, self.session_id)
-                )
-                report["steps"]["execution"] = exec_report
-
-                # Log all actions to database
-                for step_result in exec_report.get("step_results", []):
-                    self.db.log_action(
-                        session_id=self.session_id,
-                        action=step_result["action"],
-                        object_id=step_result.get("params", {}).get("object_id", ""),
-                        params=step_result.get("params"),
-                        success=step_result["success"],
-                        error_message=step_result.get("error", ""),
-                        duration_seconds=step_result.get("duration_seconds", 0),
-                    )
-
-                report["success"] = exec_report["failed_steps"] == 0
-            else:
-                log.warning("No robot controller — plan generated but not executed")
-                report["steps"]["execution"] = {
-                    "status": "skipped",
-                    "reason": "No robot controller (standalone mode)",
-                }
-                report["success"] = True  # Plan generation succeeded
+            # ── Step 4: Execution ────────────────────────────
+            # The CLI plans only. Robot execution runs through the
+            # Isaac Sim bridge (Streamlit UI / workflow_engine); the
+            # in-Isaac --sim controller was removed in Step 8.
+            log.info("Plan generated; execute it from the UI (Isaac Sim bridge)")
+            report["steps"]["execution"] = {
+                "status": "skipped",
+                "reason": "CLI plans only; run via the UI and the Isaac Sim bridge",
+            }
+            report["success"] = True  # Plan generation succeeded
 
         except Exception as e:
             log.error(f"Kitting cycle FAILED: {e}")
@@ -483,7 +430,6 @@ def main():
 Examples:
   python main.py                               # Interactive mode (standalone)
   python main.py -c "Pick all motor valves"     # Single command (standalone)
-  python main.py --sim                          # Interactive mode (Isaac Sim)
   python main.py --ui                           # Launch Streamlit UI
         """,
     )
@@ -497,11 +443,6 @@ Examples:
         "--config",
         type=str, default="config.yaml",
         help="Path to configuration file (default: config.yaml)",
-    )
-    parser.add_argument(
-        "--sim",
-        action="store_true",
-        help="Enable Isaac Sim mode (requires running inside Isaac Sim)",
     )
     parser.add_argument(
         "--ui",
@@ -541,13 +482,8 @@ Examples:
         print("Database re-seeded.")
         return
 
-    # Initialise mode
-    if args.sim:
-        # Isaac Sim mode — must be run inside the simulator
-        asyncio.get_event_loop().run_until_complete(app.init_sim())
-    else:
-        # Standalone mode
-        app.init_standalone(mock_image_path=args.mock_image)
+    # Standalone mode (the robot runs through the UI and the Isaac Sim bridge)
+    app.init_standalone(mock_image_path=args.mock_image)
 
     # Execute
     try:

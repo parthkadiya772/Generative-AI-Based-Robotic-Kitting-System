@@ -12,6 +12,7 @@ to prevent downstream errors from:
 from typing import Any, Dict, List, Optional
 
 from utils.logger import log
+from utils.workspace import default_workspace_bounds
 
 
 # ─── Required fields for each detected object ───────────────
@@ -42,12 +43,6 @@ LOCATION_FIELDS = (
 
 VALID_AFFORDANCES = {"graspable", "stackable", "fragile", "fixed", "destination", "container"}
 
-# Default workspace bounds for position validation (UR10 + gantry reach)
-DEFAULT_WORKSPACE_BOUNDS = {
-    "x_min": -2.5, "x_max": 3.5,
-    "y_min": -2.0, "y_max": 2.0,
-    "z_min": -0.1, "z_max": 2.0,
-}
 
 
 def validate_scene_response(
@@ -95,7 +90,7 @@ def validate_scene_response(
     if not isinstance(scene_summary, str):
         scene_summary = str(scene_summary)
 
-    bounds = workspace_bounds or DEFAULT_WORKSPACE_BOUNDS
+    bounds = workspace_bounds or default_workspace_bounds()
 
     # Validate each object
     validated_objects = []
@@ -207,7 +202,7 @@ def validate_single_object(
                 f"Object {index}: approximate_position is not a dict — rejected")
             return None
 
-        bounds = workspace_bounds or DEFAULT_WORKSPACE_BOUNDS
+        bounds = workspace_bounds or default_workspace_bounds()
 
         for axis in ("x", "y", "z"):
             if axis not in pos:

@@ -1,13 +1,12 @@
 """
-Isaac Sim Script Editor — Kitting System Launcher.
+Isaac Sim Script Editor — Kitting System diagnostics.
 
-Paste this entire script into Isaac Sim's Script Editor and click Run.
-It works within Isaac Sim's own Python environment without external dependencies.
+Run inside Isaac Sim with the project scene open:
+    exec(open("/path/to/robot_in_air/generative_kitting/isaac_sim_launcher.py").read())
 
-Prerequisites:
-  - AIKIDO.usd is already loaded in the stage
-  - OLLAMA_BASE_URL env var points at your model server
-    (defaults to http://localhost:11434 — see .env.example)
+Checks the scene prims, the configured VLM endpoint and that the robot moves to
+its home pose. Prim paths, joints and home pose come from robot.yaml
+(ROBOT_CONFIG_PATH), the VLM from config.yaml — nothing robot-specific here.
 """
 
 import sys
@@ -17,20 +16,57 @@ import asyncio
 import traceback
 import numpy as np
 
-# ─── Configuration ───────────────────────────────────────────
+# ─── Configuration (robot.yaml + config.yaml) ───────────────
 
-OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-VLM_MODEL = "Qwen/Qwen3-VL"
-LLM_MODEL = "Qwen/Qwen3-VL"
+_MARKER = os.path.join("generative_kitting", "isaac_sim_bridge.py")
 
-# Robot prim paths (from your AIKIDO.usd)
-ROBOT_PRIM = "/World/gantry"
-UR10_BASE = "/World/gantry/gantry_home/ur10_flattened/ur10_instanceable/base_link"
-EE_LINK   = "/World/gantry/gantry_home/ur10_flattened/ur10_instanceable/ee_link"
-CAMERA    = "/World/Camera"
 
-# Home joint positions (from robot_control.py)
-HOME_JOINTS = [0.0, 0, -1.5708, 1.5708, -1.5708, -1.5708, 0]
+def _find_repo_root():
+    """Repo root from KITTING_PROJECT_ROOT, __file__, the open stage or the cwd."""
+    candidates = [os.environ.get("KITTING_PROJECT_ROOT", ""), globals().get("__file__")]
+    try:
+        import omni.usd
+        url = omni.usd.get_context().get_stage_url() or ""
+        for prefix in ("file:///", "file://", "file:"):
+            if url.startswith(prefix):
+                url = url[len(prefix):] if os.name == "nt" else "/" + url[len(prefix):].lstrip("/")
+                break
+        candidates.append(os.path.dirname(url) if url else "")
+    except Exception:
+        pass
+    candidates.append(os.getcwd())
+    for start in filter(None, candidates):
+        d = os.path.abspath(start)
+        for _ in range(8):
+            if os.path.isfile(os.path.join(d, _MARKER)):
+                return d
+            if os.path.dirname(d) == d:
+                break
+            d = os.path.dirname(d)
+    raise RuntimeError("cannot find the robot_in_air repo; open its USD scene or set "
+                       "KITTING_PROJECT_ROOT")
+
+
+_ROOT = _find_repo_root()
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+from generative_kitting.utils.config_loader import load_config      # noqa: E402
+from generative_kitting.utils.robot_config import load_robot_config  # noqa: E402
+
+ROBOT_CFG = load_robot_config()
+APP_CFG = load_config(os.path.join(_ROOT, "generative_kitting", "config.yaml"))
+_PERCEPTION = APP_CFG.get("perception", {})
+VLM_PROVIDER = _PERCEPTION.get("vlm_provider", "vllm")
+VLM_MODEL = _PERCEPTION.get("vlm_model", "")
+VLM_BASE_URL = _PERCEPTION.get("vlm_base_url", "")
+
+ROBOT_PRIM = ROBOT_CFG.root
+ARM_BASE = ROBOT_CFG.arm_base_prim
+EE_LINK = ROBOT_CFG.ee_prim
+TOOL = ROBOT_CFG.tool_prim
+CAMERA = "/World/Camera"
+# [gantry, 6 arm joints] in cspace order; None = keep the scene's pose
+HOME_JOINTS = ROBOT_CFG.home_joints
 
 
 # ─── Simple Logger ───────────────────────────────────────────
@@ -51,13 +87,13 @@ def test_scene():
 
     stage = omni.usd.get_context().get_stage()
     if not stage:
-        log.error("No stage found! Load AIKIDO.usd first.")
+        log.error(f"No stage found! Open {ROBOT_CFG.stage_path} first.")
         return False
 
     log.info(f"Stage loaded: {stage.GetRootLayer().identifier}")
 
     all_found = True
-    for path in [ROBOT_PRIM, UR10_BASE, EE_LINK]:
+    for path in [ROBOT_PRIM, ARM_BASE, EE_LINK, TOOL]:
         prim = stage.GetPrimAtPath(path)
         if prim.IsValid():
             log.info(f"  ✓ Found: {path}")
@@ -74,33 +110,32 @@ def test_scene():
     return all_found
 
 
-# ─── Test 2: Ollama Connectivity ────────────────────────────
-def test_ollama():
-    """Check that the Ollama API is reachable via VPN."""
-    try:
-        import urllib.request
+# ─── Test 2: VLM endpoint ───────────────────────────────────
+def test_vlm():
+    """Check that the configured VLM endpoint answers and serves the model."""
+    import urllib.request
 
-        url = f"{OLLAMA_BASE_URL}/api/tags"
-        req = urllib.request.Request(url, method="GET")
-        req.add_header("Content-Type", "application/json")
-
-        log.info(f"Testing Ollama at {OLLAMA_BASE_URL}...")
-
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode())
-            models = [m["name"] for m in data.get("models", [])]
-            log.info(f"Available: {models}")
-
-            for name, label in [(VLM_MODEL, "VLM"), (LLM_MODEL, "LLM")]:
-                if name in models:
-                    log.success(f"  ✓ {label}: {name}")
-                else:
-                    log.warning(f"  ⚠ {label} '{name}' not found")
-        return True
-
-    except Exception as e:
-        log.error(f"Cannot reach Ollama: {e}")
+    if not VLM_BASE_URL or "${" in VLM_BASE_URL:
+        log.error(f"perception.vlm_base_url is not set (got {VLM_BASE_URL!r}); see .env")
         return False
+    ollama = VLM_PROVIDER.startswith("ollama")
+    base = VLM_BASE_URL.rstrip("/")
+    url = f"{base}/api/tags" if ollama else f"{base}/models"
+    log.info(f"Testing {VLM_PROVIDER} at {url} ...")
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, method="GET"), timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception as e:
+        log.error(f"Cannot reach the VLM endpoint: {e}")
+        return False
+    models = ([m["name"] for m in data.get("models", [])] if ollama
+              else [m.get("id") for m in data.get("data", [])])
+    log.info(f"Available: {models}")
+    if VLM_MODEL in models:
+        log.success(f"  ✓ VLM: {VLM_MODEL}")
+    else:
+        log.warning(f"  ⚠ VLM '{VLM_MODEL}' not served")
+    return True
 
 
 # ─── Test 3: Robot Init + Motion ─────────────────────────────
@@ -176,18 +211,21 @@ async def test_robot_and_motion():
         # ── Step F: Move to home position ─────────────────────
         log.info("Setting home position...")
 
-        # All 15 DOFs: [gantry, 6x arm, 8x gripper fingers (open)]
-        # Gripper joints at 0.0 = fully open
-        home_all = np.zeros(num_dof, dtype=np.float32)
-
-        # Set arm joints (indices 0-6: gantry + 6 UR10 joints)
-        arm_home = HOME_JOINTS  # [gantry, shoulder_pan, shoulder_lift, elbow, wrist1, wrist2, wrist3]
-        for i, val in enumerate(arm_home):
-            if i < num_dof:
-                home_all[i] = val
-
-        # Gripper joints (indices 7-14) stay at 0.0 (open)
-        log.info(f"Target ({num_dof} joints): {home_all}")
+        # Home = robot.yaml home_joints by joint NAME (cspace order: gantry,
+        # arm), gripper joints open; joints not named keep their position.
+        home_all = np.array(current, dtype=np.float32)
+        for name in ROBOT_CFG.gripper_modes:
+            if name in dof_names:
+                home_all[dof_names.index(name)] = ROBOT_CFG.finger["open"]
+        if HOME_JOINTS is None:
+            log.warning("robot.yaml home_joints is null — keeping the scene's arm pose")
+        else:
+            for name, val in zip(ROBOT_CFG.cspace_joints, HOME_JOINTS):
+                if name not in dof_names:
+                    log.error(f"Joint {name} from robot.yaml not in the articulation")
+                    return True, False
+                home_all[dof_names.index(name)] = val
+        log.info(f"Target ({num_dof} joints): {np.round(home_all, 3)}")
 
         robot.set_joint_positions(home_all)
 
@@ -225,9 +263,9 @@ async def main():
     print("\n[1/3] Checking scene...")
     scene_ok = test_scene()
 
-    # Test 2: Ollama
-    print("\n[2/3] Checking Ollama API...")
-    ollama_ok = test_ollama()
+    # Test 2: VLM endpoint
+    print("\n[2/3] Checking the VLM endpoint...")
+    vlm_ok = test_vlm()
 
     # Test 3: Robot + Motion (combined — needs async init)
     print("\n[3/3] Initialising robot & testing motion...")
@@ -242,12 +280,12 @@ async def main():
     print("  RESULTS")
     print("=" * 60)
     print(f"  Scene loaded:     {'✓' if scene_ok else '✗'}")
-    print(f"  Ollama reachable: {'✓' if ollama_ok else '✗'}")
+    print(f"  VLM reachable:    {'✓' if vlm_ok else '✗'}")
     print(f"  Robot ready:      {'✓' if robot_ok else '✗'}")
     print(f"  Motion works:     {'✓' if motion_ok else '✗'}")
     print("=" * 60)
 
-    if all([scene_ok, ollama_ok, robot_ok, motion_ok]):
+    if all([scene_ok, vlm_ok, robot_ok, motion_ok]):
         print("\n✅ ALL SYSTEMS GO — Ready for kitting operations!")
     else:
         print("\n⚠️ Some checks failed — review the output above.")

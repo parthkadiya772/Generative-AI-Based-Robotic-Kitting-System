@@ -3,27 +3,9 @@
 # ============================================================
 
 simulation:
-  # Robot hardware (prims, joints, TCP, gripper, cuMotion files):
-  # robot_config/<robot>/robot.yaml, selected by ROBOT_CONFIG_PATH.
-  robot_prim_path: "/World/gantry"
-  ur10_base_path: "/World/gantry/gantry_home/ur10_flattened/ur10_instanceable/base_link"
-  ee_path: "/World/gantry/gantry_home/ur10_flattened/ur10_instanceable/ee_link"
-  camera_prim_path: "/World/Camera"
-  physics_dt: 0.01667          # 1/60
-  rendering_dt: 0.01667        # 1/60
-
-  # Gantry configuration
-  gantry_x_joint: "/World/gantry/gantry_home/vagn/gantry_vagn_joint"
-  gantry_x_offset: 1.27
-
-  # Gripper finger prim paths (Robotiq 2F-140)
-  gripper_finger_paths:
-    - "/World/gantry/gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/left_inner_finger"
-    - "/World/gantry/gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/right_inner_finger"
-    - "/World/gantry/gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/left_outer_finger"
-    - "/World/gantry/gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/right_outer_finger"
-    - "/World/gantry/gantry_home/ur10_flattened/robotiq_fixed_physics/Robotiq_2F_140_physics_edit/robotiq_base_link"
-  box_prim_path: "/World/robot_facade_full"
+  # Robot hardware (prims, joints, gantry, home pose, TCP, gripper,
+  # cuMotion files) is NOT here: robot_config/<robot>/robot.yaml,
+  # selected by ROBOT_CONFIG_PATH. Only scene fixtures stay below.
 
   # ── Wrist-scan pipeline (current approach) ─────────────────────
   # The overhead camera is now used for the live UI feed only —
@@ -34,13 +16,8 @@ simulation:
   bin_prim_path:  "/World/robot_facade_full"
   tray_prim_path: "/World/box_840"
 
-  # Scan-pose marker prim REMOVED from the scene — the workflow now
-  # derives the safe ee_link Z geometrically from
-  #   bin_top_z + execution.gripper_tcp_offset
-  #              + execution.bin_wall_finger_clearance
-  # See KittingWorkflowEngine._safe_floor_z(). Re-add a marker prim
-  # path here only if you want to override the geometric formula with
-  # a static USD transform.
+  # Scan-pose marker prim removed from the scene; approach heights are
+  # planned by cuMotion against the nvblox collision world.
   # scan_pose_prim_path: "/World/robo_eye"
 
 # ─── Perception (VLM) ───────────────────────────────────────
@@ -303,8 +280,7 @@ orchestration:
 
 # ─── Execution ───────────────────────────────────────────────
 execution:
-  # 7-DOF: [gantry_x, shoulder_pan, shoulder_lift, elbow, wrist1, wrist2, wrist3]
-  home_joint_positions: [0.0, 0, -1.5708, 1.5708, -1.5708, -1.5708, 0]
+  # Home pose, joints, TCP and gripper angles: robot.yaml (ROBOT_CONFIG_PATH).
 
   workspace_bounds:
     x_min: -2.5
@@ -325,26 +301,9 @@ execution:
     z_min: -0.05
     z_max: 999.0
 
-  # Robotiq 2F-140 parameters
-  gripper_tcp_offset: 0.170           # metres: ee_link → finger contact pad
-  gripper_body_width: 0.160           # metres: widest dimension (fingers open)
-  gripper_force: 40.0                 # Newtons
-  finger_open_rad: 0.0               # radians — fully open
-  finger_close_rad: 0.5              # radians — ~50mm part
-
-  # ── Approach safe-height floor (compartment-wall finger clearance) ──
-  # During the approach + realign phases the IK target Z is clamped
-  # so the gripper FINGER TIPS sit at least this many metres above
-  # the COMPARTMENT wall top of the part being picked. Per-part
-  # formula:
-  #     safe_floor = part_z + box_height + gripper_tcp_offset + this_value
-  # ``box_height`` (compartment wall height ABOVE the part — defined
-  # below) is the right reference here; the whole-rack ``bin_top_z``
-  # would push ee_link past the arm's vertical reach. Tune up (e.g.
-  # 0.04) if fingers still clip the compartment lip, down (e.g. 0.01)
-  # if the approach is unnecessarily high. 0.0 = no extra buffer
-  # (finger TCP exactly at compartment wall top).
-  bin_wall_finger_clearance: 0.04
+  # Gripper force limit checked by execution/safety.py [N]
+  # (finger angles, TCP offset, widths: robot.yaml gripper / tcp)
+  gripper_force: 40.0
 
   # ── Place transit clearance (kitting tray) ──
   # During the place phase the workflow pulls the kitting tray (X, Y, Z)
@@ -353,7 +312,7 @@ execution:
   # drop point stays ~2 cm above the tray surface (clean release, not
   # a long fall). This value is sent as a SEPARATE ``transit_clearance``
   # parameter that only the bridge's transit phase consumes — it adds
-  # extra altitude during the lateral-move steps so Lula IK has more
+  # extra altitude during the lateral-move steps so the IK has more
   # headroom to find a non-folded arm pose (avoids the elbow/forearm
   # clipping the tray rim or base). Does NOT affect the place / drop
   # height.
@@ -480,7 +439,7 @@ execution:
 
   # ── Place flow: arm config reset after gantry move ──
   # After the pick retract + gantry slide, the arm joints are in
-  # whatever configuration Lula picked for the retract IK — sometimes
+  # whatever configuration the IK picked for the retract — sometimes
   # an "elbow-forward" pose with the forearm projecting into the
   # workspace. The lateral move + descent are Cartesian (chained
   # warm-starts), so they PRESERVE that configuration all the way to
@@ -493,34 +452,18 @@ execution:
   place_reset_arm_config: true
 
   # ── Wrist-scan pipeline heights (above bin / tray top, metres) ──
-  # bin_scan_height:       wrist sits this far above bin top to capture
-  #                        a single image that frames the whole bin.
-  # pick_align_height:     after the VLM picks a target, the gantry
-  #                        re-aligns so the wrist is centred over the
-  #                        part at this height before depth analysis.
   # depth_analysis_height: close-range height for the wrist depth
   #                        camera to refine the grasp pose.
   # tray_safe_height:      wrist clearance above the kitting tray
   #                        rim during placement.
-  bin_scan_height:        0.60
-  pick_align_height:      0.40
   depth_analysis_height:  1.10   # D555 accurate range ~0.6-6 m (was 0.20 for RSD455)
   tray_safe_height:       0.25
 
-  # Motion parameters
-  pre_grasp_height_offset: 0.15      # 15cm above object for approach
-  hover_clearance: 0.015             # gap above part top before plunge
-  box_height: 0.20                   # metres — box wall height above part
-  box_entry_margin: 0.20             # metres — clearance above rim
-  place_drop_height: 0.0             # metres above destination surface
-  place_retract_height: 0.20         # metres above destination after release
-  transit_safe_height: 0.35          # metres above safe_z during transit
+  # Motion parameters (pick/place heights live in the bridge and robot.yaml)
   max_pick_retries: 3               # retry scan + pick if grasp fails
-  grasp_depth_fraction: 0.5          # 0.0=top, 0.5=mid, 1.0=bottom
 
   # Safety
   action_timeout_seconds: 30         # max seconds per action primitive
-  downward_orientation: [1.0, 0.0, 1.0, 0.0]   # [w, x, y, z] quaternion
 
 # ─── Logging ─────────────────────────────────────────────────
 logging:

@@ -11,6 +11,7 @@ import time
 from typing import Optional
 
 from utils.logger import log
+from utils.workspace import default_workspace_bounds
 
 
 class WorkspaceBoundary:
@@ -25,14 +26,13 @@ class WorkspaceBoundary:
         Parameters
         ----------
         bounds : dict
-            Keys: x_min, x_max, y_min, y_max, z_min, z_max
+            Keys: x_min, x_max, y_min, y_max, z_min, z_max; missing keys come
+            from config.yaml execution.workspace_bounds.
         """
-        self.x_min = bounds.get("x_min", -0.2)
-        self.x_max = bounds.get("x_max", 0.8)
-        self.y_min = bounds.get("y_min", -0.5)
-        self.y_max = bounds.get("y_max", 0.5)
-        self.z_min = bounds.get("z_min", 0.0)
-        self.z_max = bounds.get("z_max", 0.4)
+        full = {**default_workspace_bounds(), **(bounds or {})}
+        self.x_min, self.x_max = full["x_min"], full["x_max"]
+        self.y_min, self.y_max = full["y_min"], full["y_max"]
+        self.z_min, self.z_max = full["z_min"], full["z_max"]
 
         log.info(
             f"WorkspaceBoundary: X=[{self.x_min}, {self.x_max}], "
@@ -116,7 +116,7 @@ def emergency_stop(robot_controller) -> bool:
 
     Parameters
     ----------
-    robot_controller : RobotController
+    robot_controller : object with move_home()
         The active robot controller instance.
 
     Returns

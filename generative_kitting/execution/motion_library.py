@@ -2,7 +2,7 @@
 Motion Library — Pre-computed Motion Sequences.
 
 Pure functions that generate waypoint lists for common motion patterns.
-These are consumed by RobotController — no sim dependency.
+Pure motion helpers (used by tests) — no sim dependency.
 """
 
 from typing import Dict, List, Tuple

@@ -19,11 +19,16 @@ detailed [jog] / [verify] lines there.
 """
 
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
 
-BRIDGE = "http://localhost:8600"
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from generative_kitting.utils.robot_config import load_robot_config  # noqa: E402  (loads .env)
+
+ROBOT_CFG = load_robot_config()
+BRIDGE = f"http://{os.environ.get('BRIDGE_HOST', '127.0.0.1')}:{os.environ.get('BRIDGE_PORT', '8600')}"
 TIMEOUT = 90
 
 
@@ -56,9 +61,9 @@ def main():
     st = call("/api/status")
     if "error" in st:
         print(f"  Bridge unreachable at {BRIDGE}: {st['error']}")
-        print("  Start isaac_sim_bridge.py in Isaac Sim's Script Editor.")
+        print("  Start kitting_bridge_server.py in Isaac Sim's Script Editor.")
         return 1
-    for k in ("ik_ready", "planner", "cumotion_error", "collision_spheres"):
+    for k in ("ik_ready", "planner", "cumotion_error", "collision_world"):
         if k in st:
             print(f"  {k:20s} = {st[k]}")
 
@@ -90,20 +95,29 @@ def main():
         print("  (full detail is printed in the Isaac Sim console)")
 
     # ── 2. Jog: the decisive test ────────────────────────────────
-    # index 0 = gantry_vagn_joint, the joint _diagnose_failed_write flagged
+    # Joint names from robot.yaml; /api/jog takes the articulation index.
+    names = st.get("joint_names") or []
+    gantry, arm0 = ROBOT_CFG.gantry_joint, ROBOT_CFG.arm_joints[0]
+    if gantry not in names or arm0 not in names:
+        print(f"  robot.yaml joints {gantry!r} / {arm0!r} not in the articulation {names}")
+        return 1
+    gantry_idx, arm0_idx = names.index(gantry), names.index(arm0)
+    lo, hi = ROBOT_CFG.gantry_limits
+
+    # The gantry joint is the one _diagnose_failed_write flagged
     # as BLOCKED under every write method during real trajectory execution.
     # Test it in total isolation first — bare apply_action, no planner, no
     # trajectory, no point cloud — per DIAGNOSE_stuck_but_success.md Check 7.
     # A prismatic gantry axis moves less visibly than a revolute joint, so
     # use a larger, unambiguous delta.
-    head("2a. JOG gantry_vagn_joint (index 0) — apply_action only, no planner")
-    print("  Trying BOTH directions: the USD limits are [-3.1, 0.0] and this")
-    print("  joint is usually parked within a few mm of its upper limit (0.0),")
+    head(f"2a. JOG {gantry} (index {gantry_idx}) — apply_action only, no planner")
+    print(f"  Trying BOTH directions: the limits are [{lo}, {hi}] and this")
+    print(f"  joint is usually parked within a few mm of its upper limit ({hi}),")
     print("  so a +delta test alone asks it to go somewhere out of range and")
     print("  will falsely report 'stuck' when it is really just at its wall.")
     moved_either = False
     for d in (-0.3, 0.3):
-        jog0 = call("/api/jog", {"index": 0, "delta": d, "frames": 120})
+        jog0 = call("/api/jog", {"index": gantry_idx, "delta": d, "frames": 120})
         if "error" in jog0:
             print(f"  delta {d:+.2f}: FAILED: {jog0['error']}")
             continue
@@ -114,26 +128,26 @@ def main():
         if jog0["moved"]:
             # Drive back toward the middle of the range so the second
             # direction (and later steps) aren't testing from a limit too.
-            call("/api/jog", {"index": 0, "delta": -d, "frames": 90})
+            call("/api/jog", {"index": gantry_idx, "delta": -d, "frames": 90})
 
     if not moved_either:
-        print("  *** gantry_vagn_joint does NOT respond to a bare")
+        print(f"  *** {gantry} does NOT respond to a bare")
         print("      apply_action in EITHER direction. The block is upstream")
         print("      of planning — a drive/USD-schema issue on this joint")
         print("      alone. See the joint_report block above for this joint:")
         print("      jointEnabled, excludeFromArticulation, DriveAPI,")
         print("      maxJointVelocity, and RigidBodyAPI on its bodies.")
     else:
-        print("  -> gantry_vagn_joint DOES respond to bare apply_action.")
+        print(f"  -> {gantry} DOES respond to bare apply_action.")
         print("     The earlier BLOCKED result during real execution must be")
         print("     state-dependent — see Check 1/E in")
         print("     DIAGNOSE_stuck_but_success.md: robot-in-its-own-map can")
         print("     abort a segment silently even when the raw drive works.")
 
-    # index 1 = shoulder_pan, a second isolated apply_action control to
+    # The first arm joint, a second isolated apply_action control to
     # confirm the articulation as a whole is controllable.
-    head("2b. JOG shoulder_pan (index 1) — apply_action only, no planner")
-    jog = call("/api/jog", {"index": 1, "delta": 0.2, "frames": 120})
+    head(f"2b. JOG {arm0} (index {arm0_idx}) — apply_action only, no planner")
+    jog = call("/api/jog", {"index": arm0_idx, "delta": 0.2, "frames": 120})
     if "error" in jog:
         print(f"  FAILED: {jog['error']}")
         return 1
@@ -169,8 +183,8 @@ def main():
     if "error" in v:
         print(f"  {v['error']}")
         print("\n  A 'NO PATH to its own pose' here means the world->robot-root")
-        print("  transform is wrong. Try ROBOT_ROOT_PATH = '/World/gantry'")
-        print("  (the URDF's root link is 'gantry').")
+        print(f"  transform is wrong. robot.yaml articulation.root ({ROBOT_CFG.root!r}) must be")
+        print(f"  the prim of the URDF root link {ROBOT_CFG.cumotion_root_link!r}.")
         return 1
 
     for path, pos in (v.get("root_candidates") or {}).items():
@@ -190,10 +204,10 @@ def main():
     if not v["passed"]:
         print("  The planned goal does not reach the requested tool pose,")
         print("  so the world->robot-root transform is offset. Compare the")
-        print("  candidates above against the URDF root link 'gantry'.")
+        print(f"  candidates above against the URDF root link {ROBOT_CFG.cumotion_root_link!r}.")
         return 1
 
-    # ── 4. Is the point cloud blocking the planner? ──────────────
+    # ── 4. Is the collision world blocking the planner? ──────────
     head("4. PLAN TEST — with vs without the collision world")
     pt = call("/api/plan_test", {"lift": 0.15})
     if "error" in pt:
@@ -207,9 +221,9 @@ def main():
     tgt = pt["target"]
     print(f"  obstacle comparison target "
           f"({tgt[0]:+.3f}, {tgt[1]:+.3f}, {tgt[2]:+.3f})")
-    print(f"  with    {pt['collision_spheres']:>5d} spheres : "
+    print(f"  with {pt.get('collision_world', '?')}: "
           f"{'PATH FOUND' if pt['with_obstacles'] else 'NO PATH'}")
-    print(f"  with        0 spheres : "
+    print(f"  with an empty world: "
           f"{'PATH FOUND' if pt['without_obstacles'] else 'NO PATH'}")
     print()
     print(f"  {pt['verdict']}")

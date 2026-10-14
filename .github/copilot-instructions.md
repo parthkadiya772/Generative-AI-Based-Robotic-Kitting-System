@@ -37,7 +37,7 @@ Operator says "pick all motor valves" → VLM sees parts → LLM plans sequence 
 - **[vlm_perception.py](generative_kitting/perception/vlm_perception.py)** — VLM API calls
 - **[llm_planner.py](generative_kitting/orchestration/llm_planner.py)** — LLM API calls
 - **[workflow_engine.py](generative_kitting/orchestration/workflow_engine.py)** — 10-phase pipeline orchestrator (VLM→USD match→LLM→execute)
-- **[robot_controller.py](generative_kitting/execution/robot_controller.py)** — Plan→Isaac Sim API translation
+- **[isaac_sim_bridge.py](generative_kitting/isaac_sim_bridge.py)** — Plan→Isaac Sim API translation (HTTP bridge; cuMotion + nvblox)
 - **[motion_library.py](generative_kitting/execution/motion_library.py)** — Waypoint generation for pick/place/transit
 
 ### Validation (Critical)

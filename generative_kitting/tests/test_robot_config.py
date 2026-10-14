@@ -227,3 +227,14 @@ class TestValidation:
 def test_env_var_with_project_root_placeholder(monkeypatch):
     monkeypatch.setenv("ROBOT_CONFIG_PATH", "${PROJECT_ROOT}/generative_kitting/robot_config/ur10e")
     assert load_robot_config().config_dir == UR10E_DIR
+
+
+def test_dotenv_project_root_placeholder(monkeypatch, tmp_path):
+    # python-dotenv expands ${PROJECT_ROOT} at load time; it must already be set.
+    import utils.config_loader as cl
+    (tmp_path / ".env").write_text("KITTING_TEST_PATH=${PROJECT_ROOT}/generative_kitting\n")
+    monkeypatch.setattr(cl, "project_root", lambda: tmp_path)
+    monkeypatch.delenv("PROJECT_ROOT", raising=False)
+    monkeypatch.delenv("KITTING_TEST_PATH", raising=False)
+    cl._load_dotenv_if_present()
+    assert cl._expand_string(os.environ["KITTING_TEST_PATH"]) == f"{tmp_path.as_posix()}/generative_kitting"

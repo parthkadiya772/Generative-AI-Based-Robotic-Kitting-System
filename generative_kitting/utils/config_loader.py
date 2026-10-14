@@ -36,6 +36,11 @@ def project_root() -> Path:
     return Path(__file__).resolve().parent.parent.parent
 
 
+def package_dir() -> Path:
+    """``<project_root>/generative_kitting``: the anchor for relative data paths."""
+    return project_root() / "generative_kitting"
+
+
 def _ensure_project_root_env() -> None:
     """Inject ``PROJECT_ROOT`` into the environment if the operator
     hasn't set it. Uses forward slashes for cross-platform YAML."""
@@ -55,6 +60,10 @@ def _load_dotenv_if_present() -> None:
     a shell export always wins over the .env file, matching the
     conventional dotenv precedence.
     """
+    # python-dotenv expands ${PROJECT_ROOT} while loading, so it must be set
+    # first (else .env paths like ${PROJECT_ROOT}/generative_kitting/... lose
+    # their root and become /generative_kitting/...).
+    _ensure_project_root_env()
     env_path = project_root() / ".env"
     if not env_path.is_file():
         return
@@ -131,4 +140,12 @@ def load_config(config_path: str | os.PathLike) -> dict:
     _ensure_project_root_env()
     with open(config_path, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f) or {}
-    return _expand(raw)
+    cfg = _expand(raw)
+    # A relative log_dir means "next to config.yaml", not "wherever the
+    # process was started" (it used to land in <cwd>/logs).
+    log_cfg = cfg.get("logging") if isinstance(cfg, dict) else None
+    if isinstance(log_cfg, dict) and log_cfg.get("log_dir"):
+        log_dir = Path(log_cfg["log_dir"])
+        if not log_dir.is_absolute():
+            log_cfg["log_dir"] = str(Path(config_path).resolve().parent / log_dir)
+    return cfg

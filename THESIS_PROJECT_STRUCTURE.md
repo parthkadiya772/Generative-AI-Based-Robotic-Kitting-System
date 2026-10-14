@@ -30,7 +30,7 @@ robot_in_air/                          ← repository root
 ├── THESIS_FRAMEWORK_SUMMARY.md        Full architecture write-up (v5)
 │
 └── generative_kitting/                ← MAIN SOURCE PACKAGE
-    ├── main.py                        CLI — supports --sim / --ui
+    ├── main.py                        CLI (plans only) — supports --ui
     ├── config.yaml                    Master configuration
     ├── requirements.txt               Python dependencies
     ├── run_ui.bat / run_ui.sh         Streamlit launchers
@@ -71,7 +71,6 @@ generative_kitting/
 │                                      Plan-length guard (≤ 50)
 │
 ├── execution/                         ── EXECUTION (deterministic)
-│   ├── robot_controller.py            Plans → IK + gripper actions
 │   ├── motion_library.py              Waypoint generators
 │   └── safety.py                      Workspace bounds, force limits,
 │                                      e-stop, action timeouts

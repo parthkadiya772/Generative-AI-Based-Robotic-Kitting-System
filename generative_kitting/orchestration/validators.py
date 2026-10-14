@@ -10,6 +10,7 @@ import re
 from typing import Any, Dict, List, Optional, Set
 
 from utils.logger import log
+from utils.workspace import default_workspace_bounds
 
 
 # ─── Whitelisted Action Primitives ───────────────────────────
@@ -36,12 +37,6 @@ ACTION_PARAMS = {
     "request_perception_update": [],
 }
 
-# Default workspace bounds (matches actual UR10 + gantry reach)
-DEFAULT_WORKSPACE_BOUNDS = {
-    "x_min": -2.5, "x_max": 3.5,
-    "y_min": -2.0, "y_max": 2.0,
-    "z_min": -0.1, "z_max": 2.0,
-}
 
 # Joint angle patterns to reject (hallucination detection)
 JOINT_ANGLE_PATTERNS = [
@@ -108,7 +103,7 @@ def validate_task_plan(
         If the plan contains any invalid elements.
     """
     errors = []
-    bounds = workspace_bounds or DEFAULT_WORKSPACE_BOUNDS
+    bounds = workspace_bounds or default_workspace_bounds()
 
     # ── Structure validation ─────────────────────────────────
     if not isinstance(plan, dict):

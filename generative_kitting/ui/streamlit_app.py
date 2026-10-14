@@ -784,7 +784,7 @@ with col_left:
                 st.image(
                     depth_img,
                     width="stretch",
-                    caption="RealSense RSD455 • Pseudo Depth",
+                    caption="RealSense D555 • Pseudo Depth",
                 )
             except Exception as e:
                 st.info(f"No depth feed: {e}")

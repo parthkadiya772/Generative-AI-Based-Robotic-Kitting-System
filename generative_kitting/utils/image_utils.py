@@ -99,7 +99,7 @@ def decode_image_base64(b64_string: str) -> Image.Image:
 
 def save_debug_image(
     image: Image.Image,
-    directory: str = "logs/vlm_images",
+    directory: Optional[str] = None,
     prefix: str = "capture",
     fmt: str = "png",
 ) -> str:
@@ -110,8 +110,8 @@ def save_debug_image(
     ----------
     image : PIL.Image.Image
         Image to save.
-    directory : str
-        Target directory.
+    directory : str, optional
+        Target directory (default: generative_kitting/logs/vlm_images).
     prefix : str
         Filename prefix.
     fmt : str
@@ -122,6 +122,9 @@ def save_debug_image(
     str
         Absolute path to the saved file.
     """
+    if directory is None:
+        from utils.config_loader import package_dir
+        directory = str(package_dir() / "logs" / "vlm_images")
     os.makedirs(directory, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     filename = f"{prefix}_{timestamp}.{fmt}"

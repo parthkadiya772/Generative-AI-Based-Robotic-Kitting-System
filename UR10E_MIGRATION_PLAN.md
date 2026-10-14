@@ -244,19 +244,15 @@ Target pipeline: 4 corner depth cameras → robot self-masking → nvblox (TSDF 
 - **Check result (2026-10-14): passed.** Distances: the SDF matches exact distances to the integrated points within one voxel (7.2/7.3). Approaches to 0.25 m above `large_gear_1` from home, world rebuilt each run, bridge restarted per yaw: yaw 0 5/5 (1.4 mm), +30° 5/5 (1.3 mm), −30° 5/5 (1.4 mm); no cspace NO PATH. `pick_test.sh` on fresh scenes: `large_gear_1` 50.5 N, hold OK; `motor_valve_1` 49.6 N, hold OK.
 - **Later (user, 2026-10-13):** calibrate all cameras (intrinsics + extrinsics) so detected part coordinates and the nvblox map share one frame; then test the VLM pipeline end to end (part detection → 3D grasp target → planned pick). Camera poses come from USD until calibration replaces them.
 
-## Step 8: Secondary consumers
-- **`execution/robot_controller.py`:**
-  - Load `robot.yaml`.
-  - Drop the stock-UR10 URDF patching.
-  - Fix its gantry lookup.
-  - Fix or remove the Lula path.
-- **`isaac_sim_launcher.py` and `diagnose_motion.py`:** read paths, home pose and joint indices from the YAML.
-- **`workflow_engine.py`:**
-  - Remove duplicated robot defaults, such as the TCP offset and finger close; read them from config instead.
-  - Clean up `effective_reach` and the other defaults that differ from `config.yaml`.
-- **Workspace bounds:** keep one copy. Merge `validators.py` ×2 and the `safety.py` fallback.
-- **LLM prompts:** change "UR10" → "UR10e" and "RSD455" → "D555". Re-check the camera-height text.
-- **Check:** `pytest tests/` passes; mock-mode CLI runs.
+## Step 8: Secondary consumers ✅ done (2026-10-14, awaiting review)
+- **`execution/robot_controller.py`: removed** (user decision). It was the in-Isaac `main.py --sim` path (Lula IK, never initialised); the bridge + cuMotion replaces it. Also removed: `main.py` `init_sim` / `--sim` (the CLI now plans only; robot execution runs through the UI and the bridge) and the 27 `config.yaml` keys no code reads any more (old UR10 prim paths, gantry joint/offset, home pose, `gripper_tcp_offset` 0.170, `finger_*_rad`, Lula URDF/YAML keys, unused heights, `downward_orientation`). Robot settings live only in `robot.yaml`.
+- **`isaac_sim_launcher.py`:** reads prims, home pose and joint names from `robot.yaml`, the VLM from `config.yaml` (checks vLLM `/v1/models` or Ollama `/api/tags`), finds the repo like the bridge; home is applied by joint name. Live: prims found, robot reaches `home_joints`.
+- **`diagnose_motion.py`:** joint indices from `/api/status` names + `robot.yaml`, gantry limits and URDF root from `robot.yaml`, bridge from `BRIDGE_HOST`/`BRIDGE_PORT`; fixed the `collision_spheres` KeyError left by 7.5. Live: all checks pass.
+- **`workflow_engine.py`:** the drifting fallbacks are gone (`max_pick_retries` 2 vs 3, `effective_reach.z_max` 0.60 / 1.00 vs 999, `depth_analysis_height` 0.20 vs 1.10, `place_transit_clearance` 0.35 vs 0.20): `_exec_value` reads `config.yaml execution.*` and raises if missing. No 0.5 finger-close fallbacks (the bridge uses `robot.yaml` close). Dead `_safe_floor_z` and its stale 0.170 TCP offset removed.
+- **Workspace bounds: one copy** (`config.yaml execution.workspace_bounds`, `utils/workspace.py`); both validators and the `safety.py` fallback (was a tabletop 0.8 × 1.0 × 0.4 m box) use it.
+- **Prompts:** UR10 → UR10e, RSD455 → RealSense D555 (`workflow_engine`, `prompt_templates`, UI caption). Camera height text "30–50 cm" checked: 0.39 m above the part top / 0.43 m above the bin floor at the pick standoff.
+- **Portability (found here):** `requirements.txt` was a UTF-16 Windows `pip freeze` with `pywin32` / `win32_setctime` → UTF-8 with `sys_platform == "win32"` markers; the project venv `generative_kitting/.aikido` (uv, Python 3.12) installs on Linux. python-dotenv expanded `${PROJECT_ROOT}` in `.env` before it was set (→ `/generative_kitting/...`); `config_loader` now sets it first (test added). A relative `logging.log_dir` / the debug-image folder followed the cwd; now anchored at `generative_kitting/logs`.
+- **Check:** `pytest tests/` 131 passed (was 126; +5 tests). Mock-mode CLI runs end to end and fails cleanly at the VLM call: the vLLM / Ollama server (10.7.0.35) is not reachable from this machine (VPN), so a full mock cycle is still to be run by the user.
 
 ## Step 9: Docs and cleanup
 - Update `CLAUDE.md`, `AGENTS.md` and `GEMINI.md`: robot description and the scene reference table.

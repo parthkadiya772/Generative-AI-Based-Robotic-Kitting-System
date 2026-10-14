@@ -12,7 +12,8 @@ combines:
   the operator command into a plan, constrained to a fixed action
   vocabulary.
 - **NVIDIA Isaac Sim 6.0.1** — UR10 arm with a Robotiq 2F-140 gripper on
-  a gantry rail, controlled deterministically via a Lula IK solver.
+  a gantry rail, controlled deterministically via cuMotion planning
+  against an nvblox collision world built from the depth cameras.
 
 The VLM never drives the robot directly; it only emits validated
 action primitives (`pick_object`, `place_object`, `move_home`, …).

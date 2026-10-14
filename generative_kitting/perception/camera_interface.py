@@ -88,7 +88,7 @@ class CameraInterface:
 
     def capture_and_save(
         self,
-        directory: str = "logs/vlm_images",
+        directory: str = None,
         prefix: str = "workspace",
     ) -> tuple:
         """
@@ -174,7 +174,7 @@ class MockCameraInterface:
 
     def capture_and_save(
         self,
-        directory: str = "logs/vlm_images",
+        directory: str = None,
         prefix: str = "mock_workspace",
     ) -> tuple:
         """Capture and save mock image."""
@@ -380,7 +380,7 @@ class BridgeCameraInterface:
 
     def capture_and_save(
         self,
-        directory: str = "logs/vlm_images",
+        directory: str = None,
         prefix: str = "bridge_workspace",
     ) -> tuple:
         """Capture and save bridge image."""

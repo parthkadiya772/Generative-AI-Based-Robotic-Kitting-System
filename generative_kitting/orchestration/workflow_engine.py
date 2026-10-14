@@ -37,6 +37,7 @@ from knowledge.parts_catalogue import (
 )
 from perception.object_detector import ZeroShotDetector
 from utils.logger import log
+from utils.workspace import default_workspace_bounds
 
 
 def _with_catalogue(prompt: str) -> str:
@@ -289,7 +290,7 @@ centre of the surrounding bin region.
 
 # ─── Wrist camera close-range scan prompt ──────────────────
 WRIST_SCAN_PROMPT = """You are a robotic vision system with a wrist-mounted camera
-on a UR10 robot arm. You are looking STRAIGHT DOWN into a parts bin from
+on a UR10e robot arm. You are looking STRAIGHT DOWN into a parts bin from
 approximately 30-50 cm above.
 
 Identify ALL loose mechanical parts visible in the bin below.
@@ -329,7 +330,7 @@ RESPOND ONLY WITH VALID JSON:
 }"""
 
 DEPTH_GRASP_PROMPT = """You are a robotic depth-vision system analyzing a close-up depth image
-from a RealSense RSD455 camera mounted on a UR10 robot arm.
+from a RealSense D555 camera mounted on a UR10e robot arm.
 
 The robot arm is positioned near a part it needs to grasp.
 Analyze this depth image and provide:
@@ -354,7 +355,7 @@ RESPOND ONLY WITH VALID JSON:
 }"""
 
 WRIST_VERIFY_PROMPT = """You are looking straight down from a wrist-mounted RealSense camera
-on a UR10 robot arm, approximately 30-50 cm above a parts bin.
+on a UR10e robot arm, approximately 30-50 cm above a parts bin.
 
 The robot's gantry has ALREADY moved the gripper above the planned
 target part — that target is the part CLOSEST TO THE IMAGE CENTRE.
@@ -453,6 +454,13 @@ class KittingWorkflowEngine:
 
     def cancel(self):
         self._cancelled = True
+
+    def _exec_value(self, key: str):
+        """config.yaml execution.<key>, with no code-side default (they drifted)."""
+        try:
+            return self.config["execution"][key]
+        except (KeyError, TypeError):
+            raise KeyError(f"config.yaml execution.{key} is not set") from None
 
     def _notify(self, phase: str, status: str, detail: str = ""):
         if self._phase_callback:
@@ -649,7 +657,7 @@ class KittingWorkflowEngine:
             # to world coordinates via the overhead depth pipeline.
             # Robot stays parked — no scan move required.
             # ═══════════════════════════════════════════════════
-            max_retries = exec_cfg.get("max_pick_retries", 2)
+            max_retries = int(self._exec_value("max_pick_retries"))
             pick_succeeded = False
             current_overhead = overhead_image  # re-captured on retry
 
@@ -2198,13 +2206,10 @@ class KittingWorkflowEngine:
         (``approximate_position``).  Destination objects (kitting tray)
         are never filtered — they don't need to be grasped.
         """
-        reach = self.config.get("execution", {}).get("effective_reach", {})
-        x_min = reach.get("x_min", -2.0)
-        x_max = reach.get("x_max", 3.0)
-        y_min = reach.get("y_min", -1.3)
-        y_max = reach.get("y_max", 1.3)
-        z_min = reach.get("z_min", -0.05)
-        z_max = reach.get("z_max", 0.60)
+        reach = self._exec_value("effective_reach")
+        x_min, x_max = reach["x_min"], reach["x_max"]
+        y_min, y_max = reach["y_min"], reach["y_max"]
+        z_min, z_max = reach["z_min"], reach["z_max"]
 
         objects = scene.get("detected_objects", [])
         reachable = []
@@ -2261,8 +2266,9 @@ class KittingWorkflowEngine:
         """
         tray_surface_z = self.config.get("perception", {}).get(
             "tray_surface_z", 0.02)
-        workspace = self.config.get("execution", {}).get("workspace_bounds", {})
-        z_max = workspace.get("z_max", 1.5)
+        workspace = (self.config.get("execution", {}).get("workspace_bounds")
+                     or default_workspace_bounds())
+        z_max = workspace["z_max"]
 
         tray_keywords = ("tray", "kitting", "destination")
         for obj in scene.get("detected_objects", []):
@@ -2275,7 +2281,7 @@ class KittingWorkflowEngine:
                 # Depth projection Z is unreliable for the tray
                 proj_z = pos["z"]
                 use_z = tray_surface_z
-                z_min = workspace.get("z_min", -0.1)
+                z_min = workspace["z_min"]
                 if proj_z > z_max or proj_z < z_min:
                     log.warning(
                         f"Tray projected z={proj_z:.3f} outside bounds — "
@@ -3054,10 +3060,8 @@ class KittingWorkflowEngine:
         - Part tops ~ 0.7-0.9 m
         - Effective reach Z: [z_min, z_max] from config
         """
-        reach = self.config.get("execution", {}).get(
-            "effective_reach", {})
-        z_min = reach.get("z_min", -0.05)
-        z_max = reach.get("z_max", 1.00)
+        reach = self._exec_value("effective_reach")
+        z_min, z_max = reach["z_min"], reach["z_max"]
 
         # Outside reachable range -> reject
         if projected_z < z_min or projected_z > z_max:
@@ -3211,37 +3215,10 @@ class KittingWorkflowEngine:
             f"{refined['z']:.3f})  Δxy={offset*100:.1f} cm")
         return refined
 
-    def _safe_floor_z(self, part_z: float) -> float:
-        """Return the minimum ee_link Z for a part-specific compartment
-        approach that keeps the gripper finger tips clear of the bin
-        compartment wall top.
-
-        Geometry (per-part, NOT per-rack):
-            compartment_wall_top_z = part_z + box_height
-            finger_TCP_z          = ee_link_z − gripper_tcp_offset
-            require finger_TCP_z ≥ compartment_wall_top_z
-                                 + bin_wall_finger_clearance
-        ⇒   ee_link_z ≥ part_z + box_height + gripper_tcp_offset
-                       + bin_wall_finger_clearance
-
-        ``box_height`` (compartment wall height above the part) is a
-        local, per-part value — much smaller than the rack's overall
-        ``bin_top_z`` (which is the top of the entire rack structure
-        and would push ee_link past the arm's vertical reach).
-
-        Pass ``part_z`` from the caller — the world Z of the part top
-        / grasp point as projected by ``/api/project_to_world``.
-        """
-        exec_cfg = self.config.get("execution", {})
-        box_h = float(exec_cfg.get("box_height", 0.05))
-        tcp_off = float(exec_cfg.get("gripper_tcp_offset", 0.170))
-        clearance = float(exec_cfg.get("bin_wall_finger_clearance", 0.02))
-        return float(part_z) + box_h + tcp_off + clearance
-
     def _realign_over_part(self, params: dict, step_num,
                            align_height: float,
                            bin_top_z: float) -> bool:
-        """Slide gantry + UR10 IK so the wrist sits over the target
+        """Slide gantry + UR10e IK so the wrist sits over the target
         part at a collision-safe height with the ee_link facing down.
 
         This is the explicit "vagn realigns to detected part" step in
@@ -3251,20 +3228,11 @@ class KittingWorkflowEngine:
 
         Z policy
         --------
-        The realign target is the LARGER of:
-          - ``part_z + align_height`` (the "preferred" close-range
-            descent for depth analysis), and
-          - the geometric "fingers-clear-walls" floor (``bin_top_z +
-            gripper_tcp_offset + bin_wall_finger_clearance``) — see
-            :meth:`_safe_floor_z`.
-
-        The scan-pose floor is critical for multi-compartment bins
-        whose dividers extend above the parts: a single IK jump from
-        scan height down to ``part_z + 0.4`` would route the wrist
-        through divider walls and self-collide. Staying at scan height
-        defers the actual descent to ``_pick_descend`` which moves
-        Cartesian (X/Y locked) — the only safe way to enter a single
-        compartment.
+        The realign target is ``part_z + align_height`` (the close-range
+        height for depth analysis). The move is planned by cuMotion
+        against the nvblox collision world, so divider walls are avoided
+        by the planner; the descent into the compartment stays with
+        ``_pick_descend`` (Cartesian, X/Y locked).
 
         Also applies ``scan_pose_orientation`` so the gripper fingers
         stay rotated out of the wrist camera's view.
@@ -3654,9 +3622,7 @@ class KittingWorkflowEngine:
         local_retries_max = int(
             self.config.get("execution", {}).get(
                 "local_grasp_retries", 2))
-        depth_h = float(
-            self.config.get("execution", {}).get(
-                "depth_analysis_height", 0.20))
+        depth_h = float(self._exec_value("depth_analysis_height"))
 
         # Capture the obj_label up front so the rescan can use it.
         rescan_label = (params.get("label")
@@ -3842,9 +3808,11 @@ class KittingWorkflowEngine:
                          "Closing gripper...")
             close_result = self.camera.send_command("/api/pick_close", {})
             grasp_confirmed = close_result.get("grasp_confirmed", False)
-            grip_hold = close_result.get("grip_hold", 0.5)
+            # No fallback angle: None lets the bridge use robot.yaml
+            # gripper.finger.close (see the grip_hold hand-off below).
+            grip_hold = close_result.get("grip_hold")
             result["grip_hold"] = grip_hold
-            result["finger_close"] = close_result.get("finger_close", 0.5)
+            result["finger_close"] = close_result.get("finger_close")
             result["sub_phases"].append({
                 "phase": "pick_close",
                 "status": "success" if grasp_confirmed else "warn",
@@ -3855,7 +3823,7 @@ class KittingWorkflowEngine:
 
             # ── Mechanical close-failure guard (LOCAL retry) ───────
             actual_finger = close_result.get("actual_finger")
-            target_finger = close_result.get("finger_close", 0.5)
+            target_finger = close_result.get("finger_close")
             try:
                 af = float(actual_finger) if actual_finger is not None else None
                 tf = float(target_finger)
@@ -4006,8 +3974,7 @@ class KittingWorkflowEngine:
         # the Phase 0 lookup didn't run.
         tray = getattr(self, "_tray_position", None)
         exec_cfg = self.config.get("execution", {})
-        transit_clearance = float(
-            exec_cfg.get("place_transit_clearance", 0.35))
+        transit_clearance = float(self._exec_value("place_transit_clearance"))
         # Gap between finger TCP and tray top at the release point.
         # Defaults to 0.03 m (3 cm) so the part is released just above
         # the tray surface — clean drop, no rim catch.

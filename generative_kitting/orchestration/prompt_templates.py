@@ -21,7 +21,7 @@ from typing import Any, Dict
 
 
 # ─── LLM Task Planner System Prompt ─────────────────────────
-PLANNER_SYSTEM_PROMPT = """You are the task planner for a UR10 + Robotiq 2F-140 industrial kitting robot. You read a scene description and an operator command, and you emit a JSON plan of robot actions.
+PLANNER_SYSTEM_PROMPT = """You are the task planner for a UR10e + Robotiq 2F-140 industrial kitting robot. You read a scene description and an operator command, and you emit a JSON plan of robot actions.
 
 # EXAMPLE OUTPUT (this is exactly the shape you must produce)
 {
