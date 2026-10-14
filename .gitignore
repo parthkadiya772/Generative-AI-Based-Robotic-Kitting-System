@@ -41,3 +41,14 @@ diagnose_projection_bias.py
 
 # nvblox bridge debug dump (/api/nvblox_update {"dump": true})
 generative_kitting/logs/nvblox_frames.npz
+
+# Docker / Windows-hybrid setup: work in progress, kept local until it is ready
+Dockerfile
+docker-compose.yml
+docker-compose.yaml
+docker-compose.*.yml
+docker-compose.md
+.dockerignore
+docker/
+server/
+INTEGRATION_IMPLEMENTATION.md

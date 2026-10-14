@@ -278,8 +278,8 @@ location. To force a specific checkout (e.g. two clones), put
 
 What does depend on the machine is the **software stack**, not paths: Ubuntu
 24 + CUDA 12 for nvblox, a driver ≥ 580 for the CUDA 13 torch build, and
-Isaac Sim 6.1. A Docker image (`Dockerfile`, `docker-compose.yml`) is planned
-to pin these.
+Isaac Sim 6.1. A Docker image to pin these is planned (work in progress, not
+yet part of the repository).
 
 ---
 
