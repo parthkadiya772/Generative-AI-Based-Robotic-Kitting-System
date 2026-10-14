@@ -536,5 +536,4 @@ robot_in_air/
 ## 15. License and citation
 
 This codebase accompanies the Master's thesis "Generative AI-based Robotic
-Kitting System" (Kadiya, 2026). See `THESIS_FRAMEWORK_SUMMARY.md` for the
-academic context.
+Kitting System" (Kadiya, 2026).
