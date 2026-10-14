@@ -52,3 +52,17 @@ docker-compose.md
 docker/
 server/
 INTEGRATION_IMPLEMENTATION.md
+
+# Not needed to run the project (checked 2026-10-14: no scene, code or doc uses them); kept locally
+/.github/
+/assets_copy/
+/configuration/
+/generative_kitting/isaac_compat.py
+/robot_in_air.usd
+/robotiq_2f_140.usd
+/robotiq_2f_140_flatten.usd
+/robotiq_fixed_physics.usd
+/ur10_gripper_140.usd
+/ur10_gripper_camera.usd
+/robotiq_2F_140_Joints_parameter.xlsx
+/skills-lock.json
