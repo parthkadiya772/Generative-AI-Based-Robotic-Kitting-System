@@ -13,23 +13,18 @@ API on port 8600 that the Streamlit dashboard consumes for:
                             never used for grasp coordinates
   GET  /api/prim_center?prim=<path> → USD bbox centre/top/height for a
                             static fixture (bin, tray). Not for parts.
-  POST /api/plan_test      → plan one pose with AND without the collision
-                            world, to prove whether the cloud blocks it
+  POST /api/plan_test      → plan one tool-frame pose with AND without the
+                            collision world, to prove whether it blocks it
   POST /api/jog            → nudge one joint via apply_action only (no
                             planner, no IK) and report if it moved
   POST /api/verify_planner → self-test: plan to the tool's own current
                             pose; a large joint delta means the
                             world->robot-root transform is wrong
-  POST /api/build_static_world → ONE-TIME (per cell setup): scan the
-                            static structure (rail/rack/floor/walls) with
-                            the robot parked out of the corner cameras'
-                            view. Cached to disk; reused by every
-                            build_collision_world call below.
   POST /api/build_collision_world → rebuild the cuMotion collision world:
-                            cached static structure + this cycle's
-                            dynamic layer from the 4 corner cameras
-  POST /api/wrist_obstacles → add neighbour-part obstacles from the wrist
-                            camera, carving out the target grasp point
+                            depth cameras -> nvblox -> one SDF obstacle,
+                            grasp targets carved (see _nvblox_world)
+  POST /api/nvblox_update  → integrate the depth cameras into nvblox only
+  POST /api/nvblox_world   → nvblox_update + load the SDF into cuMotion
   POST /api/execute       → execute a list of action primitives
   POST /api/joints        → set joint positions directly
   POST /api/home          → move robot to home position
@@ -453,19 +448,13 @@ def _apply_gripper_gains():
         print(f"[OK] Gripper armature {armature} kg*m^2 on {len(joints)} joints")
 
 # ═════════════════════════════════════════════════════════════
-# COLLISION WORLD  (4-camera point cloud → cuMotion sphere colliders)
+# SCENE CAMERAS  (Replicator render products)
 #
-#   Four corner cameras render Replicator "pointcloud" annotators. The
-#   merged cloud is voxel-downsampled and fed to cuMotion as spheres,
-#   one per voxel, radius = voxel/2 so the set is watertight.
-#
-#   Points near known grasp targets are carved out: an obstacle sitting
-#   on the grasp point makes the pick unplannable by construction. The
-#   targets come from the perception pipeline (camera + depth), so this
-#   path involves no USD lookup at all.
-#
-#   Local awareness of neighbouring parts comes later, from the wrist
-#   camera at standoff height — see _add_wrist_obstacles().
+#   The corner and overhead cameras keep one render product each. The
+#   pointcloud annotator (surface_z, diagnostics) and the depth annotator
+#   for nvblox (NVBLOX COLLISION WORLD below) share it. The collision
+#   world itself is the nvblox SDF; the old point-cloud → sphere world,
+#   its static scan and the wrist-camera spheres were removed in Step 7.5.
 # ═════════════════════════════════════════════════════════════
 
 POINTCLOUD_CAMERAS = {
@@ -477,38 +466,7 @@ POINTCLOUD_CAMERAS = {
     "/World/Camera_Kit": (480, 640),
 }
 
-COLLISION_VOXEL_SIZE = 0.02       # 2 cm — trades fidelity for sphere count
-COLLISION_MAX_SPHERES = 6000      # hard cap; planner cost grows with count
-COLLISION_SAFETY_MARGIN = 0.005   # 5 mm inflation on every obstacle
-# Radius of the XY cylinder cleared around each known grasp target so
-# the part being picked never becomes its own obstacle.
-TARGET_CARVE_RADIUS = 0.06
-
-# ── Static structure scan ───────────────────────────────────────
-#
-#   The gantry rail, bin rack, floor, and walls do not move. Re-scanning
-#   them every cycle means re-deriving the same geometry over and over,
-#   AND re-running robot self-filtering across the arm's full range of
-#   motion every single time — the fragile part of the pipeline, since
-#   the self-filter has to correctly mask a moving 15-link arm in every
-#   pose it can be in.
-#
-#   Capture this ONCE with the robot parked in a pose that puts it
-#   outside the 4 corner cameras' view (POST /api/build_static_world).
-#   The self-filter still runs as a safety net in case the park pose
-#   isn't perfectly clear, but with the robot genuinely out of frame
-#   there is nothing for it to remove. The result is cached to disk so
-#   a bridge restart does not require a re-scan.
-#
-#   Per-cycle rebuilds (_build_collision_world) then ADD the dynamic
-#   layer (whatever the corner cameras currently see, self-filtered and
-#   carved around detected targets, exactly as before) on top of this
-#   fixed static layer, instead of re-deriving the static structure from
-#   scratch every time.
-STATIC_WORLD_VOXEL_SIZE = 0.03    # coarser: structure doesn't need 2cm fidelity
 _PROJECT_ROOT = os.path.dirname(_ENV_FILE) if _ENV_FILE else os.getcwd()
-STATIC_WORLD_CACHE = os.path.join(
-    _PROJECT_ROOT, "generative_kitting", "logs", "static_world_scan.json")
 
 _pc_annotators = {}               # cam_path -> replicator annotator
 # The render product itself, kept so a second annotator (e.g. semantic
@@ -560,15 +518,6 @@ async def _measure_surface_z(params=None):
     fallback_z = 0.02 if (cam_name == "kit" or "box" in str(params)) else 0.0
     print(f"  [surface_z] pointcloud empty/out-of-range, returning fallback z={fallback_z:.3f}")
     return {"status": "ok", "z": fallback_z, "source": "fallback", "points_sampled": 0}
-
-
-def _voxel_downsample(points, voxel_size):
-    """Keep one point per occupied voxel."""
-    if len(points) == 0:
-        return points
-    keys = np.floor(points / voxel_size).astype(np.int64)
-    _, idx = np.unique(keys, axis=0, return_index=True)
-    return points[idx]
 
 
 def _ensure_pointcloud_annotators(cameras):
@@ -629,28 +578,6 @@ async def _capture_pointcloud(cameras=None, ticks=5):
           f"y[{lo[1]:+.2f}, {hi[1]:+.2f}]  "
           f"z[{lo[2]:+.2f}, {hi[2]:+.2f}]  ({len(merged)} pts)")
     return merged
-
-
-def _carve_around_points(points, targets, radius):
-    """Remove cloud points near known grasp targets.
-
-    Returns ``(kept, n_removed)``.
-
-    The parts we intend to pick must NOT become collision geometry — a
-    sphere sitting on the grasp point makes the pick unplannable by
-    construction. ``targets`` are the world XYZ the perception pipeline
-    already produced from camera + depth, so this needs no USD lookup
-    and no bin bounding box.
-
-    Carving is by XY cylinder rather than a sphere: the gripper descends
-    vertically, so the whole column above a part has to stay clear.
-    """
-    if len(points) == 0 or not targets:
-        return points, 0
-    tgt = np.asarray(targets, dtype=np.float64)[:, :2]
-    d = np.linalg.norm(points[:, None, :2] - tgt[None, :, :], axis=2)
-    near = (d <= radius).any(axis=1)
-    return points[~near], int(near.sum())
 
 
 _XRDF_SPHERES_CACHE = None
@@ -971,6 +898,14 @@ def _nvblox_get_sdf(carve=()):
     return data["values"], data["origin"], float(data["voxel_size"]), stats
 
 
+def _collision_world_desc():
+    """What cuMotion currently plans against, for logs and /api/status."""
+    if STATE.nvblox_sdf_handle is None:
+        return "empty"
+    nx, ny, nz, voxel = STATE.nvblox_sdf_key
+    return f"nvblox SDF {nx}x{ny}x{nz} @ {voxel * 100:.0f} cm"
+
+
 def _set_cumotion_sdf(values, origin, voxel_size):
     """Load a dense SDF (grid corner at world ``origin``) into the cuMotion world.
 
@@ -1096,47 +1031,21 @@ async def _nvblox_world(params=None):
     return result
 
 
-def _spheres_from_points(points, prefix, radius, margin=COLLISION_SAFETY_MARGIN):
-    """Push one sphere collider per point into the cuMotion world."""
-    import warp as wp
-
-    n = len(points)
-    if n == 0:
-        return 0
-
-    prim_paths = [f"{prefix}/{i}" for i in range(n)]
-    with wp.ScopedDevice(STATE.cumotion_device):
-        radii = wp.array(np.full(n, radius, dtype=np.float32), dtype=wp.float32)
-        scales = wp.array(np.ones((n, 3), dtype=np.float32), dtype=wp.vec3)
-        tols = wp.array(np.full(n, margin, dtype=np.float32), dtype=wp.float32)
-        positions = wp.array(points.astype(np.float32), dtype=wp.vec3)
-        quats = wp.array(
-            np.tile([1.0, 0.0, 0.0, 0.0], (n, 1)).astype(np.float32), dtype=wp.vec4)
-        enabled = wp.array(np.ones(n, dtype=np.int32), dtype=wp.int32)
-
-    STATE.cumotion_world.add_spheres(
-        prim_paths=prim_paths, radii=radii, scales=scales,
-        safety_tolerances=tols, poses=(positions, quats),
-        enabled_array=enabled)
-    return n
-
-
 async def _plan_test(params=None):
     """Plan the same pose twice: with the collision world, and without.
 
-    Answers one question directly — is the point cloud what is blocking
-    the planner? A temporary EMPTY world + planner is built for the
-    second attempt, so the live collision world is left untouched.
+    Answers one question directly — is the collision world what is
+    blocking the planner? A temporary EMPTY world + planner is built for
+    the second attempt, so the live collision world is left untouched.
 
-    The usual culprit is the robot itself: the corner cameras see the
-    arm, so its geometry ends up in the cloud, and the robot's own XRDF
-    spheres then overlap those obstacles. cuMotion reports the START
-    configuration as in-collision and every plan fails, including
-    trivial ones.
+    The usual culprits: a robot part the depth mask missed (cuMotion then
+    reports the START configuration in collision and every plan fails),
+    or a target that was not carved.
 
     Params:
-        position / orientation: target pose. Defaults to the tool's own
-            current pose lifted by ``lift`` metres.
+        position / orientation: target pose of the cuMotion TOOL frame
+            (robotiq_base_link, TCP + tcp.offset up), not the TCP. Defaults
+            to the tool's own current pose lifted by ``lift`` metres.
         lift: default 0.15
     """
     import omni.usd
@@ -1175,7 +1084,7 @@ async def _plan_test(params=None):
 
     print(f"  [plan-test] tool now ({tool[0]:.3f}, {tool[1]:.3f}, {tool[2]:.3f})")
     print(f"  [plan-test] q_start = [{', '.join(f'{v:+.3f}' for v in q0)}]")
-    if STATE.collision_sphere_count == 0:
+    if STATE.nvblox_sdf_handle is None:
         print("  [plan-test] NOTE: the collision world is EMPTY, so the "
               "with/without comparison is degenerate. Call "
               "/api/build_collision_world first to test obstacles.")
@@ -1194,11 +1103,11 @@ async def _plan_test(params=None):
     pos = np.array(probes[2][1] if len(probes) > 2 else probes[0][1],
                    dtype=np.float64)
 
-    # A — the live world, however many spheres it holds.
+    # A — the live world (the nvblox SDF, if built).
     with_world = STATE.cumotion_planner.plan_to_pose_target(
         q_initial=q0, position=pos, orientation=ori) is not None
     print(f"  [plan-test] WITH obstacles    "
-          f"({STATE.collision_sphere_count} spheres): "
+          f"({_collision_world_desc()}): "
           f"{'PATH FOUND' if with_world else 'NO PATH'}")
 
     # B — a throwaway empty world, so the live one is not disturbed.
@@ -1212,20 +1121,19 @@ async def _plan_test(params=None):
     empty_world.world_view.update()
     without_world = empty_planner.plan_to_pose_target(
         q_initial=q0, position=pos, orientation=ori) is not None
-    print(f"  [plan-test] WITHOUT obstacles (0 spheres): "
+    print(f"  [plan-test] WITHOUT obstacles (empty world): "
           f"{'PATH FOUND' if without_world else 'NO PATH'}")
 
     if without_world and not with_world:
-        verdict = ("The collision world is blocking the planner. Almost "
-                   "certainly the robot's own body is in the point cloud "
-                   "(the corner cameras see the arm), so the START "
-                   "configuration is in collision.")
+        verdict = ("The collision world is blocking the planner: the target "
+                   "or the START configuration is in collision with the map "
+                   "(an unmasked robot part, or an uncarved target).")
     elif not without_world and not with_world:
         verdict = ("Blocked even with NO obstacles — the pose is "
                    "unreachable or the start config is invalid. Not a "
-                   "point-cloud problem.")
+                   "collision-world problem.")
     elif with_world:
-        verdict = "Planning succeeds with obstacles; the cloud is not the blocker."
+        verdict = "Planning succeeds with obstacles; the map is not the blocker."
     else:
         verdict = "Plans with obstacles but not without — unexpected."
     print(f"  [plan-test] {verdict}")
@@ -1235,7 +1143,7 @@ async def _plan_test(params=None):
             "reachability": reach,
             "with_obstacles": with_world,
             "without_obstacles": without_world,
-            "collision_spheres": STATE.collision_sphere_count,
+            "collision_world": _collision_world_desc(),
             "verdict": verdict}
 
 
@@ -1499,88 +1407,7 @@ async def _verify_planner(params=None):
             "robot_root_world_pos": [float(v) for v in root_t],
             "root_candidates": candidates,
             "tool_world_pos": tool_pos,
-            "collision_spheres": STATE.collision_sphere_count}
-
-
-def _save_static_world(points):
-    """Cache the static-structure scan to disk so a bridge restart
-    doesn't require re-parking the robot and re-scanning."""
-    try:
-        os.makedirs(os.path.dirname(STATIC_WORLD_CACHE), exist_ok=True)
-        with open(STATIC_WORLD_CACHE, "w") as f:
-            json.dump({"points": np.asarray(points).tolist()}, f)
-        print(f"  [static] saved {len(points)} points to {STATIC_WORLD_CACHE}")
-    except Exception as e:
-        print(f"  [static] WARNING: could not save cache: {e}")
-
-
-def _load_static_world():
-    """Load the cached static-structure scan into STATE, if not already
-    loaded this session. Returns the points array (may be empty)."""
-    if STATE.static_world_points is not None:
-        return STATE.static_world_points
-    try:
-        with open(STATIC_WORLD_CACHE, "r") as f:
-            data = json.load(f)
-        pts = np.asarray(data.get("points", []), dtype=np.float64)
-        if pts.ndim == 2 and pts.shape[1] == 3:
-            STATE.static_world_points = pts
-            print(f"  [static] loaded {len(pts)} cached points from "
-                  f"{STATIC_WORLD_CACHE}")
-            return pts
-    except FileNotFoundError:
-        pass
-    except Exception as e:
-        print(f"  [static] WARNING: could not load cache: {e}")
-    STATE.static_world_points = np.empty((0, 3))
-    return STATE.static_world_points
-
-
-async def _build_static_world(params=None):
-    """Capture the STATIC cell structure once, from a parked pose.
-
-    The operator must move the robot out of the 4 corner cameras' view
-    first (e.g. gantry run to one end, arm folded) — call /api/status
-    or check the viewport to confirm before calling this. With the robot
-    genuinely out of frame, this scan needs no self-filtering by
-    construction; the XRDF self-filter still runs as a defensive second
-    pass in case the park pose isn't perfectly clear of every camera.
-
-    This replaces re-deriving the gantry rail / rack / floor / walls
-    every planning cycle, which was also re-running robot self-filtering
-    across the arm's full range of motion every cycle — the fragile,
-    error-prone part of the old pipeline. Call this once per physical
-    cell setup (rack moved, new obstacle added, etc.), not per pick.
-    """
-    params = params or {}
-    if STATE.cumotion_world is None and not _init_cumotion():
-        return {"error": "cuMotion not initialised"}
-
-    voxel = float(params.get("voxel_size", STATIC_WORLD_VOXEL_SIZE))
-
-    raw = await _capture_pointcloud()
-    if len(raw) == 0:
-        return {"error": "no point cloud data from any camera"}
-
-    filtered, n_self_filtered = _filter_robot_self_points(raw)
-    if n_self_filtered > 0.05 * len(raw):
-        print(f"  [static] WARNING: self-filter removed {n_self_filtered} "
-              f"of {len(raw)} points ({100*n_self_filtered/len(raw):.0f}%). "
-              f"The robot may still be inside the cameras' view — this scan "
-              f"should be taken with the robot fully parked out of frame, "
-              f"not relying on the self-filter to clean it up.")
-
-    voxels = _voxel_downsample(filtered, voxel)
-    _save_static_world(voxels)
-    STATE.static_world_points = voxels
-
-    print(f"  [static] structure scan: {len(raw)} raw → {n_self_filtered} "
-          f"self-filtered → {len(voxels)} voxels @ {voxel*100:.0f}cm "
-          f"(cached — will be reused by every collision-world rebuild "
-          f"until re-scanned)")
-    return {"status": "ok", "raw_points": int(len(raw)),
-            "self_filtered": n_self_filtered,
-            "static_points": int(len(voxels)), "voxel_size": voxel}
+            "collision_world": _collision_world_desc()}
 
 
 async def _probe_pointcloud_semantic_fields(params=None):
@@ -1813,50 +1640,9 @@ async def _build_collision_world(params=None):
     result.update({
         "source": "nvblox",
         "carved": result["service_sdf"].get("carved", 0),
-        "spheres": STATE.collision_sphere_count,
         "integrated_pixels": sum(c["integrated_pixels"] for c in result.get("cameras", [])),
     })
     return result
-
-
-async def _add_wrist_obstacles(params):
-    """Add neighbour-part obstacles from the wrist camera at standoff.
-
-    Captured at ``pick_align_height`` rather than grasp height: at grasp
-    height the fingers occlude the target and the camera's offset from
-    the TCP makes the view geometrically poor.
-
-    A cylinder of ``carve_radius`` around the grasp XY is EXCLUDED, so
-    the target itself never becomes an obstacle — otherwise the descent
-    to grasp is unplannable. Everything else the wrist sees (neighbouring
-    parts, bin dividers) becomes a collider.
-    """
-    if STATE.cumotion_world is None:
-        return {"error": "cuMotion not initialised"}
-
-    grasp_xy = params.get("grasp_xy")
-    if not (isinstance(grasp_xy, (list, tuple)) and len(grasp_xy) >= 2):
-        return {"error": "grasp_xy [x, y] required"}
-    carve_r = float(params.get("carve_radius", 0.06))
-    voxel = float(params.get("voxel_size", 0.01))   # finer: wrist is close
-
-    raw = await _capture_pointcloud(
-        cameras={CAMERA_WRIST_PRIM: (480, 640)}, ticks=4)
-    if len(raw) == 0:
-        return {"error": "wrist point cloud empty"}
-
-    d_xy = np.linalg.norm(raw[:, :2] - np.array(grasp_xy[:2]), axis=1)
-    neighbours = raw[d_xy > carve_r]
-    n_carved = int((d_xy <= carve_r).sum())
-
-    voxels = _voxel_downsample(neighbours, voxel)
-    n = _spheres_from_points(voxels, "/collision/wrist_local", voxel / 2.0)
-    STATE.cumotion_world.world_view.update()
-
-    print(f"  [pcd-wrist] {len(raw)} raw → {n_carved} carved around target "
-          f"→ {n} neighbour spheres")
-    return {"status": "ok", "spheres": n, "carved": n_carved,
-            "carve_radius": carve_r}
 
 
 # ═════════════════════════════════════════════════════════════
@@ -1914,7 +1700,6 @@ def _reset_cumotion_world():
     STATE.cumotion_world = CumotionWorldInterface(
         world_to_robot_base=(base_pos, base_quat),
         device=STATE.cumotion_device)
-    STATE.collision_sphere_count = 0
     STATE.nvblox_sdf_handle = None        # belonged to the old world
     # The planner holds a reference to the world interface, so rebuild it.
     if STATE.cumotion_robot is not None:
@@ -2062,7 +1847,7 @@ def _plan_pose(tcp_pos, orientation):
         print(f"  [plan] NO PATH to tool pose "
               f"({tool_pos[0]:.3f}, {tool_pos[1]:.3f}, {tool_pos[2]:.3f}) "
               f"— target unreachable, in collision, or start in collision "
-              f"({STATE.collision_sphere_count} obstacle spheres)")
+              f"(collision world: {_collision_world_desc()})")
         return None
     return _path_to_trajectory(path)
 
@@ -2314,15 +2099,9 @@ class BridgeState:
         self.cumotion_dof_indices = []    # XRDF cspace order -> articulation DOF
         self.cumotion_ready = False
         self.cumotion_error = "not initialised yet"
-        self.collision_sphere_count = 0
         self.nvblox_sdf_handle = None     # cuMotion SDF obstacle from nvblox
         self.nvblox_sdf_key = None        # (nx, ny, nz, voxel) it was built for
         self.held_part = None             # {"radius": m} while a grasp is confirmed
-        # Static structure scan (gantry rail, rack, floor, walls) — see
-        # /api/build_static_world. Captured once, cached to disk, reused
-        # by every _build_collision_world rebuild instead of being
-        # re-derived (and re-self-filtered) every cycle.
-        self.static_world_points = None
         # Single-use handoff: set by ik_solve, consumed by the next
         # _apply_interpolated so the planned path is actually followed.
         self.pending_trajectory = None
@@ -2478,10 +2257,6 @@ class BridgeHandler(BaseHTTPRequestHandler):
             STATE.push_command({"action": "build_collision_world",
                                 "params": body})
             self._send_json(STATE.pop_result(timeout=180))
-        elif path == "/api/build_static_world":
-            STATE.push_command({"action": "build_static_world",
-                                "params": body})
-            self._send_json(STATE.pop_result(timeout=180))
         elif path == "/api/probe_obstacle_update":
             STATE.push_command({"action": "probe_obstacle_update", "params": body})
             self._send_json(STATE.pop_result(timeout=60))
@@ -2497,9 +2272,6 @@ class BridgeHandler(BaseHTTPRequestHandler):
         elif path == "/api/nvblox_update":
             STATE.push_command({"action": "nvblox_update", "params": body})
             self._send_json(STATE.pop_result(timeout=120))
-        elif path == "/api/wrist_obstacles":
-            STATE.push_command({"action": "wrist_obstacles", "params": body})
-            self._send_json(STATE.pop_result(timeout=60))
         elif path == "/api/realign_gantry":
             self._handle_realign_gantry(body)
         elif path == "/api/pick":
@@ -2654,7 +2426,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 "ik_ready": STATE.ik_ready,
                 "planner": "cumotion",
                 "cumotion_error": STATE.cumotion_error,
-                "collision_spheres": STATE.collision_sphere_count,
+                "collision_world": _collision_world_desc(),
                 "contact_sensor_pad_ready":
                     STATE.contact_sensor is not None,
                 "contact_sensor_tip_ready":
@@ -3738,9 +3510,9 @@ async def _apply_interpolated(target_joints, settle_frames=SETTLE_FRAMES, finger
         # A cuMotion trajectory existed and was streamed, but the
         # articulation did not actually move (see the "*** ROBOT DID NOT
         # MOVE ***" print in _execute_trajectory). This is almost always
-        # the robot's own sensed point cloud making the start state look
-        # like it is already in collision (DIAGNOSE_stuck_but_success.md
-        # Cause #1). Do NOT fall through to the blind, non-collision-aware
+        # the robot's own body left in the collision map (a missed depth
+        # mask) making the start state look like it is already in
+        # collision (DIAGNOSE_stuck_but_success.md Cause #1). Do NOT fall through to the blind, non-collision-aware
         # joint interpolation below — that would drive the robot straight
         # through whatever the planner was trying to avoid, exactly the
         # HC-2 violation the sensor-only planning design forbids. Surface
@@ -3749,8 +3521,8 @@ async def _apply_interpolated(target_joints, settle_frames=SETTLE_FRAMES, finger
         raise RuntimeError(
             "cuMotion trajectory execution produced no motion — refusing "
             "to fall back to a collision-unaware interpolated move. Check "
-            "whether the robot's own point cloud is blocking its start "
-            "state (self-filter coverage) before retrying.")
+            "whether the robot's own body is in the collision map (depth "
+            "mask coverage, /api/plan_test) before retrying.")
 
     current_joints = STATE.robot.get_joint_positions()
 
@@ -4363,9 +4135,10 @@ async def _approach_target(params):
 
     target_z = z
 
-    # Move gantry to EXACT target X first, then update base pose
-    await _move_gantry_x(x)
-    _update_base_pose()
+    # No separate gantry slide first: the gantry is cspace joint 0, so the
+    # pose planner moves it with the arm. A gantry-only slide from home
+    # drags the hanging arm through the rack and never planned (its error
+    # was ignored); removed in Step 7.5.
 
     if orientation is not None:
         try:
@@ -5249,7 +5022,6 @@ def _shutdown_bridge(reason="simulation stopped"):
     STATE.cumotion_planner = None
     STATE.cumotion_ready = False
     STATE.pending_trajectory = None
-    STATE.collision_sphere_count = 0
     STATE.nvblox_sdf_handle = None
     STATE.held_part = None
 
@@ -5454,8 +5226,6 @@ async def _process_commands_loop():
                 result = await _verify_planner(cmd.get("params", {}))
             elif action == "build_collision_world":
                 result = await _build_collision_world(cmd.get("params", {}))
-            elif action == "build_static_world":
-                result = await _build_static_world(cmd.get("params", {}))
             elif action == "probe_obstacle_update":
                 result = await _probe_obstacle_update(cmd.get("params", {}))
             elif action == "probe_shared_segmentation":
@@ -5466,8 +5236,6 @@ async def _process_commands_loop():
                 result = await _nvblox_world(cmd.get("params", {}))
             elif action == "nvblox_update":
                 result = await _nvblox_update(cmd.get("params", {}))
-            elif action == "wrist_obstacles":
-                result = await _add_wrist_obstacles(cmd.get("params", {}))
             elif action == "approach":
                 result = await _approach_target(cmd.get("params", {}))
             elif action == "realign_gantry_hold_ee":

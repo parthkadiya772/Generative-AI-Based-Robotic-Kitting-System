@@ -347,42 +347,6 @@ class BridgeCameraInterface:
         return self.send_command("/api/build_collision_world", payload,
                                  timeout=180)
 
-    def build_static_world(self, voxel_size: float = None) -> dict:
-        """Capture the STATIC cell structure once, from a parked pose.
-
-        Move the robot out of the 4 corner cameras' view first (gantry to
-        one end, arm folded clear) — this is a one-time-per-setup call,
-        not part of the per-pick loop. The result is cached on the bridge
-        (and to disk) and reused by every subsequent
-        ``build_collision_world`` call, so the gantry rail / rack / floor
-        / walls no longer need to be re-derived — and re-self-filtered
-        against the moving arm — on every scan cycle.
-
-        Parameters
-        ----------
-        voxel_size : float
-            Downsample grid in metres (bridge default 0.03 — coarser than
-            the dynamic layer since static structure needs less fidelity).
-        """
-        payload = {}
-        if voxel_size:
-            payload["voxel_size"] = float(voxel_size)
-        return self.send_command("/api/build_static_world", payload,
-                                 timeout=180)
-
-    def add_wrist_obstacles(self, grasp_xy: list,
-                            carve_radius: float = 0.06) -> dict:
-        """Add neighbour-part obstacles seen by the wrist camera.
-
-        Call at standoff height, before the final descent. A cylinder of
-        ``carve_radius`` around ``grasp_xy`` is excluded so the target
-        part itself never becomes an obstacle.
-        """
-        return self.send_command(
-            "/api/wrist_obstacles",
-            {"grasp_xy": list(grasp_xy), "carve_radius": float(carve_radius)},
-            timeout=60)
-
     def project_to_world(self, points: list, camera: str = "rgb",
                          fresh_depth: bool = False) -> dict:
         """Project normalised image coordinates to world XYZ via depth.
