@@ -43,3 +43,14 @@ def test_errors_and_empty_input():
     assert _top_surface_point([]) is None
     assert _top_surface_point([{"error": "no valid depth at pixel"}]) is None
     assert _top_surface_point([{"x": 0.0, "y": 0.0, "z": 1.0}, {"error": "x"}])[2] == 1.0
+
+
+def test_measure_tool_helpers():
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
+    import measure_grounding as mg
+    assert mg._label("large_gear_12") == "large_gear"
+    assert mg._iou((0, 0, 10, 10), (0, 0, 10, 10)) == pytest.approx(1.0)
+    assert mg._iou((0, 0, 10, 10), (5, 0, 15, 10)) == pytest.approx(1 / 3)
+    s = mg._stats([1.0, 2.0, 3.0, None, float("nan")])
+    assert s["n"] == 3 and s["mean"] == 2.0 and s["max"] == 3.0
+    assert mg._stats([]) is None

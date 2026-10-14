@@ -416,6 +416,26 @@ def _top_surface_point(samples, band=0.01):
     return x, y, z_top, len(top)
 
 
+def _bbox_grid_points(bbox, n=9, inset=0.10):
+    """n x n sample points inside a normalised box (x1, y1, x2, y2), inset by
+    ``inset`` of its size on each side so the edges (often the bin floor)
+    carry less weight. Shared by _detect_parts and tools/measure_grounding.py."""
+    x1, y1, x2, y2 = (float(v) for v in bbox)
+    ix, iy = (x2 - x1) * inset, (y2 - y1) * inset
+    x1, x2, y1, y2 = x1 + ix, x2 - ix, y1 + iy, y2 - iy
+    return [(x1 + (x2 - x1) * i / (n - 1), y1 + (y2 - y1) * j / (n - 1))
+            for i in range(n) for j in range(n)]
+
+
+def _wrist_patch_points(cx, cy, half=0.04, n=7):
+    """n x n normalised points within +-half of (cx, cy), clipped to the image:
+    the wrist verify's depth patch around the VLM centre. Shared with
+    tools/measure_grounding.py."""
+    offs = [half * (2 * k / (n - 1) - 1) for k in range(n)]
+    return [(min(max(cx + dx, 0.0), 1.0), min(max(cy + dy, 0.0), 1.0))
+            for dx in offs for dy in offs]
+
+
 class WorkflowPhase:
     """Represents a single phase in the kitting workflow."""
     BIN_LOOKUP      = "bin_lookup"      # USD lookup of bin + tray centres
@@ -1632,21 +1652,10 @@ class KittingWorkflowEngine:
 
             bbox = obj.get("_detector_bbox_full")
             if bbox:
-                # Sample a GRIDxGRID grid inside the bbox (with 10%
-                # inset to avoid edges that may hit bin floor)
-                bx_min, by_min, bx_max, by_max = bbox
-                inset_x = (bx_max - bx_min) * 0.10
-                inset_y = (by_max - by_min) * 0.10
-                bx_min += inset_x
-                bx_max -= inset_x
-                by_min += inset_y
-                by_max -= inset_y
+                # GRIDxGRID samples inside the bbox (10 % inset)
                 start = len(proj_points)
-                for i in range(GRID):
-                    for j in range(GRID):
-                        u = bx_min + (bx_max - bx_min) * (i / (GRID - 1))
-                        v = by_min + (by_max - by_min) * (j / (GRID - 1))
-                        proj_points.append(_make_point(u, v))
+                for u, v in _bbox_grid_points(bbox, n=GRID):
+                    proj_points.append(_make_point(u, v))
                 slices.append((start, GRID * GRID))
             else:
                 # Single VLM centre projection
@@ -2826,11 +2835,8 @@ class KittingWorkflowEngine:
             # A 7x7 patch around the VLM centre (+-4 % of the image,
             # ~+-2 cm at the 0.4 m standoff), reduced to the part's top
             # surface: one pixel at the centre looks through the bore.
-            cx_n, cy_n = float(vlm_center["x"]), float(vlm_center["y"])
-            offs = [k / 3 * 0.04 for k in range(-3, 4)]
-            patch = [{"x": min(max(cx_n + dx, 0.0), 1.0),
-                      "y": min(max(cy_n + dy, 0.0), 1.0)}
-                     for dx in offs for dy in offs]
+            patch = [{"x": u, "y": v} for u, v in _wrist_patch_points(
+                float(vlm_center["x"]), float(vlm_center["y"]))]
             proj = self.camera.project_to_world(patch, camera="wrist")
             wpts = proj.get("world_points", [])
             top = _top_surface_point(wpts)
