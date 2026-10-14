@@ -974,6 +974,7 @@ async def _nvblox_world(params=None):
         return {"error": got.get("error", "sdf export failed"), "update": update}
     values, origin, voxel_size, sdf_stats = got
     margin = float(ROBOT_CFG.nvblox["sdf_safety_margin"])
+    STATE.nvblox_sdf_raw = (values, origin, voxel_size)   # for the start-state escape
     values = values - margin
     t1 = time.perf_counter()
     inspection = _set_cumotion_sdf(values, origin, voxel_size)
@@ -1670,6 +1671,7 @@ def _reset_cumotion_world():
         world_to_robot_base=(base_pos, base_quat),
         device=STATE.cumotion_device)
     STATE.nvblox_sdf_handle = None        # belonged to the old world
+    STATE.nvblox_sdf_raw = None
     # The planner holds a reference to the world interface, so rebuild it.
     if STATE.cumotion_robot is not None:
         from isaacsim.robot_motion.cumotion import GraphBasedMotionPlanner
@@ -1805,13 +1807,45 @@ def _tool_pose_from_tcp(tcp_pos, orientation):
     return np.array(tcp_pos, dtype=np.float64) - _tcp_offset() * approach, quat
 
 
+def _plan_with_start_escape(plan_once):
+    """Run ``plan_once()``; if the START state is blocked only by the SDF
+    safety margin, plan once more with the margin removed.
+
+    The current configuration is physically realised, so a start "in
+    collision" with the inflated map means the arm sits within
+    nvblox.sdf_safety_margin of a surface (after a failed grasp, next to a
+    bin wall), not inside it; cuMotion then refuses every plan, home
+    included (seen 2026-10-14). The escape plan still keeps cuMotion's own
+    ~1-2 cm conservatism. Applied only when a zero-length plan from the
+    start also fails, and the margin is restored right after.
+    """
+    path = plan_once()
+    raw = STATE.nvblox_sdf_raw
+    margin = float(ROBOT_CFG.nvblox["sdf_safety_margin"]) if ROBOT_CFG.nvblox else 0.0
+    if path is not None or raw is None or margin <= 0:
+        return path
+    q0 = _current_cspace()
+    if STATE.cumotion_planner.plan_to_cspace_target(q_initial=q0, q_final=q0) is not None:
+        return None                      # start is fine; the target is the problem
+    values, origin, voxel = raw
+    print(f"  [plan] start state within the {margin*100:.0f} cm SDF safety margin — "
+          f"planning the escape with margin 0")
+    _set_cumotion_sdf(values, origin, voxel)
+    try:
+        path = plan_once()
+    finally:
+        _set_cumotion_sdf(values - margin, origin, voxel)
+    print(f"  [plan] escape {'found' if path is not None else 'NOT found'}; margin restored")
+    return path
+
+
 def _plan_pose(tcp_pos, orientation):
     """Plan a collision-free path to a TCP pose. Returns a trajectory or None."""
     tool_pos, quat = _tool_pose_from_tcp(tcp_pos, orientation)
     q0 = _current_cspace()
 
-    path = STATE.cumotion_planner.plan_to_pose_target(
-        q_initial=q0, position=tool_pos, orientation=quat)
+    path = _plan_with_start_escape(lambda: STATE.cumotion_planner.plan_to_pose_target(
+        q_initial=q0, position=tool_pos, orientation=quat))
     if path is None:
         print(f"  [plan] NO PATH to tool pose "
               f"({tool_pos[0]:.3f}, {tool_pos[1]:.3f}, {tool_pos[2]:.3f}) "
@@ -1824,8 +1858,8 @@ def _plan_pose(tcp_pos, orientation):
 def _plan_cspace(q_target):
     """Plan a collision-free path to a joint configuration."""
     q0 = _current_cspace()
-    path = STATE.cumotion_planner.plan_to_cspace_target(
-        q_initial=q0, q_final=np.array(q_target, dtype=np.float64))
+    path = _plan_with_start_escape(lambda: STATE.cumotion_planner.plan_to_cspace_target(
+        q_initial=q0, q_final=np.array(q_target, dtype=np.float64)))
     if path is None:
         print(f"  [plan] NO PATH to cspace target")
         return None
@@ -2071,6 +2105,7 @@ class BridgeState:
         self.nvblox_sdf_handle = None     # cuMotion SDF obstacle from nvblox
         self.nvblox_sdf_key = None        # (nx, ny, nz, voxel) it was built for
         self.held_part = None             # {"radius": m} while a grasp is confirmed
+        self.nvblox_sdf_raw = None        # (values, origin, voxel) before the safety margin
         # Single-use handoff: set by ik_solve, consumed by the next
         # _apply_interpolated so the planned path is actually followed.
         self.pending_trajectory = None
@@ -2385,12 +2420,17 @@ class BridgeHandler(BaseHTTPRequestHandler):
     def _handle_status(self):
         try:
             joints = STATE.robot.get_joint_positions() if (STATE.robot is not None) else None
+            try:
+                tcp = [round(float(v), 4) for v in get_tcp_pos()]
+            except Exception:
+                tcp = None
             self._send_json({
                 "status": "ready" if (STATE.is_ready and not STATE.is_executing) else ("executing" if STATE.is_executing else "initializing"),
                 "is_ready": STATE.is_ready,
                 "num_dof": STATE.num_dof,
                 "joint_names": list(STATE.dof_names) if STATE.dof_names else [],
                 "joint_positions": joints.tolist() if joints is not None else [],
+                "tcp_position": tcp,    # world TCP (pad centre), for recovery lifts
                 "is_executing": STATE.is_executing,
                 "ik_ready": STATE.ik_ready,
                 "planner": "cumotion",
@@ -3348,6 +3388,9 @@ async def _verify_grasp():
     and the finger is not fully closed (fully closed always means empty).
     Under load the finger angle alone is unreliable: the compliant inner
     joints let it settle past its target while the part is still held.
+    A pad gap wider than gripper.max_part_width is never a held part: the
+    fingers stopped on the bin floor or a wall (seen 2026-10-14: "held" at
+    a 138 mm gap with the fingertips on the floor).
     """
     actual = _finger_angle()
     target = STATE.grip_target
@@ -3355,10 +3398,13 @@ async def _verify_grasp():
     min_force = ROBOT_CFG.gripper["adaptive_close"]["min_force"]
     blocked = target is not None and target - actual > GRASP_CONFIRM_RAD
     fully_closed = actual >= ROBOTIQ_MAX_RAD - 0.03
-    held = not fully_closed and ((touching and force >= min_force) or blocked)
+    gap = ROBOT_CFG.gap_for_finger(actual)
+    too_wide = gap > float(ROBOT_CFG.gripper.get("max_part_width", ROBOTIQ_MAX_STROKE))
+    held = (not fully_closed and not too_wide
+            and ((touching and force >= min_force) or blocked))
     return {"status": "ok", "is_grasping": bool(held),
             "finger_pos": actual, "finger_target": target,
-            "pad_gap_m": ROBOT_CFG.gap_for_finger(actual),
+            "pad_gap_m": gap, "blocked_open": bool(too_wide and blocked),
             "pad_contact": bool(touching), "contact_force": force}
 
 
@@ -4964,6 +5010,7 @@ def _shutdown_bridge(reason="simulation stopped"):
     STATE.cumotion_ready = False
     STATE.pending_trajectory = None
     STATE.nvblox_sdf_handle = None
+    STATE.nvblox_sdf_raw = None
     STATE.held_part = None
 
     # Drain any pending commands/results so they don't leak into next session

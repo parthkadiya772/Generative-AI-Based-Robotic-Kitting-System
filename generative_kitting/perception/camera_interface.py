@@ -120,7 +120,7 @@ class MockCameraInterface:
     def __init__(
         self,
         image_path: Optional[str] = None,
-        image_dir: str = "logs/vlm_images",
+        image_dir: Optional[str] = None,
     ):
         """
         Parameters
@@ -132,6 +132,9 @@ class MockCameraInterface:
             is not set, the most recent image in this directory is used.
         """
         self.image_path = image_path
+        if image_dir is None:
+            from utils.config_loader import package_dir
+            image_dir = str(package_dir() / "logs" / "vlm_images")
         self.image_dir = image_dir
         self.camera_prim_path = "/Mock/Camera"
         log.info(f"MockCameraInterface initialised (image_path={image_path})")
@@ -460,6 +463,18 @@ class BridgeCameraInterface:
                 return json.loads(resp.read().decode())
         except Exception as e:
             return {"annotations": [], "error": str(e)}
+
+    def get_status(self) -> dict:
+        """Bridge /api/status (joints, TCP position, planner state); {"error": ...} if unreachable."""
+        import urllib.request
+        import json
+
+        try:
+            req = urllib.request.Request(f"{self.bridge_url}/api/status", method="GET")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return json.loads(resp.read().decode())
+        except Exception as e:
+            return {"error": str(e)}
 
     def execute_plan(self, plan: list) -> dict:
         """Send an action plan to Isaac Sim for execution."""

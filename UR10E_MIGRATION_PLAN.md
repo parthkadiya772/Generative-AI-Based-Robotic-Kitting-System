@@ -263,6 +263,17 @@ Target pipeline: 4 corner depth cameras → robot self-masking → nvblox (TSDF 
 - `pytest tests/`: 131 passed.
 
 ## Step 10: End-to-end validation
+- **First UI run (user, 2026-10-14), `large_gear_2`: failed.** Bridge log: grasp z 0.818 (gear top 0.843) → fingertips on the bin floor (80 N) → "held" at a 138 mm gap (false) → retract / retry / home all NO PATH from inside the bin → three overhead re-scans with the arm over the bin.
+- **Error budget, measured against sim ground truth** (`/api/scene_annotations` + `/api/project_to_world`, overhead 1920×1080, ~1.2 mm/px at the bin): GT centre pixel → 3D 3.6–5 mm on gears (camera model exact in sim; cameras agree to 5–8 mm). Depth at the centre pixel goes through the gear / valve bore: z 40 / 85 mm too low. VLM boxes (overlay vs GT): x = 0.985·x_GT + 2.6 (residual 3 px of 13 px rms, systematic), y residual 6.6 px; 20 px ≈ 22–25 mm on the table. The workflow's bbox-grid XY used the grid's **top-left sample** (`s.get("u")` on samples without u/v): 57–100 mm on gears, = the recorder's 58–75 mm.
+- **Step 1 fixes (2026-10-14, awaiting review):**
+  - `_top_surface_point`: 9×9 inset grid in the box → z = 90th percentile, xy = centroid of samples within 1 cm of it. Gears: 1.6–2.3 mm / z −2 mm with exact boxes, 1.8–13.8 mm / −2 to −4 mm with the run's VLM offsets (old: 57–100 mm / −24 to −36 mm). Valves: ~20–28 mm, z −29 mm (asymmetric; needs a mask / grasp-point layer). Unit tests in `tests/test_grounding.py`.
+  - Wrist verify (`_verify_and_realign`) projects a 7×7 patch around the VLM centre and uses the same top-surface estimate (was one pixel).
+  - Config: `verify_and_realign_with_wrist` and six other keys lived in `perception:` while the workflow read `execution:` → never applied. The workflow now reads them from `perception:`; wrist verification on, wrist XY applied (`wrist_xy_refinement_informational_only: false`, 5 cm cap; May-2026 evidence 17 vs 58 mm). Dead `direct_cumotion_pick` and duplicate keys removed.
+  - Recovery: `_park_for_overhead_scan` (home → else open + Cartesian lift + home; abort instead of an occluded re-scan); `/api/status` reports `tcp_position`. Bridge `_plan_with_start_escape`: when the start state is blocked only by the SDF safety margin (zero-length plan fails), plan once with margin 0, then restore. From the run's failure pose: home reached.
+  - `_verify_grasp`: a pad gap above `gripper.max_part_width` (0.130 m) is not a grasp (the failure case now reports not held; gear at 84 mm still held).
+  - Found by pyflakes: `_detect_parts` passed an undefined `overhead_image` to the label check (now `image`). Debug-image dirs anchored at `generative_kitting/logs`.
+  - Regression: `large_gear_1` pick 50.3 N, hold OK; `pytest tests/` 134 passed. **Not tested here:** the VLM / wrist-verify path (needs the user's VPN).
+- **Next (agreed order):** 2. grounding-error measurement script (GT vs VLM per stage); 3. VLM coordinate convention + affine correction (VPN); 4. wrist eye-in-hand closed loop (IBVS); 5. real-cell calibration (Zhang intrinsics, AX=XB wrist, AX=ZB fixed cameras, TCP pivot), validated in sim against USD first.
 - Full UI run: "Pick all motor valves and place them into tray compartment 1". Record success rate and failure modes using the evaluation recorder, and compare against the UR10 baseline in `THESIS_EVALUATION_RESULTS.md`.
 
 ---

@@ -111,45 +111,22 @@ perception:
   # mode), or 1.0 to disable verification-driven retries entirely.
   place_verify_min_confidence: 0.6
 
-  # ── Wrist-driven XY refinement (apply or only inform?) ──
-  # The wrist VLM is asked to pinpoint the part's pixel centre in
-  # the close-range view; the bridge projects that pixel through
-  # the wrist camera's actual USD transform to produce a "refined"
-  # world XY. The geometry is correct, but the VLM's pixel-centroid
-  # guess is only ~5 % accurate (~25 mm world error at 40 cm camera
-  # height) — applying its correction is *less* accurate than the
-  # overhead OWL-ViT2 bbox centre that produced the original Phase 2
-  # XY (sub-pixel detector accuracy → <1 cm world error).
-  #
-  # When this flag is true (default) the workflow only USES the
-  # wrist verify for visibility / path-clear checks, NOT for XY
-  # adjustment. The Z correction still applies because the wrist
-  # depth is much more accurate than the overhead depth at close
-  # range. If you observe genuine large XY errors that the overhead
-  # didn't catch, set this false to re-enable the (less precise)
-  # wrist refinement and rely on the 5 cm cap to reject neighbour-
-  # part hijacks.
-  # NOTE on history: this was set to true earlier when we believed
-  # the overhead OWL detector was sub-pixel accurate. The diagnostic
-  # log of 2026-05-10 disproved that — overhead error was 58 mm vs
-  # wrist projection's 17 mm for the same gear. With the wrist VLM
-  # prompt now constrained to the centre-most part and the 5 cm
-  # neighbour-rejection cap, the wrist refinement is the more
-  # accurate signal of the two. Setting back to false so the wrist
-  # XY correction is APPLIED (not just logged). USD-snap still
-  # overrides both when it fires; this is the fallback for any
-  # detection that USD-snap rejects (no matching prim within
-  # snap_radius) — and the path the system will take once on a real
-  # ── Direct Telekinesis Pick & Place Execution ──
-  # When direct_cumotion_pick is true (default), the pipeline uses the direct
-  # 3D point-cloud and cuMotion trajectory pipeline: overhead VLM detects target ->
-  # 3D point cloud supplies world coordinates -> cuMotion executes pick & place.
-  # Skips redundant multi-pass wrist VLM re-queries that stall execution.
-  direct_cumotion_pick: true
-  verify_and_realign_with_wrist: false
-  close_range_rescan_xy: false
-  wrist_rescan_before_grasp: false
-  wrist_xy_refinement_informational_only: true
+  # ── Pre-grasp wrist verification (eye-in-hand) ──
+  # At the standoff above the target, the wrist camera checks the part is
+  # there and re-measures it: the VLM's pixel, widened to a 7x7 depth patch
+  # and reduced to the part's top surface (a single pixel looks through the
+  # bore). Z is always applied.
+  # XY: false = APPLY the wrist XY (capped at 5 cm, which rejects a
+  # neighbour part); true = log it only and keep the overhead XY.
+  # Evidence: 2026-05-10 overhead 58 mm vs wrist 17 mm on one gear; the
+  # overhead figure was mostly a bug (it used the box grid's top-left
+  # sample), fixed 2026-10-14 (top-surface centroid, 2-4 mm with exact
+  # boxes). Re-decide with the grounding-error measurement.
+  # Before 2026-10-14 these keys were read from ``execution`` and had no
+  # effect here; the workflow now reads them from ``perception``.
+  # (close_range_rescan_xy / wrist_rescan_before_grasp live in execution.)
+  verify_and_realign_with_wrist: true
+  wrist_xy_refinement_informational_only: false
 
   # ── Realignment frame: gripper-over-part vs camera-over-part ──
   # The wrist projection returns the part's WORLD XY (already
@@ -158,7 +135,7 @@ perception:
   # GRIPPER lands above the part — correct for grasping.
   #
   # Some scenes have a non-trivial offset between the wrist RGB
-  # camera and ee_link (the RealSense RSD455 mounts the camera
+  # camera and ee_link (the RealSense D555 mounts the camera
   # slightly forward and to one side of the gripper TCP). When
   # ``realign_camera_over_part`` is true, the workflow subtracts
   # the (cam_world_xy − ee_world_xy) vector from the realignment

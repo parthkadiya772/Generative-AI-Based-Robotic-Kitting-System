@@ -89,6 +89,9 @@ gripper:
   # 1e-3 measured best 2026-10-13: 1e-4 lets pads tilt, 1e-2 halves the force.
   armature: 0.001
   grasp_confirm_rad: 0.02   # held if finger stops this far short of target
+  # widest part we grasp [m] (motor_valve 117-125 mm across). A "grasp" at a
+  # wider pad gap is fingers stopped on the floor or a wall, not a part.
+  max_part_width: 0.130
   adaptive_close:
     min_force: 0.5
     step_rad: 0.02

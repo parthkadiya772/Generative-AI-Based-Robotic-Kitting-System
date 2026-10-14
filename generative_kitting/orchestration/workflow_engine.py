@@ -37,6 +37,7 @@ from knowledge.parts_catalogue import (
 )
 from perception.object_detector import ZeroShotDetector
 from utils.logger import log
+from utils.config_loader import package_dir
 from utils.workspace import default_workspace_bounds
 
 
@@ -392,6 +393,29 @@ collision_risk: "none", "low", "medium", or "high"."""
 
 
 
+def _top_surface_point(samples, band=0.01):
+    """Grasp point from depth samples over a part: its top surface.
+
+    z = 90th percentile of the sample heights (the part's top face);
+    x/y = mean of the samples within ``band`` of that height. A single
+    pixel at the box centre is not used: on gears and valves it looks
+    through the bore to the bin floor (40 / 85 mm too low, measured
+    2026-10-14), and samples that miss the part land on the floor and
+    drop out of the band. Returns (x, y, z, n_used) or None.
+    """
+    pts = [s for s in samples
+           if isinstance(s, dict) and "error" not in s
+           and all(k in s for k in ("x", "y", "z"))]
+    if not pts:
+        return None
+    zs = sorted(float(s["z"]) for s in pts)
+    z_top = zs[min(len(zs) - 1, int(round(0.9 * (len(zs) - 1))))]
+    top = [s for s in pts if float(s["z"]) >= z_top - band]
+    x = sum(float(s["x"]) for s in top) / len(top)
+    y = sum(float(s["y"]) for s in top) / len(top)
+    return x, y, z_top, len(top)
+
+
 class WorkflowPhase:
     """Represents a single phase in the kitting workflow."""
     BIN_LOOKUP      = "bin_lookup"      # USD lookup of bin + tray centres
@@ -454,6 +478,38 @@ class KittingWorkflowEngine:
 
     def cancel(self):
         self._cancelled = True
+
+    def _park_for_overhead_scan(self) -> bool:
+        """Move home so the overhead camera sees the bin. True only if home was reached.
+
+        After a failed pick the gripper can sit down in a compartment,
+        inside the planner's safety margin of the walls, so /api/home finds
+        no path (seen 2026-10-14). Then: open the gripper, lift straight up
+        (Cartesian, not planned) and retry home. Never re-scan the bin from
+        the overhead camera with the arm still over it.
+        """
+        def reached(r):
+            return isinstance(r, dict) and "error" not in r and r.get("status") != "error"
+
+        if reached(self.camera.send_command("/api/home", {})):
+            return True
+        log.warning("[Recover] /api/home failed from the current pose — "
+                    "opening the gripper and lifting straight up")
+        self.camera.send_command("/api/gripper", {"action": "open"})
+        status = (self.camera.get_status()
+                  if hasattr(self.camera, "get_status") else {})
+        tcp = status.get("tcp_position") if isinstance(status, dict) else None
+        if tcp:
+            lift = self.camera.send_command("/api/approach", {
+                "x": tcp[0], "y": tcp[1], "z": tcp[2] + 0.30, "cartesian": True})
+            if not reached(lift):
+                log.warning(f"[Recover] Cartesian lift failed: {lift.get('error')}")
+        if reached(self.camera.send_command("/api/home", {})):
+            log.info("[Recover] home reached after the lift")
+            return True
+        log.error("[Recover] robot could not return home — an overhead "
+                  "re-scan now would be occluded by the arm")
+        return False
 
     def _exec_value(self, key: str):
         """config.yaml execution.<key>, with no code-side default (they drifted)."""
@@ -1074,9 +1130,14 @@ class KittingWorkflowEngine:
                                  f"{failure_kind} failed ({failure_detail}) "
                                  f"— re-scanning (retry {attempt + 1})...")
                     try:
-                        # Park before re-scan in case the arm is in an
-                        # awkward post-pick pose blocking the overhead.
-                        self.camera.send_command("/api/home", {})
+                        # Park before re-scan: the overhead camera must not
+                        # see the bin through the arm.
+                        if not self._park_for_overhead_scan():
+                            return self._finalize(
+                                result, "error",
+                                "Robot could not return home after the failed "
+                                "pick; stopped instead of re-scanning an "
+                                "occluded bin")
                         # capture_workspace_image raises if the bridge is
                         # unreachable — no placeholder frame to screen for.
                         current_overhead = self.camera.capture_workspace_image()
@@ -1489,7 +1550,7 @@ class KittingWorkflowEngine:
                 current = (obj.get("label") or "").strip()
                 current_base = re.sub(r"_\d+$", "", current).strip()
                 result = self._verify_label_with_vlm(
-                    overhead_image, current, bbox_full)
+                    image, current, bbox_full)
                 if result is None:
                     log.info(
                         f"  [Verify] '{current}': VLM gave no answer; "
@@ -1555,7 +1616,7 @@ class KittingWorkflowEngine:
         #    single point for unmatched ones ────────────────────
         proj_points = []
         slices = []  # (start, count) per object
-        GRID = 5  # 5x5 sample grid inside bbox
+        GRID = 9  # 9x9 sample grid inside bbox (top-surface estimate)
 
         def _make_point(u, v):
             pt = {"x": u, "y": v}
@@ -1609,33 +1670,26 @@ class KittingWorkflowEngine:
                         continue
 
                     if count > 1:
-                        # Median Z across grid samples = part top surface
-                        zs = sorted(s["z"] for s in samples)
-                        med_z = zs[len(zs) // 2]
-                        # Reject samples > 5 cm below median (bin floor)
-                        kept = [s for s in samples
-                                if s["z"] >= med_z - 0.05]
-                        # Centre XY from bbox (not depth-projected)
-                        ip = obj["image_position"]
-                        # Re-project the centre to get camera ray X/Y
-                        # at the median depth — but simpler: use the
-                        # nearest sample to centre for X/Y consistency
-                        cx_norm = ip["x"]
-                        cy_norm = ip["y"]
-                        # Pick sample whose median is closest to centre
-                        best = min(
-                            samples,
-                            key=lambda s: (
-                                (s.get("u", cx_norm) - cx_norm) ** 2
-                                + (s.get("v", cy_norm) - cy_norm) ** 2))
+                        # Top surface of the part: XY = centroid of the
+                        # samples on it, Z = its height. (The old code
+                        # took the "sample nearest the centre", but the
+                        # samples carry no u/v, so it always used the
+                        # grid's top-left corner: ~40 mm off on gears.)
+                        top = _top_surface_point(samples)
+                        if top is None:
+                            continue
+                        tx, ty, tz, n_top = top
+                        depths = [s.get("depth_m", -1) for s in samples
+                                  if isinstance(s, dict) and "depth_m" in s]
                         wp = {
-                            "x": best["x"],
-                            "y": best["y"],
-                            "z": med_z,
+                            "x": tx,
+                            "y": ty,
+                            "z": tz,
                             "method": (
                                 proj_result.get("method", "?")
-                                + f"_grid{len(kept)}of{count}"),
-                            "depth_m": best.get("depth_m", -1),
+                                + f"_top{n_top}of{count}"),
+                            "depth_m": (sorted(depths)[len(depths) // 2]
+                                        if depths else -1),
                         }
                     else:
                         wp = samples[0]
@@ -1700,7 +1754,7 @@ class KittingWorkflowEngine:
             from utils.image_utils import save_debug_image
             save_path = save_debug_image(
                 overlay,
-                directory="logs/vlm_images",
+                directory=str(package_dir() / "logs" / "vlm_images"),
                 prefix="vlm_overlay")
             log.info(f"[Bin-zoom] VLM overlay → {save_path}")
             self._notify_vlm_overlay(overlay)
@@ -2711,7 +2765,7 @@ class KittingWorkflowEngine:
         try:
             from utils.image_utils import save_debug_image
             save_debug_image(
-                wrist_image, directory="logs/wrist_verify",
+                wrist_image, directory=str(package_dir() / "logs" / "wrist_verify"),
                 prefix=f"verify_{obj_id}_step{step_num}")
         except Exception:
             pass
@@ -2769,17 +2823,20 @@ class KittingWorkflowEngine:
             return result
 
         try:
-            proj = self.camera.project_to_world(
-                [{"x": vlm_center["x"], "y": vlm_center["y"]}],
-                camera="wrist")
+            # A 7x7 patch around the VLM centre (+-4 % of the image,
+            # ~+-2 cm at the 0.4 m standoff), reduced to the part's top
+            # surface: one pixel at the centre looks through the bore.
+            cx_n, cy_n = float(vlm_center["x"]), float(vlm_center["y"])
+            offs = [k / 3 * 0.04 for k in range(-3, 4)]
+            patch = [{"x": min(max(cx_n + dx, 0.0), 1.0),
+                      "y": min(max(cy_n + dy, 0.0), 1.0)}
+                     for dx in offs for dy in offs]
+            proj = self.camera.project_to_world(patch, camera="wrist")
             wpts = proj.get("world_points", [])
-            if not wpts:
+            top = _top_surface_point(wpts)
+            if top is None:
                 return result
-
-            wp = wpts[0]
-            refined_x = wp["x"]
-            refined_y = wp["y"]
-            refined_z = wp["z"]
+            refined_x, refined_y, refined_z, _ = top
 
             # ── Explicit prim-position diagnostics ────────────
             # Read the current world XY of every relevant prim — the
@@ -2800,7 +2857,7 @@ class KittingWorkflowEngine:
             log.info(
                 f"[Verify] Wrist projection: ({refined_x:.3f}, "
                 f"{refined_y:.3f}, {refined_z:.3f}) "
-                f"[{wp.get('method', '?')}]")
+                f"[{proj.get('method', '?')} top-surface patch]")
             if ee_pos[0] is not None:
                 log.info(
                     f"[Verify] Prim XY snapshot at projection time: "
@@ -2831,7 +2888,7 @@ class KittingWorkflowEngine:
             # target so the camera, not the gripper, lands above
             # the part.
             compensate = bool(
-                self.config.get("execution", {}).get(
+                self.config.get("perception", {}).get(
                     "realign_camera_over_part", False))
             if compensate and cam_to_ee_dx is not None:
                 refined_x_target = refined_x - cam_to_ee_dx
@@ -2890,7 +2947,7 @@ class KittingWorkflowEngine:
         # IS more accurate than overhead at close range.
         coords_updated = False
         wrist_xy_informational_only = bool(
-            self.config.get("execution", {}).get(
+            self.config.get("perception", {}).get(
                 "wrist_xy_refinement_informational_only", True))
 
         if wrist_xy_informational_only:
@@ -3359,7 +3416,7 @@ class KittingWorkflowEngine:
         #       and produces false negatives that abort otherwise-
         #       good picks. Default off.
         do_depth_vlm_check = bool(
-            self.config.get("execution", {}).get(
+            self.config.get("perception", {}).get(
                 "depth_analysis_vlm_check", False))
 
         self._notify(WorkflowPhase.DEPTH_ANALYSIS, "running",
@@ -3374,7 +3431,7 @@ class KittingWorkflowEngine:
             try:
                 from utils.image_utils import save_debug_image
                 save_debug_image(
-                    depth_image, directory="logs/depth_analysis",
+                    depth_image, directory=str(package_dir() / "logs" / "depth_analysis"),
                     prefix=f"depth_{obj_id}_step{step_num}")
             except Exception:
                 pass
@@ -3442,7 +3499,7 @@ class KittingWorkflowEngine:
 
         # ── Phase A2: Pre-grasp verification + realignment (Optional) ──
         do_wrist_verify = bool(
-            self.config.get("execution", {}).get(
+            self.config.get("perception", {}).get(
                 "verify_and_realign_with_wrist", False))
         if do_wrist_verify:
             self._notify(WorkflowPhase.GRASP_REFINEMENT, "running",
@@ -3745,7 +3802,7 @@ class KittingWorkflowEngine:
             # ── Wrist VLM check 1: "Is the part between the fingers?" ──
             # (skipped by default — geometrically broken at grasp height)
             do_pre_grasp_check = bool(
-                self.config.get("execution", {}).get(
+                self.config.get("perception", {}).get(
                     "pre_grasp_wrist_vlm_check", False))
             wrist_b64 = descend_result.get("wrist_image")
             part_between_fingers = True
@@ -3781,7 +3838,7 @@ class KittingWorkflowEngine:
                         "status": "warn", "detail": str(e)})
 
             wrist_min_conf = float(
-                self.config.get("execution", {}).get(
+                self.config.get("perception", {}).get(
                     "wrist_verify_min_confidence", 0.7))
             # Pre-grasp confident-no abort (only when check enabled)
             if (do_pre_grasp_check and not part_between_fingers
@@ -4557,7 +4614,7 @@ class KittingWorkflowEngine:
                 # this threshold filters those out while preserving
                 # retries for confidently-detected failures.
                 min_conf = float(
-                    self.config.get("execution", {}).get(
+                    self.config.get("perception", {}).get(
                         "place_verify_min_confidence", 0.6))
                 if (in_tray is False
                         and (confidence is None
