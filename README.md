@@ -230,10 +230,8 @@ bridge.
 exec(open("/path/to/robot_in_air/generative_kitting/isaac_sim_launcher.py").read())
 ```
 checks the robot prims from `robot.yaml`, the configured VLM endpoint and a
-move to the home pose. From a terminal, with the bridge running:
-```bash
-generative_kitting/.aikido/bin/python generative_kitting/diagnose_motion.py
-```
+move to the home pose. With the bridge running, `/api/plan_test` (section 5.5)
+checks the planner against the collision world.
 
 ### 5.4 Without Isaac Sim
 
@@ -426,7 +424,6 @@ cd generative_kitting
 |---|---|
 | `tools/measure_grounding.py` | error budget against ground truth (`--vlm live|fake|none`, `--wrist`) |
 | `tools/pick_test.sh X Y TOP_Z [GRASP_LIFT] [YAW_DEG]` | one staged pick through the bridge |
-| `diagnose_motion.py` | bridge status, joint jog, planner frame check, plan test |
 | `isaac_sim_launcher.py` | in-Isaac scene / VLM / home check |
 
 ---
@@ -438,8 +435,6 @@ robot_in_air/
 ├── .env.example                  # template; copy to .env
 ├── UR10e_Container_Assets/       # the Isaac Sim scene (AIKIDO_ur10e_swapped.usd)
 ├── AIKIDO.usd                    # UR10 baseline scene
-├── UR10E_MIGRATION_PLAN.md       # step-by-step migration log with measurements
-├── PIPELINE_UPDATES_PENDING.md   # verified Isaac Sim findings
 ├── archive/                      # legacy UR10 script + Lula config (not used)
 └── generative_kitting/
     ├── config.yaml               # perception / planning / workflow settings
@@ -541,5 +536,5 @@ robot_in_air/
 ## 15. License and citation
 
 This codebase accompanies the Master's thesis "Generative AI-based Robotic
-Kitting System" (Kadiya, 2026). See `THESIS_FRAMEWORK_SUMMARY.md` and
-`THESIS_EVALUATION_RESULTS.md` for the academic context.
+Kitting System" (Kadiya, 2026). See `THESIS_FRAMEWORK_SUMMARY.md` for the
+academic context.

@@ -66,3 +66,13 @@ INTEGRATION_IMPLEMENTATION.md
 /ur10_gripper_camera.usd
 /robotiq_2F_140_Joints_parameter.xlsx
 /skills-lock.json
+
+# Personal working notes, thesis drafts and local diagnostics; kept locally
+/generative_kitting/diagnose_motion.py
+/UR10E_MIGRATION_PLAN.md
+/PIPELINE_UPDATES_PENDING.md
+/THESIS_EVALUATION_RESULTS.md
+/robot_self_filtering_spec.md
+/UR10E_MIGRATION_INVENTORY.md
+/THESIS_PROJECT_STRUCTURE.md
+/AIKIDO_Project_Update.pptx
