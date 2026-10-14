@@ -254,12 +254,13 @@ Target pipeline: 4 corner depth cameras → robot self-masking → nvblox (TSDF 
 - **Portability (found here):** `requirements.txt` was a UTF-16 Windows `pip freeze` with `pywin32` / `win32_setctime` → UTF-8 with `sys_platform == "win32"` markers; the project venv `generative_kitting/.aikido` (uv, Python 3.12) installs on Linux. python-dotenv expanded `${PROJECT_ROOT}` in `.env` before it was set (→ `/generative_kitting/...`); `config_loader` now sets it first (test added). A relative `logging.log_dir` / the debug-image folder followed the cwd; now anchored at `generative_kitting/logs`.
 - **Check:** `pytest tests/` 131 passed (was 126; +5 tests). Mock-mode CLI runs end to end and fails cleanly at the VLM call: the vLLM / Ollama server (10.7.0.35) is not reachable from this machine (VPN), so a full mock cycle is still to be run by the user.
 
-## Step 9: Docs and cleanup
-- Update `CLAUDE.md`, `AGENTS.md` and `GEMINI.md`: robot description and the scene reference table.
-- Update the header of `robot_self_filtering_spec.md`.
-- `PIPELINE_UPDATES_PENDING.md` §4–5: re-measure on the new stage which prims move with the robot, and the label placement.
-- Archive `src/` (legacy) and `robot_config/ur10/AIKIDO.yaml` (dead Lula config).
-- Fix `gripper_max_width` (0.085 → 0.140) or remove it.
+## Step 9: Docs and cleanup ✅ done (2026-10-14, awaiting review)
+- **`CLAUDE.md`** (local, git-ignored): UR10e + D555, robot.yaml as the source of truth, nvblox collision world and masking, held part (masked, not yet attached to cuMotion), tool frame vs TCP, `ee_link` caveat, minimum grasp height, parts vocabulary (motor_valve, large_gear), venv paths, scene table re-checked against the live stage (13/13 prims exist). `AGENTS.md` / `GEMINI.md` only hold code-review-graph notes; nothing robot-specific to update. README: Isaac Sim 6.1, UR10e, current scene file.
+- **`robot_self_filtering_spec.md`:** header updated (UR10e, D555, Isaac 6.1) with a status block: superseded by Step 7 (XRDF-sphere depth mask → nvblox → SDF).
+- **`PIPELINE_UPDATES_PENDING.md` §4–5 re-measured on the UR10e stage** (gantry jog −0.3 m): vagn, all arm links, all gripper links and the wrist camera move; the rail/frame mesh and container Xforms are static. **`ee_link` does not move** (no rigid body): `project_to_world` now reports the live TCP as `ee_link_pos` (checked at home and at a standoff; camera→TCP offset +58 / +10 mm at both); `EE_PATH` removed from the bridge. **Instancing is back:** the 7 arm links' `visuals`/`collisions` are instanced (14 roots), so labels go on the link Xform or the prototype.
+- **Archived** (`git mv`, see `archive/README.md`): `src/` → `archive/src_ur10_legacy/`, `robot_config/ur10/AIKIDO.yaml` (dead Lula config) → `archive/ur10_lula/`. References in README, `.env.example`, copilot notes, `THESIS_PROJECT_STRUCTURE.md`, `isaac_compat.py` updated.
+- **`gripper_max_width`:** already gone (removed with the other dead `config.yaml` keys); nothing reads a max width, the stroke is `robot.yaml gripper.stroke` (0.140).
+- `pytest tests/`: 131 passed.
 
 ## Step 10: End-to-end validation
 - Full UI run: "Pick all motor valves and place them into tray compartment 1". Record success rate and failure modes using the evaluation recorder, and compare against the UR10 baseline in `THESIS_EVALUATION_RESULTS.md`.

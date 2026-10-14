@@ -21,7 +21,7 @@ Operator says "pick all motor valves" → VLM sees parts → LLM plans sequence 
 | **Knowledge** | `generative_kitting/knowledge/` | SQLite parts database, seed data |
 | **UI** | `generative_kitting/ui/` | Streamlit dashboard with live video & chat |
 | **Tests** | `generative_kitting/tests/` | pytest suite (65 tests, must all pass) |
-| **Legacy** | `src/robot_control.py` | Original monolithic control script (reference only) |
+| **Legacy** | `archive/src_ur10_legacy/robot_control.py` | Original monolithic UR10 control script (archived, reference only) |
 
 ## Key Files by Task
 

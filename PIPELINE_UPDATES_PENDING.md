@@ -117,29 +117,38 @@ Companion helpers that exist and are useful: `get_labels`, `remove_labels`,
 Labels must be applied to the `Gprim`/`Mesh` descendants, not the link `Xform`s.
 Labelling the subtree root alone does nothing.
 
-**No USD instancing in this scene.** Every prim under `/World/gantry` reports
-`instance=False, instanceable=False, instanceProxy=False`, so the instancing hazard
-described in the spec (§3) does not apply here.
+**UR10e stage (re-measured 2026-10-14): instancing is back.** 14 instance roots under
+`/World/gantry`: the `visuals` and `collisions` of the seven UR10e arm links
+(`ur10e/<link>/visuals|collisions`, 66 instance / instance-proxy prims in total). Their
+meshes are instance proxies, which cannot be edited, so labels must be authored on the
+link Xform (`ur10e/<link>`, inherited by `add_labels` callers that walk descendants) or
+on the prototype. The gantry, carriage (`vagn`), gripper (`ur10e_robotiq_2f140/*`) and
+wrist camera are not instanced; label their `Gprim`/`Mesh` descendants as before (13
+non-instanced Gprims under `/World/gantry`). The old UR10 stage had no instancing.
 
 ---
 
 ## 5. Which prims move with the robot (measured, not assumed)
 
-Measured by jogging `gantry_vagn_joint` by −0.3 m and comparing world transforms
-before/after. This determines what must be treated as robot vs. as a real obstacle:
+Measured on the UR10e stage (2026-10-14) by jogging `gantry_vagn_joint` by −0.3 m
+(`/api/jog`) and comparing world transforms of every prim three levels under
+`/World/gantry` plus the wrist camera. This determines what is robot vs. a real obstacle:
 
 | Prim | Result | Treat as |
 |---|---|---|
-| `/World/gantry` | static | fixed structure |
-| `/World/gantry/gantry_home` | static | fixed mounting bracket |
-| `/World/gantry/node/gantry` (rail mesh) | static | **real obstacle — must stay in collision world** |
-| `/World/gantry/gantry_home/vagn` | moved −0.3 | robot |
-| `.../ur10_instanceable/*` (whole arm) | moved −0.3 | robot |
-| `/World/rsd555` (wrist camera) | moved −0.3 | robot |
+| `/World/gantry`, `/World/gantry/node`, `/World/gantry/node/gantry` (rail / frame mesh) | static | **real structure** (cuMotion `gantry` link, self-collision; its rim stays in the nvblox map, Step 7.2) |
+| `/World/gantry/gantry_home`, `.../ur10e`, `.../ur10e_robotiq_2f140` (container Xforms) | static | not bodies |
+| `/World/gantry/gantry_home/vagn` (+ `vagn/node`) | moved −0.299 | robot |
+| `.../ur10e/{base,shoulder,upper_arm,forearm,wrist_1,wrist_2,wrist_3}_link` | moved −0.299 … −0.292 | robot |
+| `.../ur10e_robotiq_2f140/*` (all knuckles, fingers, `robotiq_base_link`) | moved −0.292 | robot |
+| `/World/rsd555` (wrist camera) | moved −0.290 | robot |
+| `.../ur10e/ee_link` | **static** | **not a body**: no rigid body, its USD pose stays at the authored value. Use the tool frame / TCP (`get_tcp_pos`); `project_to_world` now reports the TCP as `ee_link_pos`. |
 
-The UR10 is a *sibling* of `vagn` in the USD hierarchy, not a child — they are joined
-by the `vagn_robot_joint` fixed physics joint, not by prim nesting. USD hierarchy does
-not reflect the kinematic chain here; do not infer motion from parenting.
+The wrist/gripper moved ~7 mm less than the gantry: the arm drives give a little while
+the carriage slides. The arm and gripper are *siblings* of `vagn` in the USD hierarchy,
+joined by fixed physics joints, not by prim nesting — do not infer motion from parenting.
+The robot mask for nvblox uses the XRDF spheres at the live link poses, which matches
+this list (Step 7.2).
 
 ---
 

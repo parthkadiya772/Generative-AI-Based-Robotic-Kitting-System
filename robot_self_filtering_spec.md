@@ -1,8 +1,19 @@
 # SPEC: Robot Self-Filtering → cuMotion Obstacles
 
-**Target:** Isaac Sim 6.0.1, Python API (Script Editor / VS Code Edition), no ROS 2.
-**Robot:** UR10 + Robotiq 2F-140 + wrist camera, on a *vagn* riding a gantry.
+**Target:** Isaac Sim 6.0.1 (written for), now running on 6.1; Python API (Script Editor / VS Code Edition), no ROS 2.
+**Robot:** UR10e + Robotiq 2F-140 + RealSense D555 wrist camera, on a *vagn* riding a gantry (was UR10 when written).
 **Sensors:** 4 corner cameras + 2 overhead (bin, kitting tray) + 1 wrist camera.
+
+> **Status (2026-10-14): superseded, kept as background.** The collision world is now
+> built by `UR10E_MIGRATION_PLAN.md` Step 7, not by the semantic-segmentation pipeline
+> below: depth from the 4 corner + 2 overhead cameras, robot pixels masked with the
+> XRDF collision spheres at the live joint state (plus a held-part sphere), integrated by
+> nvblox (separate service), exported as an exact signed distance field and loaded as one
+> cuMotion SDF obstacle (`/api/build_collision_world`). Robot masking was checked against
+> ground truth (robot hidden vs shown): 0 moving-robot pixels leak.
+> Facts that changed since this spec: the UR10e stage **does** use USD instancing on the arm
+> links' `visuals`/`collisions` (§3 hazard applies again), and the `ee_link` prim does not
+> follow the arm (`PIPELINE_UPDATES_PENDING.md` §4–5).
 
 ---
 

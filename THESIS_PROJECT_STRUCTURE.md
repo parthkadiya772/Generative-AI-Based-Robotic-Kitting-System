@@ -21,10 +21,10 @@ robot_in_air/                          ← repository root
 ├── transforms/  transforms_simple/    USD transform layers
 ├── kitting_table/  ur10_setup/        USD scene fragments
 │
-├── configuration/                     Standalone robot-config files
-│   ├── kitting_lula_config.yaml       Lula IK collision spheres
-│   ├── kitting_robot.urdf             URDF used by bridge after patching
-│   └── robot_control.py               Manual-control script (legacy)
+├── archive/src_ur10_legacy/          Archived UR10 robot-config files
+│   ├── kitting_lula_config.yaml       Lula IK collision spheres (archived)
+│   ├── kitting_robot.urdf             UR10 URDF (archived)
+│   └── robot_control.py               Manual-control script (archived)
 │
 ├── CLAUDE.md                          Project instructions
 ├── THESIS_FRAMEWORK_SUMMARY.md        Full architecture write-up (v5)

@@ -8,7 +8,7 @@ interface the execution layer already uses (``apply_action`` /
 ``get_joint_positions``), so call sites don't have to change.
 
 Used by importable modules that run inside Isaac Sim. The
-``exec()``-launched scripts (``isaac_sim_bridge.py``, ``src/robot_control.py``,
+``exec()``-launched scripts (``isaac_sim_bridge.py``, ``archive/src_ur10_legacy/robot_control.py``,
 ``isaac_sim_launcher.py``) inline an equivalent adapter because they have no
 reliable ``__file__`` / ``sys.path`` for a local import.
 

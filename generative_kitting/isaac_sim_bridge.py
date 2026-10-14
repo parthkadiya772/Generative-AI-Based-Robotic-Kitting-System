@@ -142,7 +142,7 @@ if ROBOT_CFG.missing():
 
 
 # ═════════════════════════════════════════════════════════════
-# CONFIGURATION (mirrors the constants in robot_control.py)
+# CONFIGURATION (robot values from robot.yaml; the rest are bridge tuning)
 # ═════════════════════════════════════════════════════════════
 
 # Bridge host/port come from env so the operator can pin the listener
@@ -165,7 +165,6 @@ IMU_PRIM          = ROBOT_CFG.wrist_camera["imu"]
 
 # Robot geometry
 ARM_BASE_PATH  = ROBOT_CFG.arm_base_prim
-EE_PATH        = ROBOT_CFG.ee_prim
 PLACE_BOX_PATH = "/World/box_840"
 
 
@@ -2914,15 +2913,18 @@ async def _project_to_world(params):
     if misses:
         print(f"  [project] {len(misses)} point(s) had no valid depth: {misses}")
 
-    # Camera + ee_link world positions let the caller sanity-check the
-    # geometry that backed the projection.
+    # Camera + gripper world positions let the caller sanity-check the
+    # geometry that backed the projection. "ee_link_pos" is the live TCP:
+    # the USD ee_link prim has no rigid body on the UR10e stage, so its
+    # world pose stays at the authored value while the arm moves
+    # (measured 2026-10-14 by jogging the gantry).
     extra = {}
     cam_pos = omni.usd.get_world_transform_matrix(
         omni.usd.get_context().get_stage().GetPrimAtPath(cam_path)).GetRow(3)
     extra["camera_pos"] = [float(cam_pos[0]), float(cam_pos[1]),
                            float(cam_pos[2])]
     try:
-        ee = get_world_pos(EE_PATH)
+        ee = get_tcp_pos()
         extra["ee_link_pos"] = [float(ee[0]), float(ee[1]), float(ee[2])]
     except Exception:
         pass

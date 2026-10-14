@@ -14,7 +14,7 @@ articulation:
 # relative to articulation.root
 prims:
   arm_base: gantry_home/ur10e/base_link
-  ee: gantry_home/ur10e/ee_link
+  ee: gantry_home/ur10e/ee_link   # no rigid body: its USD pose does NOT follow the arm (use tool / TCP)
   tool: gantry_home/ur10e_robotiq_2f140/robotiq_base_link
   gripper_root: gantry_home/ur10e_robotiq_2f140
 

@@ -11,7 +11,7 @@ combines:
 - **VLM-based task planning** — the same VLM family turns the scene plus
   the operator command into a plan, constrained to a fixed action
   vocabulary.
-- **NVIDIA Isaac Sim 6.0.1** — UR10 arm with a Robotiq 2F-140 gripper on
+- **NVIDIA Isaac Sim 6.1** — UR10e arm with a Robotiq 2F-140 gripper on
   a gantry rail, controlled deterministically via cuMotion planning
   against an nvblox collision world built from the depth cameras.
 
@@ -57,7 +57,7 @@ git clone <your-fork-url> robot_in_air
 cd robot_in_air
 ```
 
-The repository ships with the USD scene (`AIKIDO.usd`), config, source
+The repository ships with the USD scene (`UR10e_Container_Assets/AIKIDO_ur10e_swapped.usd`), config, source
 code, and an example environment file. There is no submodule step.
 
 ---
@@ -266,7 +266,8 @@ connection is required — everything is mocked.
 ```
 robot_in_air/
 ├── .env.example              # template for local environment vars
-├── AIKIDO.usd                # main Isaac Sim scene
+├── UR10e_Container_Assets/   # main Isaac Sim scene (AIKIDO_ur10e_swapped.usd, robot.yaml robot.stage)
+├── AIKIDO.usd                # UR10 baseline scene
 ├── CLAUDE.md                 # in-depth architecture notes
 ├── README.md                 # this file
 ├── generative_kitting/       # main Python package
@@ -283,7 +284,7 @@ robot_in_air/
 │   ├── ui/streamlit_app.py   # operator dashboard
 │   ├── utils/config_loader.py  # env-aware YAML loader
 │   └── tests/                # pytest suite
-└── src/robot_control.py      # legacy monolithic control script
+└── archive/                  # legacy UR10 control script + Lula config (not used)
 ```
 
 ---
