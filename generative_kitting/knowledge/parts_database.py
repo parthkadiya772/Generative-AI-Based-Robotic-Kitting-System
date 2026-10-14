@@ -62,7 +62,7 @@ class PartsDatabase:
     );
     """
 
-    def __init__(self, db_path: str = "knowledge/kitting.db"):
+    def __init__(self, db_path: str = None):
         """
         Open or create the SQLite database and ensure schema exists.
 
@@ -71,6 +71,8 @@ class PartsDatabase:
         db_path : str
             Path to the SQLite database file.
         """
+        if db_path is None:   # next to this module, independent of the cwd
+            db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kitting.db")
         os.makedirs(os.path.dirname(db_path) if os.path.dirname(db_path) else ".", exist_ok=True)
         self.db_path = db_path
         self.conn = sqlite3.connect(db_path, check_same_thread=False)

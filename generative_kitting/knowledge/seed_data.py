@@ -189,14 +189,15 @@ def seed_kits(db: PartsDatabase) -> None:
     log.info(f"Seeded {len(kits)} kit definitions into database")
 
 
-def seed_database(db_path: str = "knowledge/kitting.db") -> PartsDatabase:
+def seed_database(db_path: str = None) -> PartsDatabase:
     """
     Create and populate a fresh database with sample data.
 
     Parameters
     ----------
-    db_path : str
-        Path to the SQLite database file.
+    db_path : str, optional
+        Path to the SQLite database file (default: knowledge/kitting.db
+        next to this package, whatever the current directory).
 
     Returns
     -------

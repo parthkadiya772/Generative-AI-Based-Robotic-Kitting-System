@@ -1,322 +1,545 @@
 # Generative AI-based Robotic Kitting System
 
-A neuro-symbolic framework that turns natural-language operator
-commands ("pick all motor valves") into safe robot motion. The system
-combines:
+Natural-language kitting ("pick all motor valves and place them into the tray")
+on a simulated **UR10e + Robotiq 2F-140** hanging from a gantry rail in
+**NVIDIA Isaac Sim 6.1**. A vision-language model (Qwen3-VL) finds the parts
+in camera images and plans the task; the robot is driven only by validated
+action primitives through a deterministic execution layer, with
+**cuMotion** planning against a collision world that **nvblox** builds from
+six depth cameras.
 
-- **Vision-Language Models (VLMs)** — Qwen2.5-VL / Qwen3-VL / Gemma4
-  for zero-shot scene understanding. The VLM both identifies parts and
-  **self-grounds their bounding boxes** — there is no separate
-  object-detector stage.
-- **VLM-based task planning** — the same VLM family turns the scene plus
-  the operator command into a plan, constrained to a fixed action
-  vocabulary.
-- **NVIDIA Isaac Sim 6.1** — UR10e arm with a Robotiq 2F-140 gripper on
-  a gantry rail, controlled deterministically via cuMotion planning
-  against an nvblox collision world built from the depth cameras.
-
-The VLM never drives the robot directly; it only emits validated
-action primitives (`pick_object`, `place_object`, `move_home`, …).
-Execution is fully deterministic.
+The VLM never commands joints. It emits labelled boxes and a plan made of a
+fixed action vocabulary (`pick_object`, `place_object`, `move_home`, …); part
+positions come from those boxes plus depth, never from the simulator's scene
+graph.
 
 ---
 
-## Architecture
+## Contents
 
-```
-Operator command
-       │
-       ▼
-┌───────────────┐    ┌────────────────┐    ┌────────────────┐
-│  Perception   │ →  │ Orchestration  │ →  │   Execution    │
-│    (VLM)      │    │     (VLM)      │    │ (Isaac Sim)    │
-└───────────────┘    └────────────────┘    └────────────────┘
-   scene JSON          task plan            joint motion
-```
-
-## Prerequisites
-
-| Component | Version / Notes |
-|---|---|
-| Python | 3.9 or newer (3.10+ recommended) |
-| NVIDIA Isaac Sim | 6.0.1 (only for simulator-attached runs) |
-| Ollama | Any recent version (local or remote) |
-| OS | Windows / Linux (paths are resolved cross-platform) |
-| GPU | NVIDIA RTX 4070 or above with minimum 24GB VRAM |
-
-You can run the standalone CLI / Streamlit UI **without** Isaac Sim
-using `--mock-image`. Isaac Sim is only needed when you want the robot
-to actually move.
+1. [System overview](#1-system-overview)
+2. [System requirements](#2-system-requirements)
+3. [Installation](#3-installation)
+4. [Configuration](#4-configuration)
+5. [Running](#5-running)
+6. [Running on another machine (portability)](#6-running-on-another-machine-portability)
+7. [Method](#7-method)
+8. [Evaluation and measured results](#8-evaluation-and-measured-results)
+9. [Testing and diagnostics](#9-testing-and-diagnostics)
+10. [Project layout](#10-project-layout)
+11. [Known limitations](#11-known-limitations)
+12. [Troubleshooting](#12-troubleshooting)
+13. [Security notes](#13-security-notes)
+14. [References](#14-references)
+15. [License and citation](#15-license-and-citation)
 
 ---
 
-## 1. Clone
+## 1. System overview
+
+```
+ Operator command (Streamlit UI or CLI)
+        │
+        ▼
+ ┌──────────────────── Perception ────────────────────┐
+ │ overhead RGB-D ─► Qwen3-VL (labels + 2-D boxes)     │
+ │      box ─► 9×9 depth grid ─► top-surface estimator │──► part XYZ (world)
+ └─────────────────────────────────────────────────────┘
+        │
+        ▼
+ ┌──────────────────── Orchestration ─────────────────┐
+ │ Qwen3-VL planner ─► schema / whitelist validation   │──► action plan
+ └─────────────────────────────────────────────────────┘
+        │  HTTP (localhost:8600)
+        ▼
+ ┌──────────── Execution: Isaac Sim bridge ───────────┐      ┌─ nvblox service ─┐
+ │ 6 depth cams ─► robot mask ─────────────────────────┼─────►│ TSDF ─► EDT SDF  │
+ │ cuMotion SDF obstacle ◄─────────────────────────────┼──────│ (localhost:8610) │
+ │ plan standoff ─► wrist verify ─► Cartesian descent  │      └──────────────────┘
+ │ ─► adaptive close ─► lift ─► place                  │
+ └─────────────────────────────────────────────────────┘
+```
+
+Three processes run side by side:
+
+| Process | Runs in | Port | Role |
+|---|---|---|---|
+| Isaac Sim + bridge (`isaac_sim_bridge.py`) | Isaac Sim's Python | 8600 | cameras, robot, cuMotion, HTTP API |
+| nvblox service (`nvblox_service/server.py`) | its own venv (torch 2.9.1) | 8610 | depth integration, signed distance field |
+| Operator app (`main.py --ui`) | project venv `.aikido` | 8501 | VLM perception, planning, workflow |
+
+The VLM runs on a separate GPU server (vLLM, OpenAI-compatible API).
+
+---
+
+## 2. System requirements
+
+Measured on the development machine (Ubuntu 24.04, RTX 4070 Laptop 8 GB,
+driver 580.178).
+
+| Component | Requirement | Notes |
+|---|---|---|
+| OS | **Linux, Ubuntu 24.04** | the nvblox wheel is built for Ubuntu 24 + CUDA 12; the collision-world service does not run on Windows |
+| GPU (robot machine) | NVIDIA RTX, **≥ 8 GB** | measured: Isaac Sim + bridge + cuMotion ≈ 5.4 GB, nvblox ≈ 0.7 GB (2 cm voxels) |
+| NVIDIA driver | **≥ 580** | `requirements.txt` installs `torch 2.11+cu130` (CUDA 13). With an older driver install torch from a cu12x index instead |
+| Isaac Sim | **6.1** (workstation install) | first start needs internet: some assets come from NVIDIA's asset server |
+| Python | 3.12 | both venvs |
+| `uv` | any recent | creates the nvblox venv (`pip install uv` or the uv installer) |
+| VLM server | vLLM serving Qwen3-VL | a separate GPU host; the 8B model at 8 bit is ≈ 9 GB of weights plus KV cache; reached over the network / VPN |
+| Disk | ~1 GB repo + ~6 GB venvs | the repo pack is ~150 MB; USD assets up to 89 MB per file |
+
+Without Isaac Sim you can still run the planner and perception on a mock image
+(section 5.4).
+
+---
+
+## 3. Installation
+
+### 3.1 Clone
 
 ```bash
-git clone <your-fork-url> robot_in_air
+git clone https://github.com/parthkadiya772/Generative-AI-Based-Robotic-Kitting-System.git robot_in_air
 cd robot_in_air
 ```
 
-The repository ships with the USD scene (`UR10e_Container_Assets/AIKIDO_ur10e_swapped.usd`), config, source
-code, and an example environment file. There is no submodule step.
+The clone can live anywhere: no path inside the repo is machine-specific
+(section 6).
 
----
-
-## 2. Configure environment
-
-All machine-specific values (model server URL, Isaac Sim install path,
-API keys, bridge bind host) are read from environment variables, so
-you can run the project on any machine without editing the source.
-
-Copy the template and fill in what applies to you:
+### 3.2 Environment file
 
 ```bash
 cp .env.example .env
 ```
 
-Open `.env` and pick **one of the two options** for the model server:
-
-### Option A — Local Ollama (recommended, no VPN required)
-
-1. Install Ollama on your own machine: <https://ollama.com/download>
-2. Pull the models you want to use:
-   ```bash
-   ollama pull gemma4:e2b          # VLM for both perception and planning
-   ```
-3. Start the Ollama daemon (default port 11434):
-   ```bash
-   ollama serve
-   ```
-4. Leave `OLLAMA_BASE_URL` in `.env` set to the localhost default — no
-   change needed:
-   ```env
-   OLLAMA_BASE_URL=http://localhost:11434
-   ```
-
-### Option B — Remote / VPN Ollama server
-
-If your lab runs a shared GPU box, point at it directly:
+Edit only the values that describe *your* machine and network:
 
 ```env
-OLLAMA_BASE_URL=http://<your-server-host>:11434
-```
-
-The Streamlit dashboard's model dropdown will list whatever models are
-loaded on whichever server `OLLAMA_BASE_URL` resolves to at startup.
-
-### Other env vars
-
-```env
-# Loopback by default — change only if you knowingly want LAN clients
-# to call /api/execute on the Isaac Sim bridge (the bridge has no auth).
-BRIDGE_HOST=127.0.0.1
+VLLM_BASE_URL=http://<vlm-server>:8000/v1   # must include the port and /v1
+OLLAMA_BASE_URL=http://localhost:11434      # only if you use Ollama models
+BRIDGE_HOST=127.0.0.1                       # keep loopback unless you know why not
 BRIDGE_PORT=8600
-
-# Required only when you want to run the simulator-attached bridge.
-# Set to the directory containing Isaac Sim's `exts/` folder.
-#   Windows : %LOCALAPPDATA%\ov\pkg\isaac-sim-<ver>
-#   Linux   : ~/.local/share/ov/pkg/isaac-sim-<ver>
-ISAACSIM_PATH=
-
-# Only needed for OpenAI / cloud VLM providers; leave blank with Ollama.
-OPENAI_API_KEY=
+ROBOT_CONFIG_PATH=${PROJECT_ROOT}/generative_kitting/robot_config/ur10e   # leave as is
 ```
 
-`PROJECT_ROOT` is auto-detected from the file tree, so you don't have
-to set it.
+`PROJECT_ROOT` is filled in automatically; never write an absolute path for it.
+
+### 3.3 Isaac Sim 6.1
+
+Install the Isaac Sim 6.1 workstation build (see NVIDIA's installation guide)
+and check it starts (`./isaac-sim.sh`). Isaac Sim is **not** a Python
+dependency of this repo: the bridge is executed *inside* it.
+
+### 3.4 nvblox service venv (collision world)
+
+```bash
+generative_kitting/nvblox_service/setup_venv.sh
+```
+
+Creates `generative_kitting/nvblox_service/.venv` with `torch 2.9.1+cu128` and
+`nvblox_torch 0.0.10` and runs a GPU smoke test. nvblox needs its own venv
+because `nvblox_torch` links libtorch ≤ 2.9.1 while Isaac Sim 6.1 ships torch
+2.11, so it cannot load inside Isaac Sim's process.
+
+### 3.5 Operator app venv
+
+```bash
+generative_kitting/run_ui.sh          # creates generative_kitting/.aikido on first run
+```
+
+or manually:
+
+```bash
+uv venv --python 3.12 generative_kitting/.aikido
+uv pip install --python generative_kitting/.aikido/bin/python -r generative_kitting/requirements.txt
+```
+
+### 3.6 VLM server (vLLM)
+
+On the GPU server:
+
+```bash
+vllm serve cyankiwi/Qwen3-VL-8B-Instruct-AWQ-8bit \
+     --served-model-name Qwen/Qwen3-VL --port 8000
+```
+
+The served model name must match `perception.vlm_model` and
+`orchestration.llm_model` in `generative_kitting/config.yaml`
+(`Qwen/Qwen3-VL`). Check it from the robot machine:
+`curl $VLLM_BASE_URL/models`.
 
 ---
 
-## 3. Install Python dependencies
+## 4. Configuration
 
-A virtual environment named `.aikido` is the project convention. The
-launcher scripts will create it for you on first run; or do it
-manually:
+| File | Holds | Rule |
+|---|---|---|
+| `.env` (git-ignored) | network endpoints, ports, keys | the only per-machine file |
+| `generative_kitting/robot_config/ur10e/robot.yaml` | **all robot facts**: prims, joints, gantry, home pose, TCP, gripper, cuMotion URDF/XRDF, nvblox settings | single source of truth; no robot constants in code |
+| `generative_kitting/config.yaml` | perception, planning, workflow, workspace bounds, logging | `${VAR}` placeholders resolve from `.env` |
+| `generative_kitting/knowledge/parts_catalogue.yaml` | part vocabulary given to the VLM | add a part here, no code change |
 
-```bash
-python -m venv .aikido
-# Windows:
-.aikido\Scripts\activate
-# Linux / macOS:
-source .aikido/bin/activate
+`ROBOT_CONFIG_PATH` selects the robot; `robot_config/ur10/` is the frozen UR10
+baseline kept for reproducibility.
 
-pip install --upgrade pip
-pip install -r generative_kitting/requirements.txt
-```
+Key `robot.yaml → nvblox` settings (values measured, see section 8):
 
-Key packages: `streamlit`, `transformers`, `torch`, `ollama`, `openai`,
-`pillow`, `pyyaml`, `loguru`, `pydantic`, `pytest`.
+| Key | Value | Meaning |
+|---|---|---|
+| `voxel_size` | 0.02 m | 1 cm does not fit beside Isaac Sim in 8 GB |
+| `cameras` | 4 corner + `/World/Camera` + `/World/Camera_Kit` | the rack hides the bin from the corner cameras |
+| `workspace_min/max` | [−2.6, −1.6, −0.05] … [2.6, 1.6, 2.1] m | the integrated and exported box |
+| `robot_mask_margin` | 0.04 m (vagn 0.05) | sphere inflation for masking the robot out of depth |
+| `sdf_safety_margin` | 0.02 m | obstacle inflation seen by cuMotion |
+| `target_carve_radius` / `_below` | 0.10 / 0.10 m | column cleared around a grasp target |
+| `held_part_radius` | 0.11 m | depth mask around a grasped part |
+| `tsdf_decay_factor` | 0.5 | a removed part leaves the map in 2 updates |
 
 ---
 
-## 4. Run
+## 5. Running
 
-The project has four entry points. Pick the one that matches what you
-want to do.
+### 5.1 Full pipeline (Isaac Sim + robot)
 
-### A. Streamlit operator dashboard (most common)
-
-Live overhead + wrist camera, VLM detection overlays, chat command
-interface, execution logs. Connects to Isaac Sim if the bridge is
-running; otherwise falls back to mock images.
-
-```bash
-# From repo root (after activating the venv)
-python generative_kitting/main.py --ui
-```
-
-…or use the launcher scripts which also create / refresh the venv:
-
-```bash
-# Windows
-generative_kitting\run_ui.bat
-
-# Linux / macOS
-generative_kitting/run_ui.sh
-```
-
-The UI will open at <http://localhost:8501>.
-
-### B. Headless CLI
-
-Run a single command and exit (mostly useful for benchmarking and
-batch evaluation):
-
-```bash
-python generative_kitting/main.py -c "Pick all motor valves"
-```
-
-Interactive REPL:
-
-```bash
-python generative_kitting/main.py
-```
-
-### C. Run against a mock image (no Isaac Sim, no live camera)
-
-```bash
-python generative_kitting/main.py --mock-image path/to/workspace.png
-```
-
-Useful for testing perception + planning end-to-end on a fixed scene.
-
-### D. Connect to Isaac Sim (full pipeline with real robot motion)
-
-1. Open Isaac Sim and load the scene set in `robot.yaml` (`robot.stage`,
-   currently `UR10e_Container_Assets/AIKIDO_ur10e_swapped.usd`). The scene's
-   assets use relative paths, so the repo can live anywhere.
-2. Copy `.env.example` to `.env` if you have not. Paths in it use
-   `${PROJECT_ROOT}`, which is filled in automatically; no absolute paths.
-3. Start the nvblox service (collision world) from the repo root, once per
-   session (first time: `generative_kitting/nvblox_service/setup_venv.sh`):
+1. **Isaac Sim:** open `UR10e_Container_Assets/AIKIDO_ur10e_swapped.usd`
+   (= `robot.yaml robot.stage`).
+2. **nvblox service** (terminal 1, repo root):
    ```bash
    generative_kitting/nvblox_service/run.sh generative_kitting/nvblox_service/server.py
    ```
-4. In Isaac Sim's **Script Editor** (`Window → Script Editor`) run
+3. **Bridge** (Isaac Sim → `Window → Script Editor`):
    ```python
    exec(open("/path/to/robot_in_air/generative_kitting/kitting_bridge_server.py").read())
    ```
-   The launcher finds the repo by itself (from the open stage, the current
-   directory or `$HOME`); no environment variable is needed. To force a
-   checkout, put `KITTING_PROJECT_ROOT = "/path/to/robot_in_air"` before
-   the `exec`, or export it before starting Isaac Sim.
-5. You should see `[OK] Bridge v2 on http://127.0.0.1:8600` in the
-   Isaac Sim console.
-6. In another terminal, launch the Streamlit UI (option A above). It
-   will detect the bridge automatically.
+   Wait for `[OK] Bridge v2 on http://127.0.0.1:8600`.
+4. **Operator UI** (terminal 2): `generative_kitting/run_ui.sh`, then open
+   <http://localhost:8501> and type a command.
 
-The bridge exposes a small HTTP API (`/api/ping`, `/api/status`,
-`/api/camera`, `/api/execute`, `/api/pick`, `/api/place`, …) on port
-8600. It binds to loopback by default; change `BRIDGE_HOST` only if
-you knowingly want LAN access (there is no authentication).
-
----
-
-## 5. Seed / reset the parts database
-
-The parts database (`generative_kitting/knowledge/kitting.db`) is
-auto-seeded on first run. To re-seed manually:
+### 5.2 CLI (plans only)
 
 ```bash
-python generative_kitting/main.py --seed-db
+generative_kitting/.aikido/bin/python generative_kitting/main.py -c "Pick all motor valves"
+generative_kitting/.aikido/bin/python generative_kitting/main.py      # interactive
 ```
 
-Edit the catalogue in
-[`generative_kitting/knowledge/parts_catalogue.yaml`](generative_kitting/knowledge/parts_catalogue.yaml)
-to add / remove part types. The catalogue is the single source of
-truth — no code changes required when you add a part.
+The CLI perceives and plans; robot execution runs through the UI and the
+bridge.
+
+### 5.3 Isaac Sim diagnostics
+
+```python
+exec(open("/path/to/robot_in_air/generative_kitting/isaac_sim_launcher.py").read())
+```
+checks the robot prims from `robot.yaml`, the configured VLM endpoint and a
+move to the home pose. From a terminal, with the bridge running:
+```bash
+generative_kitting/.aikido/bin/python generative_kitting/diagnose_motion.py
+```
+
+### 5.4 Without Isaac Sim
+
+```bash
+generative_kitting/.aikido/bin/python generative_kitting/main.py --mock-image path/to/workspace.png -c "Pick all gears"
+```
+
+### 5.5 Bridge HTTP API (selection)
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/status` | joints, TCP position, planner and collision-world state |
+| `POST /api/build_collision_world` | depth → nvblox → SDF → cuMotion; `exclude_points` = grasp targets to carve |
+| `POST /api/approach`, `/api/pick_descend`, `/api/pick_close`, `/api/pick_retract`, `/api/place` | staged pick and place |
+| `POST /api/project_to_world` | normalised image points → world XYZ through the camera's depth |
+| `GET /api/scene_annotations?camera=rgb` | ground-truth boxes from USD (**evaluation only**) |
+| `POST /api/plan_test` | plan a tool-frame pose with vs without the collision world |
 
 ---
 
-## 6. Tests
+## 6. Running on another machine (portability)
+
+**Is execution tied to one machine's paths? No.** Nothing in the code,
+`config.yaml` or `robot.yaml` contains an absolute path. Specifically:
+
+| What | How it is located |
+|---|---|
+| Repo root (bridge inside Isaac Sim) | `kitting_bridge_server.py` searches for the marker file `generative_kitting/isaac_sim_bridge.py`, in order: `KITTING_PROJECT_ROOT` (optional), its own `__file__`, the folder of the **open USD stage** and its parents, the current directory, then `$HOME` (6 levels) |
+| Repo root (Python apps) | from the source file location (`utils/config_loader.project_root`) |
+| Paths in `.env` / YAML | `${PROJECT_ROOT}/…`, expanded at load time (set before `.env` is parsed, so python-dotenv expands it too) |
+| Logs, debug images, parts DB | anchored at `generative_kitting/`, independent of the current directory |
+| USD scene | all 41 layers reference each other with relative paths |
+| cuMotion URDF / XRDF | relative mesh paths (`./meshes/…`) |
+| nvblox venv | `run.sh` finds `.venv/lib/python3*/…` next to itself |
+
+To set the project up elsewhere you change **only** `.env` (VLM server URL,
+optional Ollama URL, bridge host/port). The one path you type yourself is the
+`exec(open(".../kitting_bridge_server.py"))` line in Isaac Sim's Script
+Editor, because Isaac Sim cannot know where you cloned the repo; it can be any
+location. To force a specific checkout (e.g. two clones), put
+`KITTING_PROJECT_ROOT = "/path/to/clone"` before that `exec` line.
+
+What does depend on the machine is the **software stack**, not paths: Ubuntu
+24 + CUDA 12 for nvblox, a driver ≥ 580 for the CUDA 13 torch build, and
+Isaac Sim 6.1. A Docker image (`Dockerfile`, `docker-compose.yml`) is planned
+to pin these.
+
+---
+
+## 7. Method
+
+### 7.1 Perception: from a VLM box to a grasp point
+
+**VLM grounding.** Qwen3-VL receives the full overhead frame (1920×1080) with
+the part catalogue and returns, per part, a label and a box (`bbox_2d`). The
+boxes are decoded as a 0–1000 relative grid; the measured boxes are consistent
+with that (all six landed on their parts, with a 1.5 % scale error in x).
+`_extract_vlm_bboxes` chooses the convention by value range, which should be
+pinned per model.
+
+**Depth projection.** Image points are back-projected through the camera's
+pinhole model using the rendered `distance_to_image_plane` depth:
+**x_cam = d · K⁻¹ [u, v, 1]ᵀ**, **x_world = T_world←cam · x_cam**.
+The renderer keeps the horizontal aperture and draws square pixels at any
+resolution, so **f_y = f_x = W·f / h_aperture** (using the USD vertical
+aperture instead put the corner cameras' floors 10–40 cm apart).
+
+**Top-surface estimator.** A single pixel at the box centre is a poor
+estimate: on these parts it looks through the bore to the bin floor (40 mm
+too low on gears, 85 mm on valves). Instead a 9×9 grid inside the box (10 %
+inset) is projected and reduced to the part's top surface:
+
+- z_top = 90th percentile of the sample heights,
+- (x, y) = mean of the samples with z ≥ z_top − 1 cm.
+
+Samples that miss the part land on the floor and drop out of the band, so the
+estimate is robust to box misplacement (section 8.2). The same estimator runs
+on a 7×7 patch (±4 % of the image) around the wrist VLM's pointed centre.
+
+**Eye-in-hand verification.** At the 0.25 m standoff the wrist camera (0.39 m
+above the part) re-measures the part; its z is always applied and its xy is
+applied within a 5 cm cap (rejects a neighbouring part). The wrist view is the
+most precise source (section 8.2), consistent with the eye-in-hand advantage
+known from visual servoing [Chaumette & Hutchinson 2006].
+
+### 7.2 Collision world: depth cameras → nvblox → signed distance field
+
+1. **Capture.** Six depth cameras (4 corner, 2 overhead) render depth on the
+   same render products as their point-cloud annotators.
+2. **Robot self-masking.** Every pixel is back-projected; pixels inside the
+   XRDF collision spheres at the *live* joint state (forward kinematics from
+   the USD link poses, +4 cm, carriage +5 cm), outside the workspace box, or
+   inside a sphere around a held part are masked (`mask = 0`). Validated
+   against ground truth by rendering with and without the robot: 0 moving-robot
+   pixels leak at the spawn and home poses.
+3. **Integration.** nvblox [Millane et al. 2024] fuses the masked depth into a
+   2 cm TSDF, allocating blocks only inside the workspace box. Updates are
+   incremental with weight decay 0.5 per update (a removed part disappears in
+   2 updates; space nothing sees fades in ~10).
+4. **Exact SDF.** nvblox's own ESDF jumped by more than one voxel between 2–3 %
+   of neighbouring voxels (up to 0.27 m), which cuMotion's `inspect_sdf`
+   rejects. The service therefore builds the field itself: occupancy =
+   observed TSDF voxels with distance ≤ 0; signed field = Euclidean distance
+   transform outside minus inside (exact EDT [Maurer et al. 2003], as
+   implemented by `scipy.ndimage.distance_transform_edt`), which is
+   1-Lipschitz by construction. Error against the integrated points: median −0.4 to −0.7 cm
+   (conservative), p90 +0.6 cm.
+5. **Planner world.** The field minus a 2 cm safety margin is loaded as one
+   cuMotion SDF obstacle (260×160×108 voxels). Grasp targets are carved as
+   vertical columns (r = 0.10 m) before the EDT so the field stays exact.
+
+### 7.3 Motion
+
+cuMotion plans collision-free transits (gantry + 6 arm joints as one 7-DOF
+c-space) to a standoff 0.25 m above the part. Descent and lift are Cartesian
+micro-steps with a contact stop; the adaptive close steps the finger until the
+pad sensor or a finger stall reports contact, then squeezes a further 0.06 rad.
+A grasp is confirmed only if the fingers stop short of their target **and**
+the pad gap is ≤ 0.13 m (wider means the fingers stopped on the floor or a
+wall). If the start state lies only inside the safety margin (e.g. after a
+failed grasp next to a wall), the planner retries once with the margin
+removed: the current configuration is physically realised, so a "collision"
+there is inflation, not contact.
+
+### 7.4 Calibration
+
+In simulation the camera model is exact: the true centre pixel back-projects
+to within 3.6–5 mm of the true part position, and the six cameras agree to
+5–8 mm. The pick errors observed during development were therefore **not**
+calibration errors but estimator and decoding errors (section 8.1). For a
+physical cell the planned procedure is: intrinsics with a ChArUco board
+[Zhang 2000; Garrido-Jurado et al. 2014], wrist hand-eye calibration AX = XB
+[Tsai & Lenz 1989; Park & Martin 1994], fixed cameras by robot-world/hand-eye
+AX = ZB [Shah 2013], TCP by pivoting — first validated in simulation against
+the known USD transforms.
+
+---
+
+## 8. Evaluation and measured results
+
+### 8.1 Error budget method
+
+`generative_kitting/tools/measure_grounding.py` measures each stage against the
+simulator's ground truth (`/api/scene_annotations`: world centre, top height
+and image box per part, per camera), running the production code path:
+
+| Stage | Input | Isolates |
+|---|---|---|
+| camera | ground-truth image box | camera model + depth + estimator |
+| centre | ground-truth centre pixel | the old single-pixel method |
+| detection | VLM boxes | 2-D error, IoU, per-axis affine fit, end-to-end 3-D error |
+| wrist | robot at the standoff | wrist box (truth) and wrist VLM centre |
+
+Reports (mean, std, p95, max; per part type) go to
+`generative_kitting/logs/grounding/<timestamp>/report.md`.
+
+```bash
+generative_kitting/.aikido/bin/python generative_kitting/tools/measure_grounding.py --vlm live --wrist --repeats 3
+```
+
+### 8.2 Results (simulation, 3 gears + 3 valves)
+
+| XY error | Gear | Valve |
+|---|---|---|
+| Old method (box-grid corner sample) | 57–100 mm | 76–111 mm |
+| Overhead, ground-truth box | 2.2 mm | 21.6 mm |
+| Overhead, VLM-like box error (~20 px) | 5.8 mm | 20.8 mm |
+| Wrist, ground-truth box | **0.2 mm** | 22.0 mm |
+| Wrist, VLM centre with 6 px noise | **2.8 mm** | 11.1 mm |
+
+Height: the top-surface estimate is within 2–4 mm on gears (the single centre
+pixel was 40 mm low). Gripper tolerance: the open 2F-140 (144 mm) leaves about
+±24 mm around a 95 mm gear. Valves are asymmetric: the centroid of their top
+surface is not their geometric centre, so they need a defined grasp point
+(mask or grasp-point model) rather than a better detector.
+
+Other checks: approaches at yaw 0 / ±30°: 15/15 within 1.4 mm;
+`large_gear_1` and `motor_valve_1` picks hold after the lift (50 / 42–50 N).
+
+---
+
+## 9. Testing and diagnostics
 
 ```bash
 cd generative_kitting
-python -m pytest tests/ -v
+.aikido/bin/python -m pytest tests/ -q        # 135 tests, no Isaac Sim needed
 ```
 
-The test suite covers planner validation, controller safety, plan
-execution paths, and perception schema checks. No Isaac Sim
-connection is required — everything is mocked.
+| Tool | Use |
+|---|---|
+| `tools/measure_grounding.py` | error budget against ground truth (`--vlm live|fake|none`, `--wrist`) |
+| `tools/pick_test.sh X Y TOP_Z [GRASP_LIFT] [YAW_DEG]` | one staged pick through the bridge |
+| `diagnose_motion.py` | bridge status, joint jog, planner frame check, plan test |
+| `isaac_sim_launcher.py` | in-Isaac scene / VLM / home check |
 
 ---
 
-## Project layout
+## 10. Project layout
 
 ```
 robot_in_air/
-├── .env.example              # template for local environment vars
-├── UR10e_Container_Assets/   # main Isaac Sim scene (AIKIDO_ur10e_swapped.usd, robot.yaml robot.stage)
-├── AIKIDO.usd                # UR10 baseline scene
-├── CLAUDE.md                 # in-depth architecture notes
-├── README.md                 # this file
-├── generative_kitting/       # main Python package
-│   ├── config.yaml           # central configuration (env-var aware)
-│   ├── main.py               # CLI / UI entry point
-│   ├── isaac_sim_bridge.py   # HTTP bridge run inside Isaac Sim
-│   ├── kitting_bridge_server.py   # one-line bridge launcher
-│   ├── isaac_compat.py       # Isaac Sim 6.0.1 experimental-core adapter
-│   ├── requirements.txt
-│   ├── perception/           # VLM perception + camera interface
-│   ├── orchestration/        # VLM planner + validators + workflow
-│   ├── execution/            # robot controller + motion + safety
-│   ├── knowledge/            # parts DB + catalogue
-│   ├── ui/streamlit_app.py   # operator dashboard
-│   ├── utils/config_loader.py  # env-aware YAML loader
-│   └── tests/                # pytest suite
-└── archive/                  # legacy UR10 control script + Lula config (not used)
+├── .env.example                  # template; copy to .env
+├── UR10e_Container_Assets/       # the Isaac Sim scene (AIKIDO_ur10e_swapped.usd)
+├── AIKIDO.usd                    # UR10 baseline scene
+├── UR10E_MIGRATION_PLAN.md       # step-by-step migration log with measurements
+├── PIPELINE_UPDATES_PENDING.md   # verified Isaac Sim findings
+├── archive/                      # legacy UR10 script + Lula config (not used)
+└── generative_kitting/
+    ├── config.yaml               # perception / planning / workflow settings
+    ├── main.py                   # CLI and UI entry point
+    ├── kitting_bridge_server.py  # Script Editor launcher (finds the repo)
+    ├── isaac_sim_bridge.py       # bridge inside Isaac Sim (cameras, cuMotion, nvblox client)
+    ├── nvblox_service/           # collision-world service (own venv)
+    ├── robot_config/ur10e/       # robot.yaml, URDF, XRDF, meshes
+    ├── perception/               # VLM, camera clients, validators
+    ├── orchestration/            # planner, prompts, workflow engine
+    ├── execution/                # safety, motion helpers
+    ├── knowledge/                # parts catalogue and database
+    ├── ui/streamlit_app.py       # operator dashboard
+    ├── utils/                    # config / robot-config loaders, workspace bounds
+    ├── tools/                    # measure_grounding.py, pick_test.sh
+    └── tests/
 ```
 
 ---
 
-## Security notes
+## 11. Known limitations
 
-- The Isaac Sim bridge binds to loopback (`127.0.0.1`) by default. It
-  exposes endpoints that move the physical / simulated robot and has
-  **no authentication** — only set `BRIDGE_HOST` / `--host` to
-  `0.0.0.0` when you control the network you're on.
-- API keys, server IPs, and install paths are loaded from environment
-  variables, not committed to the repo. `.env` is gitignored.
-- Don't commit `eval.db`, captured camera frames, or session logs —
-  they live under `generative_kitting/logs/` and may contain workspace
-  imagery.
+- **Bin and tray positions** still come from USD prim lookups
+  (`/World/robot_facade_full`, `/World/box_840`); part positions are camera +
+  VLM. Moving these to perception is the next step.
+- **Valves:** ~20 mm grasp-point offset (asymmetric part); a grasp-point /
+  segmentation stage is planned.
+- **Held part:** masked out of the map, but not attached to cuMotion's robot
+  model, so transit plans do not account for its volume.
+- **Narrow grasps:** a planned move straight to a grasp next to a bin wall can
+  be refused by the 2 cm + ~1.7 cm margins; the descent itself is Cartesian
+  and unaffected.
+- **Minimum grasp height:** the pad centre must be ≥ ~5 cm above the surface a
+  part stands on (finger bottom 47 mm below the pad centre; closing lowers the
+  pads 16–24 mm).
+- Isaac Sim: do not delete physics prims while the timeline plays; it
+  invalidates the physics views (recover: stop, `World.clear_instance()`,
+  play + stop, restart the bridge).
 
 ---
 
-## Troubleshooting
+## 12. Troubleshooting
 
-| Symptom | Likely cause / fix |
+| Symptom | Cause / fix |
 |---|---|
-| `Cannot reach Ollama` on startup | `ollama serve` not running, or `OLLAMA_BASE_URL` points at the wrong host. |
-| Bridge log says `[OK] Bridge v2 on http://127.0.0.1:8600` but Streamlit can't connect | Firewall on your machine — or you're running Streamlit in a container that can't reach loopback. Set `BRIDGE_HOST=0.0.0.0` only as a last resort. |
-| `URDF / YAML not found` when initialising IK | `ISAACSIM_PATH` is unset or points at the wrong folder. It must contain `exts/isaacsim.asset.importer.urdf/`. |
-| Streamlit UI starts but VLM model dropdown is empty | The model server reachable at `OLLAMA_BASE_URL` has no models loaded. `ollama list` on that host should show what's available. |
-| Robot's joints diverge wildly during a pick | Known IK edge case — the wrist joints are continuous and can wrap. Reset the scene in Isaac Sim and re-`exec()` the bridge. |
+| `Could not find the robot_in_air repo` when starting the bridge | the open stage is not from this clone; open `UR10e_Container_Assets/AIKIDO_ur10e_swapped.usd` or set `KITTING_PROJECT_ROOT` before `exec` |
+| `nvblox service not reachable at http://127.0.0.1:8610` | start `nvblox_service/run.sh … server.py` |
+| `nvblox venv missing` | run `nvblox_service/setup_venv.sh` |
+| `ROBOT_CONFIG_PATH is not set` / robot config not found | `.env` missing: `cp .env.example .env` |
+| VLM timeouts | `VLLM_BASE_URL` unreachable (VPN?) or missing `/v1`; `curl $VLLM_BASE_URL/models` |
+| Model not found on the server | `--served-model-name` must equal `perception.vlm_model` |
+| `NO PATH` for every plan | start inside the map: check `/api/plan_test`; rebuild the world with `/api/build_collision_world` |
+| `torch` CUDA errors in the app venv | driver older than 580: reinstall torch from a cu12x index |
+| CUDA out of memory in nvblox | keep `voxel_size: 0.02` and the workspace box; close other GPU apps |
 
 ---
 
-## License & citation
+## 13. Security notes
 
-This codebase accompanies the Master's thesis "Generative AI-based
-Robotic Kitting System" (Kadiya, 2026). See `CLAUDE.md` and
-`THESIS_FRAMEWORK_SUMMARY.md` for academic context.
+- The bridge (8600) and the nvblox service (8610) bind to `127.0.0.1` and have
+  **no authentication**: they move the robot. Do not expose them to a network
+  you do not control.
+- Server addresses and keys live in `.env`, which is git-ignored. Do not
+  commit `.env`, `generative_kitting/logs/` captures or `eval.db` if they
+  contain sensitive imagery.
+- Set your git identity before committing (`git config user.email
+  <id>+<user>@users.noreply.github.com`) so commits do not carry your local
+  username and hostname.
+
+---
+
+## 14. References
+
+- Chaumette, F., Hutchinson, S. (2006). Visual servo control, Part I: Basic
+  approaches. *IEEE Robotics & Automation Magazine*, 13(4), 82–90.
+- Maurer, C. R., Qi, R., Raghavan, V. (2003). A linear time algorithm for
+  computing exact Euclidean distance transforms of binary images in arbitrary
+  dimensions. *IEEE Trans. Pattern Analysis and Machine Intelligence*, 25(2),
+  265–270.
+- Garrido-Jurado, S., Muñoz-Salinas, R., Madrid-Cuevas, F. J., Marín-Jiménez,
+  M. J. (2014). Automatic generation and detection of highly reliable fiducial
+  markers under occlusion. *Pattern Recognition*, 47(6), 2280–2292.
+- Millane, A., Oleynikova, H., Wirbel, E., Steiner, R., Ramasamy, V., Tingdahl,
+  D., Siegwart, R. (2024). nvblox: GPU-accelerated incremental signed distance
+  field mapping. *IEEE ICRA*.
+- Park, F. C., Martin, B. J. (1994). Robot sensor calibration: solving AX = XB
+  on the Euclidean group. *IEEE Trans. Robotics and Automation*, 10(5), 717–721.
+- Shah, M. (2013). Solving the robot-world/hand-eye calibration problem using
+  the Kronecker product. *Journal of Mechanisms and Robotics*, 5(3).
+- Tsai, R. Y., Lenz, R. K. (1989). A new technique for fully autonomous and
+  efficient 3D robotics hand/eye calibration. *IEEE Trans. Robotics and
+  Automation*, 5(3), 345–358.
+- Zhang, Z. (2000). A flexible new technique for camera calibration. *IEEE
+  Trans. Pattern Analysis and Machine Intelligence*, 22(11), 1330–1334.
+- Qwen Team (2025). Qwen2.5-VL technical report. arXiv:2502.13923.
+
+---
+
+## 15. License and citation
+
+This codebase accompanies the Master's thesis "Generative AI-based Robotic
+Kitting System" (Kadiya, 2026). See `THESIS_FRAMEWORK_SUMMARY.md` and
+`THESIS_EVALUATION_RESULTS.md` for the academic context.
