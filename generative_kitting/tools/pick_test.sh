@@ -9,7 +9,7 @@ X=$1; Y=$2; Z=$3; GL=${4:-0.0}; AZ=$(python3 -c "print($Z + 0.25)")
 YAW=$(python3 -c "import math; print(math.radians(${5:-0.0}))")
 timeout 40 bash -c "until curl -s -m 2 $B/ping >/dev/null; do sleep 1; done"
 curl -s -m 130 -X POST $B/home -d '{}' | python3 -c "import json,sys; print('home:', json.load(sys.stdin).get('status'))"
-curl -s -m 180 -X POST $B/build_collision_world -d "{\"exclude_points\": [[$X, $Y, $Z]]}" | python3 -c "import json,sys; print('world:', json.load(sys.stdin).get('spheres'))"
+curl -s -m 180 -X POST $B/build_collision_world -d "{\"exclude_points\": [[$X, $Y, $Z]]}" | python3 -c "import json,sys; d=json.load(sys.stdin); print('world:', d.get('status') or d.get('error'), 'carved', d.get('carved'), 'inspect', d.get('inspect_sdf'))"
 curl -s -m 180 -X POST $B/approach -d "{\"x\": $X, \"y\": $Y, \"z\": $AZ, \"yaw\": $YAW}" | python3 -c "import json,sys; d=json.load(sys.stdin); print('approach:', d.get('status') or d.get('error'))"
 curl -s -m 180 -X POST $B/pick_descend -d "{\"x\": $X, \"y\": $Y, \"z\": $Z, \"grasp_lift\": $GL, \"yaw\": $YAW}" | python3 -c "import json,sys; d=json.load(sys.stdin); d.pop('wrist_image',None); print('descend:', d.get('status') or d.get('error'), 'contact', [s.get('contact') for s in d.get('steps',[]) if s.get('phase')=='grasp_descend'], 'xy drift mm', round(d.get('ee_drift_mm',{}).get('xy_total',-1),1), 'yaw off deg', [round(s.get('yaw_off_deg',0),1) for s in d.get('steps',[]) if s.get('phase')=='xy_align'])"
 n0=$(wc -l < "$L")

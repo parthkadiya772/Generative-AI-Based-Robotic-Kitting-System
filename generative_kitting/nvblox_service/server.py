@@ -9,7 +9,9 @@ Runs in its own venv (nvblox_torch links libtorch 2.9.1, Isaac Sim ships
                       Integrates into the existing map (clear=0, default; decayed
                       first when tsdf_decay_factor is set) or rebuilds it (clear=1),
                       then updates the ESDF.
-    GET  /sdf         .npz: dense signed distance over the workspace box for cuMotion:
+    GET  /sdf         .npz: dense signed distance over the workspace box for cuMotion
+    POST /sdf         same; JSON {"carve": [[x, y, z_min, z_max, radius], ...]} marks those
+                      vertical columns free first (grasp targets):
                       values (nx,ny,nz float32 m, z fastest, value i at voxel centre
                       workspace_min + (i + 0.5) * voxel_size), origin, voxel_size.
     POST /query       {"points": [[x, y, z], ...]} -> ESDF distance [m] per point
@@ -133,7 +135,7 @@ def query(points):
     return d.cpu().numpy().tolist()
 
 
-def dense_sdf():
+def dense_sdf(carve=()):
     """Signed distance over the workspace box: exact EDT of the TSDF occupancy.
 
     nvblox's own ESDF jumps by up to 0.27 m between neighbouring voxels
@@ -142,6 +144,8 @@ def dense_sdf():
     surface (distance <= 0); the EDT of that is 1-Lipschitz by construction.
     Unobserved voxels count as free, like the ESDF query. Measured against
     the integrated points: median -0.4 to -0.7 cm (reads closer), p90 +0.6 cm.
+    ``carve`` columns [x, y, z_min, z_max, radius] are set free before the
+    EDT, so the field stays exact around them.
     """
     t0 = time.perf_counter()
     vs = float(CFG["voxel_size"])
@@ -154,11 +158,23 @@ def dense_sdf():
     tsdf = MAPPER.query_layer(QueryType.TSDF, pts).reshape(*n, 2).cpu().numpy()
     del X, Y, Z, pts
     occ = (tsdf[..., 1] > 0) & (tsdf[..., 0] <= 0)
+    n_carved = 0
+    centres = [lo[k] + (np.arange(n[k]) + 0.5) * vs for k in range(3)]
+    for x, y, z0, z1, r in carve:
+        ix = np.flatnonzero(np.abs(centres[0] - x) <= r)
+        iy = np.flatnonzero(np.abs(centres[1] - y) <= r)
+        iz = np.flatnonzero((centres[2] >= z0) & (centres[2] <= z1))
+        if not (len(ix) and len(iy) and len(iz)):
+            continue
+        disc = np.hypot(*np.meshgrid(centres[0][ix] - x, centres[1][iy] - y, indexing="ij")) <= r
+        block = occ[ix[0]:ix[-1] + 1, iy[0]:iy[-1] + 1, iz[0]:iz[-1] + 1]
+        n_carved += int(block[disc].sum())
+        block[disc] = False
     # voxel-centre distances, surface half a voxel between occupied and free
     outside = ndimage.distance_transform_edt(~occ, sampling=vs)
     inside = ndimage.distance_transform_edt(occ, sampling=vs)
     values = np.where(occ, vs / 2 - inside, outside - vs / 2).astype(np.float32)
-    STATS["last_sdf"] = {"shape": n.tolist(), "occupied": int(occ.sum()),
+    STATS["last_sdf"] = {"shape": n.tolist(), "occupied": int(occ.sum()), "carved": n_carved,
                          "unobserved": int((tsdf[..., 1] <= 0).sum()),
                          "ms": round(1e3 * (time.perf_counter() - t0), 1)}
     return values, lo, vs
@@ -189,25 +205,31 @@ class Handler(BaseHTTPRequestHandler):
                         "max_integration_distance": CFG["max_integration_distance"],
                         "gpu_mib": _gpu_mib(), **STATS})
         elif urlparse(self.path).path == "/sdf":
-            try:
-                values, origin, vs = dense_sdf()
-            except Exception as e:
-                self._send({"error": f"{type(e).__name__}: {e}"}, 500)
-                return
-            buf = io.BytesIO()
-            np.savez(buf, values=values, origin=origin, voxel_size=vs)
-            body = buf.getvalue()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/octet-stream")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("X-Sdf-Stats", json.dumps(STATS["last_sdf"]))
-            self.end_headers()
-            self.wfile.write(body)
+            self._send_sdf(())
         else:
             self._send({"error": f"unknown endpoint {self.path}"}, 404)
 
+    def _send_sdf(self, carve):
+        try:
+            values, origin, vs = dense_sdf(carve)
+        except Exception as e:
+            self._send({"error": f"{type(e).__name__}: {e}"}, 500)
+            return
+        buf = io.BytesIO()
+        np.savez(buf, values=values, origin=origin, voxel_size=vs)
+        body = buf.getvalue()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Sdf-Stats", json.dumps(STATS["last_sdf"]))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_POST(self):
         path = urlparse(self.path).path
+        if path == "/sdf":
+            self._send_sdf(json.loads(self._body() or b"{}").get("carve", []))
+            return
         try:
             if path == "/integrate":
                 frames, clear = _unpack_npz(self._body())

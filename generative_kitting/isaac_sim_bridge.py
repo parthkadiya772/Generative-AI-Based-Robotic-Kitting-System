@@ -697,7 +697,8 @@ def _robot_spheres_world(sphere_margin, link_margins=None):
 
     Returns (centers (n,3), radii (n,), links (n,)), radii including
     sphere_margin, or link_margins[link] where given (not the housing);
-    links name each sphere's link, "wrist_camera" for the housing.
+    links name each sphere's link, "wrist_camera" for the housing and
+    "held_part" for a grasped part (STATE.held_part).
     """
     link_margins = link_margins or {}
     import omni.usd
@@ -720,6 +721,12 @@ def _robot_spheres_world(sphere_margin, link_margins=None):
         centers.append(omni.usd.get_world_transform_matrix(cam_prim).ExtractTranslation())
         radii.append(float(ROBOT_CFG.wrist_camera["self_filter_radius"]))
         links.append("wrist_camera")
+    # A held part moves with the fingers, so it is masked like a link: one
+    # sphere at the pad centre (TCP) while _pick_close has confirmed a grasp.
+    if STATE.held_part is not None:
+        centers.append(get_tcp_pos())
+        radii.append(float(STATE.held_part["radius"]) + sphere_margin)
+        links.append("held_part")
     return (np.array(centers, dtype=np.float64).reshape(-1, 3),
             np.array(radii, dtype=np.float64), np.array(links))
 
@@ -942,14 +949,19 @@ async def _nvblox_update(params=None):
     return result
 
 
-def _nvblox_get_sdf():
-    """Fetch the dense SDF from the service: (values, origin, voxel_size, stats) or error dict."""
+def _nvblox_get_sdf(carve=()):
+    """Fetch the dense SDF from the service: (values, origin, voxel_size, stats) or error dict.
+
+    ``carve``: [[x, y, z_min, z_max, radius], ...] columns the service marks free.
+    """
     import urllib.request
     import urllib.error
 
     url = ROBOT_CFG.nvblox["url"].rstrip("/") + "/sdf"
+    req = urllib.request.Request(url, data=json.dumps({"carve": list(carve)}).encode(),
+                                 headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(url, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=60) as resp:
             body, stats = resp.read(), json.loads(resp.headers.get("X-Sdf-Stats") or "{}")
     except urllib.error.HTTPError as e:
         return json.loads(e.read() or b"{}") or {"error": f"HTTP {e.code}"}
@@ -1032,6 +1044,11 @@ async def _nvblox_world(params=None):
     inflates every obstacle by that much. Params are passed on to
     _nvblox_update (clear, dump); check: also compare cuMotion's distances
     with the grid (frame check, ~0.5 s).
+
+    exclude_points: [[x, y, z_top], ...] grasp targets. A vertical column of
+        carve_radius (default nvblox.target_carve_radius) from
+        z_top - nvblox.target_carve_below up to the box top is marked free
+        before the EDT, so the target never blocks a plan to it.
     """
     params = params or {}
     if STATE.cumotion_world is None and not _init_cumotion():
@@ -1040,8 +1057,15 @@ async def _nvblox_world(params=None):
     if update.get("status") != "ok":
         return {"error": "nvblox update failed", "update": update}
 
+    nv = ROBOT_CFG.nvblox
+    targets = params.get("exclude_points") or []
+    carve_r = float(params.get("carve_radius", nv["target_carve_radius"]))
+    z_top = float(nv["workspace_max"][2])
+    carve = [[float(x), float(y), float(z) - float(nv["target_carve_below"]), z_top, carve_r]
+             for x, y, z in (t[:3] for t in targets)]
+
     t0 = time.perf_counter()
-    got = await asyncio.get_event_loop().run_in_executor(None, _nvblox_get_sdf)
+    got = await asyncio.get_event_loop().run_in_executor(None, _nvblox_get_sdf, carve)
     if isinstance(got, dict):
         return {"error": got.get("error", "sdf export failed"), "update": update}
     values, origin, voxel_size, sdf_stats = got
@@ -1055,12 +1079,15 @@ async def _nvblox_world(params=None):
         "status": "ok",
         "grid": list(values.shape), "voxel_size": voxel_size,
         "origin": [round(float(v), 3) for v in origin], "safety_margin": margin,
+        "targets": len(targets), "carve_radius": carve_r,
+        "held_part": STATE.held_part,
         "inspect_sdf": {"errors": inspection.num_errors(),
                         "flat_voxels": inspection.num_voxels_matching_all_neighbors,
                         "too_far_from_neighbours": inspection.num_voxels_too_far_from_neighbors},
         "fetch_ms": round(1e3 * (t1 - t0), 1), "load_ms": round(1e3 * (t2 - t1), 1),
         "service_sdf": sdf_stats,
         "update": {k: update[k] for k in ("capture_ms", "mask_ms", "service_ms")},
+        "cameras": update["cameras"],
     }
     if params.get("check"):
         result["frame_check"] = _cumotion_sdf_frame_check(values, origin, voxel_size)
@@ -1753,75 +1780,43 @@ async def _probe_obstacle_update(params=None):
 
 
 async def _build_collision_world(params=None):
-    """Rebuild the collision world: static structure + this cycle's dynamic layer.
+    """Rebuild cuMotion's collision world from the depth cameras via nvblox.
 
-    The static layer (gantry rail, rack, floor, walls) comes from the
-    cached parked-pose scan — see /api/build_static_world — and is NOT
-    re-derived here. Only the dynamic layer (whatever the corner cameras
-    currently see, self-filtered, carved around detected targets) is
-    rebuilt each call.
+    One SDF obstacle over the workspace box (see _nvblox_world); the robot
+    is masked out of the depth, a held part too.
 
     Params:
-        voxel_size: grid size for downsampling the dynamic layer (default 2 cm)
-        exclude_points: [[x, y, z], ...] world coords of parts to be
-            picked. An XY cylinder of ``carve_radius`` is cleared around
-            each so the target never becomes its own obstacle.
-        carve_radius: cylinder radius in metres (default 6 cm)
+        exclude_points: [[x, y, z_top], ...] parts to be picked. A vertical
+            column of ``carve_radius`` is carved out of the map around each,
+            from just below the part top up, so the target never becomes
+            its own obstacle.
+        carve_radius: column radius in metres (default robot.yaml
+            nvblox.target_carve_radius)
 
     Call once per scan cycle, after perception, before planning the pick.
     """
     params = params or {}
+    if ROBOT_CFG.nvblox is None:
+        return {"error": "robot.yaml has no nvblox section"}
     if STATE.cumotion_world is None and not _init_cumotion():
         return {"error": "cuMotion not initialised"}
 
-    voxel = float(params.get("voxel_size", COLLISION_VOXEL_SIZE))
-    static_pts = _load_static_world()
-    if len(static_pts) == 0:
-        print("  [pcd] NOTE: no static-structure scan cached — call "
-              "/api/build_static_world once with the robot parked out of "
-              "frame, or every cycle re-derives the whole cell (fragile).")
-
-    raw = await _capture_pointcloud()
-    if len(raw) == 0:
-        return {"error": "no point cloud data from any camera"}
-
-    # 1. Filter out the robot's own links to prevent start-state collision
-    filtered, n_self_filtered = _filter_robot_self_points(raw)
-
-    targets = params.get("exclude_points") or []
-    carve_r = float(params.get("carve_radius", TARGET_CARVE_RADIUS))
-    kept, n_carved = _carve_around_points(filtered, targets, carve_r)
-    dynamic_voxels = _voxel_downsample(kept, voxel)
-
-    voxels = (np.vstack([static_pts, dynamic_voxels])
-              if len(static_pts) else dynamic_voxels)
-
-    if len(voxels) > COLLISION_MAX_SPHERES:
-        keep = np.random.default_rng(0).choice(
-            len(voxels), COLLISION_MAX_SPHERES, replace=False)
-        print(f"  [pcd] capping {len(voxels)} → {COLLISION_MAX_SPHERES} spheres")
-        voxels = voxels[keep]
-
-    # Fresh world each rebuild — cuMotion has no per-prefix removal.
+    # Fresh world: drops spheres left by older paths (wrist obstacles).
     _reset_cumotion_world()
-    n = _spheres_from_points(voxels, "/collision/structure", voxel / 2.0)
-    STATE.cumotion_world.world_view.update()
-    STATE.collision_sphere_count = n
-
-    print(f"  [pcd] collision world: {len(static_pts)} static + {len(raw)} raw dynamic "
-          f"→ {n_self_filtered} robot self-filtered "
-          f"→ {n_carved} carved around {len(targets)} target(s) @ {carve_r*100:.0f}cm "
-          f"→ {len(voxels)} total voxels @ {voxel*100:.0f}cm → {n} spheres")
-    if not targets:
-        print("  [pcd] NOTE: no exclude_points given — every part in the bin "
+    result = await _nvblox_world(params)
+    if result.get("status") != "ok":
+        return result
+    if not params.get("exclude_points"):
+        print("  [nvblox] NOTE: no exclude_points given — every part in the bin "
               "is an obstacle, so grasp poses will not plan. Pass the "
               "detected part coordinates.")
-    return {"status": "ok", "static_points": int(len(static_pts)),
-            "raw_points": int(len(raw)),
-            "self_filtered": n_self_filtered,
-            "carved": n_carved, "targets": len(targets),
-            "carve_radius": carve_r, "spheres": n,
-            "voxel_size": voxel}
+    result.update({
+        "source": "nvblox",
+        "carved": result["service_sdf"].get("carved", 0),
+        "spheres": STATE.collision_sphere_count,
+        "integrated_pixels": sum(c["integrated_pixels"] for c in result.get("cameras", [])),
+    })
+    return result
 
 
 async def _add_wrist_obstacles(params):
@@ -2322,6 +2317,7 @@ class BridgeState:
         self.collision_sphere_count = 0
         self.nvblox_sdf_handle = None     # cuMotion SDF obstacle from nvblox
         self.nvblox_sdf_key = None        # (nx, ny, nz, voxel) it was built for
+        self.held_part = None             # {"radius": m} while a grasp is confirmed
         # Static structure scan (gantry rail, rack, floor, walls) — see
         # /api/build_static_world. Captured once, cached to disk, reused
         # by every _build_collision_world rebuild instead of being
@@ -3554,6 +3550,8 @@ async def _set_gripper(finger_value):
     """Open or close the gripper. Waits long enough for physics to settle."""
     import omni.kit.app
     from isaacsim.core.utils.types import ArticulationAction
+    if finger_value < 0.1:
+        STATE.held_part = None             # opening releases whatever was held
     targets = set_finger_joints(STATE.robot, STATE.dof_names, finger_value)
     STATE.robot.apply_action(ArticulationAction(joint_positions=targets))
     # 90 frames for gripper to fully close/open (with boosted stiffness, faster settle)
@@ -4784,6 +4782,9 @@ async def _pick_close(params):
 
         grasp_check = await _verify_grasp()
         confirmed = grasp_check["is_grasping"]
+        STATE.held_part = ({"radius": float(params.get(
+            "held_radius", ROBOT_CFG.nvblox["held_part_radius"]))}
+            if confirmed and ROBOT_CFG.nvblox else None)
         print(f"  [CLOSE] {'held' if confirmed else 'NOTHING HELD'}: finger "
               f"{grasp_check['finger_pos']:.3f} / target {target:.3f} rad, "
               f"pad gap {grasp_check['pad_gap_m']*1000:.0f} mm, "
@@ -5250,6 +5251,7 @@ def _shutdown_bridge(reason="simulation stopped"):
     STATE.pending_trajectory = None
     STATE.collision_sphere_count = 0
     STATE.nvblox_sdf_handle = None
+    STATE.held_part = None
 
     # Drain any pending commands/results so they don't leak into next session
     with STATE._lock:

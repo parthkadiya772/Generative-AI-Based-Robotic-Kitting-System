@@ -319,18 +319,21 @@ class BridgeCameraInterface:
     def build_collision_world(self, exclude_points: list = None,
                               carve_radius: float = None,
                               voxel_size: float = None) -> dict:
-        """Rebuild the cuMotion collision world from the 4 corner cameras.
+        """Rebuild the cuMotion collision world: depth cameras -> nvblox -> SDF.
 
         Parameters
         ----------
         exclude_points : list of [x, y, z]
-            World coords of parts to be picked. An XY cylinder is cleared
-            around each so the target never becomes its own obstacle —
-            without this a grasp pose cannot be planned.
+            World coords of the tops of parts to be picked. A vertical
+            column is carved out of the map around each so the target never
+            becomes its own obstacle — without this a grasp pose cannot be
+            planned.
         carve_radius : float
-            Cylinder radius in metres (bridge default 0.06).
+            Column radius in metres (bridge default robot.yaml
+            nvblox.target_carve_radius).
         voxel_size : float
-            Downsample grid in metres (bridge default 0.02).
+            Unused since the nvblox SDF (voxel size is robot.yaml
+            nvblox.voxel_size); kept for older callers.
 
         Call once per scan cycle, AFTER perception, before planning.
         """

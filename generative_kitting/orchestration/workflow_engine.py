@@ -822,9 +822,9 @@ class KittingWorkflowEngine:
                             exclude_points=part_xyz)
                         if cw.get("status") == "ok":
                             log.info(
-                                f"[Collision] {cw['spheres']} spheres from "
-                                f"{cw['raw_points']} points; carved "
-                                f"{cw['carved']} around {cw['targets']} part(s)")
+                                f"[Collision] nvblox SDF {cw['grid']} from "
+                                f"{cw['integrated_pixels']} depth pixels; carved "
+                                f"{cw['carved']} voxels around {cw['targets']} part(s)")
                         else:
                             log.warning(
                                 f"[Collision] build failed: {cw.get('error')} "
