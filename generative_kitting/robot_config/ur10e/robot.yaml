@@ -178,3 +178,7 @@ nvblox:
   # 0.5 clears it in 2 updates and an unseen region (e.g. under the arm)
   # lasts ~10 updates; 0.2 clears in 1 but forgets unseen space in ~4.
   tsdf_decay_factor: 0.5
+  # m subtracted from the SDF handed to cuMotion (inflates obstacles). The
+  # EDT SDF reads -0.5 cm (closer) at the median; 99.5 % of surface points lie
+  # within 2 cm of it; cuMotion adds 0.7-1.7 cm on its own (2026-10-14).
+  sdf_safety_margin: 0.02

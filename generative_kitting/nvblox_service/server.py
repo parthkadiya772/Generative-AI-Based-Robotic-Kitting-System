@@ -9,6 +9,9 @@ Runs in its own venv (nvblox_torch links libtorch 2.9.1, Isaac Sim ships
                       Integrates into the existing map (clear=0, default; decayed
                       first when tsdf_decay_factor is set) or rebuilds it (clear=1),
                       then updates the ESDF.
+    GET  /sdf         .npz: dense signed distance over the workspace box for cuMotion:
+                      values (nx,ny,nz float32 m, z fastest, value i at voxel centre
+                      workspace_min + (i + 0.5) * voxel_size), origin, voxel_size.
     POST /query       {"points": [[x, y, z], ...]} -> ESDF distance [m] per point
     POST /clear
     GET  /status      voxel size, frames integrated, GPU memory of this process
@@ -28,6 +31,7 @@ from urllib.parse import urlparse
 
 import numpy as np
 import torch
+from scipy import ndimage
 from nvblox_torch.mapper import Mapper, QueryType
 from nvblox_torch.mapper_params import (EsdfIntegratorParams, MapperParams,
                                         ProjectiveIntegratorParams, TsdfDecayIntegratorParams,
@@ -68,7 +72,7 @@ def _make_mapper():
 
 
 MAPPER = _make_mapper()
-STATS = {"frames": 0, "updates": 0, "last_update": None}
+STATS = {"frames": 0, "updates": 0, "last_update": None, "last_sdf": None}
 
 
 def _gpu_mib():
@@ -129,6 +133,37 @@ def query(points):
     return d.cpu().numpy().tolist()
 
 
+def dense_sdf():
+    """Signed distance over the workspace box: exact EDT of the TSDF occupancy.
+
+    nvblox's own ESDF jumps by up to 0.27 m between neighbouring voxels
+    (2-3 % of pairs, 2026-10-14), which cuMotion's inspect_sdf flags. The
+    TSDF is reliable, so occupied = observed (weight > 0) and on or behind a
+    surface (distance <= 0); the EDT of that is 1-Lipschitz by construction.
+    Unobserved voxels count as free, like the ESDF query. Measured against
+    the integrated points: median -0.4 to -0.7 cm (reads closer), p90 +0.6 cm.
+    """
+    t0 = time.perf_counter()
+    vs = float(CFG["voxel_size"])
+    lo, hi = np.asarray(CFG["workspace_min"], float), np.asarray(CFG["workspace_max"], float)
+    n = np.round((hi - lo) / vs).astype(int)
+    axes = [torch.arange(n[k], device="cuda", dtype=torch.float32) * vs + float(lo[k]) + vs / 2
+            for k in range(3)]
+    X, Y, Z = torch.meshgrid(*axes, indexing="ij")
+    pts = torch.stack([X.reshape(-1), Y.reshape(-1), Z.reshape(-1)], 1)
+    tsdf = MAPPER.query_layer(QueryType.TSDF, pts).reshape(*n, 2).cpu().numpy()
+    del X, Y, Z, pts
+    occ = (tsdf[..., 1] > 0) & (tsdf[..., 0] <= 0)
+    # voxel-centre distances, surface half a voxel between occupied and free
+    outside = ndimage.distance_transform_edt(~occ, sampling=vs)
+    inside = ndimage.distance_transform_edt(occ, sampling=vs)
+    values = np.where(occ, vs / 2 - inside, outside - vs / 2).astype(np.float32)
+    STATS["last_sdf"] = {"shape": n.tolist(), "occupied": int(occ.sum()),
+                         "unobserved": int((tsdf[..., 1] <= 0).sum()),
+                         "ms": round(1e3 * (time.perf_counter() - t0), 1)}
+    return values, lo, vs
+
+
 def _unpack_npz(body):
     data = np.load(io.BytesIO(body))
     n = int(data["num_cameras"])
@@ -153,6 +188,21 @@ class Handler(BaseHTTPRequestHandler):
             self._send({"status": "ok", "voxel_size": CFG["voxel_size"],
                         "max_integration_distance": CFG["max_integration_distance"],
                         "gpu_mib": _gpu_mib(), **STATS})
+        elif urlparse(self.path).path == "/sdf":
+            try:
+                values, origin, vs = dense_sdf()
+            except Exception as e:
+                self._send({"error": f"{type(e).__name__}: {e}"}, 500)
+                return
+            buf = io.BytesIO()
+            np.savez(buf, values=values, origin=origin, voxel_size=vs)
+            body = buf.getvalue()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("X-Sdf-Stats", json.dumps(STATS["last_sdf"]))
+            self.end_headers()
+            self.wfile.write(body)
         else:
             self._send({"error": f"unknown endpoint {self.path}"}, 404)
 

@@ -942,6 +942,133 @@ async def _nvblox_update(params=None):
     return result
 
 
+def _nvblox_get_sdf():
+    """Fetch the dense SDF from the service: (values, origin, voxel_size, stats) or error dict."""
+    import urllib.request
+    import urllib.error
+
+    url = ROBOT_CFG.nvblox["url"].rstrip("/") + "/sdf"
+    try:
+        with urllib.request.urlopen(url, timeout=60) as resp:
+            body, stats = resp.read(), json.loads(resp.headers.get("X-Sdf-Stats") or "{}")
+    except urllib.error.HTTPError as e:
+        return json.loads(e.read() or b"{}") or {"error": f"HTTP {e.code}"}
+    except urllib.error.URLError as e:
+        return {"error": f"nvblox service not reachable at {url} ({e.reason})"}
+    data = np.load(io.BytesIO(body))
+    return data["values"], data["origin"], float(data["voxel_size"]), stats
+
+
+def _set_cumotion_sdf(values, origin, voxel_size):
+    """Load a dense SDF (grid corner at world ``origin``) into the cuMotion world.
+
+    cuMotion conventions, measured 2026-10-14: values[i, j, k] is the
+    distance at the voxel centre origin + (ijk + 0.5) * voxel_size, z
+    fastest; the obstacle pose places the grid corner; obstacle poses are
+    in the robot base frame, like the wrapper's spheres. The obstacle is
+    reused while the grid shape is unchanged.
+    """
+    import cumotion
+    from isaacsim.robot_motion.cumotion.impl.utils import isaac_sim_to_cumotion_pose
+
+    world = STATE.cumotion_world._world
+    key = (*values.shape, voxel_size)
+    if STATE.nvblox_sdf_handle is not None and STATE.nvblox_sdf_key != key:
+        world.remove_obstacle(STATE.nvblox_sdf_handle)
+        STATE.nvblox_sdf_handle = None
+    if STATE.nvblox_sdf_handle is None:
+        f32 = cumotion.Obstacle.GridPrecision.FLOAT
+        grid = cumotion.Obstacle.Grid(*values.shape, voxel_size, f32, f32)
+        obstacle = cumotion.create_obstacle(cumotion.Obstacle.Type.SDF)
+        obstacle.set_attribute(cumotion.Obstacle.Attribute.GRID,
+                               cumotion.Obstacle.AttributeValue(grid))
+        STATE.nvblox_sdf_handle = world.add_obstacle(obstacle)
+        STATE.nvblox_sdf_key = key
+
+    world.set_sdf_grid_values_from_host(
+        STATE.nvblox_sdf_handle, np.ascontiguousarray(values, dtype=np.float32))
+    base_pos, base_quat = _robot_base_pose_arrays()
+    world.set_pose(STATE.nvblox_sdf_handle, isaac_sim_to_cumotion_pose(
+        position_world_to_target=np.asarray(origin, dtype=np.float64),
+        orientation_world_to_target=np.array([1.0, 0.0, 0.0, 0.0]),
+        position_world_to_base=base_pos.numpy().reshape(3),
+        orientation_world_to_base=base_quat.numpy().reshape(4)))
+    STATE.cumotion_world.world_view.update()
+    return world.inspect_sdf(STATE.nvblox_sdf_handle)
+
+
+def _cumotion_sdf_frame_check(values, origin, voxel_size, n=500):
+    """cuMotion's distance vs the grid value at random voxel centres (world frame in).
+
+    cuMotion reads 0.7-1.7 cm short at 2 cm voxels (conservative
+    interpolation), so the expected difference is small and negative; a
+    misplaced grid shows up as large errors.
+    """
+    import cumotion
+    from isaacsim.robot_motion.cumotion.impl.utils import isaac_sim_to_cumotion_pose
+
+    inspector = cumotion.create_world_inspector(STATE.cumotion_world.world_view)
+    base_pos, base_quat = _robot_base_pose_arrays()
+    rng = np.random.default_rng(0)
+    idx = rng.integers(0, values.shape, size=(n, 3))
+    diffs = []
+    for i, j, k in idx:
+        p_world = np.asarray(origin) + (np.array([i, j, k]) + 0.5) * voxel_size
+        p_base = isaac_sim_to_cumotion_pose(
+            position_world_to_target=p_world, orientation_world_to_target=np.array([1.0, 0, 0, 0]),
+            position_world_to_base=base_pos.numpy().reshape(3),
+            orientation_world_to_base=base_quat.numpy().reshape(4)).translation
+        d = inspector.distance_to(STATE.nvblox_sdf_handle, np.asarray(p_base, dtype=np.float64))
+        diffs.append(d - float(values[i, j, k]))
+    diffs = np.array(diffs)
+    return {"samples": n, "median": round(float(np.median(diffs)), 4),
+            "min": round(float(diffs.min()), 4), "max": round(float(diffs.max()), 4)}
+
+
+async def _nvblox_world(params=None):
+    """Update nvblox from the cameras and load its SDF into the cuMotion world.
+
+    The SDF is shifted down by robot.yaml nvblox.sdf_safety_margin, which
+    inflates every obstacle by that much. Params are passed on to
+    _nvblox_update (clear, dump); check: also compare cuMotion's distances
+    with the grid (frame check, ~0.5 s).
+    """
+    params = params or {}
+    if STATE.cumotion_world is None and not _init_cumotion():
+        return {"error": "cuMotion not initialised"}
+    update = await _nvblox_update(params)
+    if update.get("status") != "ok":
+        return {"error": "nvblox update failed", "update": update}
+
+    t0 = time.perf_counter()
+    got = await asyncio.get_event_loop().run_in_executor(None, _nvblox_get_sdf)
+    if isinstance(got, dict):
+        return {"error": got.get("error", "sdf export failed"), "update": update}
+    values, origin, voxel_size, sdf_stats = got
+    margin = float(ROBOT_CFG.nvblox["sdf_safety_margin"])
+    values = values - margin
+    t1 = time.perf_counter()
+    inspection = _set_cumotion_sdf(values, origin, voxel_size)
+    t2 = time.perf_counter()
+
+    result = {
+        "status": "ok",
+        "grid": list(values.shape), "voxel_size": voxel_size,
+        "origin": [round(float(v), 3) for v in origin], "safety_margin": margin,
+        "inspect_sdf": {"errors": inspection.num_errors(),
+                        "flat_voxels": inspection.num_voxels_matching_all_neighbors,
+                        "too_far_from_neighbours": inspection.num_voxels_too_far_from_neighbors},
+        "fetch_ms": round(1e3 * (t1 - t0), 1), "load_ms": round(1e3 * (t2 - t1), 1),
+        "service_sdf": sdf_stats,
+        "update": {k: update[k] for k in ("capture_ms", "mask_ms", "service_ms")},
+    }
+    if params.get("check"):
+        result["frame_check"] = _cumotion_sdf_frame_check(values, origin, voxel_size)
+    print(f"  [nvblox] SDF {values.shape} -> cuMotion, inspect errors "
+          f"{inspection.num_errors()}, load {result['load_ms']} ms")
+    return result
+
+
 def _spheres_from_points(points, prefix, radius, margin=COLLISION_SAFETY_MARGIN):
     """Push one sphere collider per point into the cuMotion world."""
     import warp as wp
@@ -1793,6 +1920,7 @@ def _reset_cumotion_world():
         world_to_robot_base=(base_pos, base_quat),
         device=STATE.cumotion_device)
     STATE.collision_sphere_count = 0
+    STATE.nvblox_sdf_handle = None        # belonged to the old world
     # The planner holds a reference to the world interface, so rebuild it.
     if STATE.cumotion_robot is not None:
         from isaacsim.robot_motion.cumotion import GraphBasedMotionPlanner
@@ -2192,6 +2320,8 @@ class BridgeState:
         self.cumotion_ready = False
         self.cumotion_error = "not initialised yet"
         self.collision_sphere_count = 0
+        self.nvblox_sdf_handle = None     # cuMotion SDF obstacle from nvblox
+        self.nvblox_sdf_key = None        # (nx, ny, nz, voxel) it was built for
         # Static structure scan (gantry rail, rack, floor, walls) — see
         # /api/build_static_world. Captured once, cached to disk, reused
         # by every _build_collision_world rebuild instead of being
@@ -2365,6 +2495,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
         elif path == "/api/probe_pointcloud_semantic_fields":
             STATE.push_command({"action": "probe_pointcloud_semantic_fields", "params": body})
             self._send_json(STATE.pop_result(timeout=60))
+        elif path == "/api/nvblox_world":
+            STATE.push_command({"action": "nvblox_world", "params": body})
+            self._send_json(STATE.pop_result(timeout=120))
         elif path == "/api/nvblox_update":
             STATE.push_command({"action": "nvblox_update", "params": body})
             self._send_json(STATE.pop_result(timeout=120))
@@ -5116,6 +5249,7 @@ def _shutdown_bridge(reason="simulation stopped"):
     STATE.cumotion_ready = False
     STATE.pending_trajectory = None
     STATE.collision_sphere_count = 0
+    STATE.nvblox_sdf_handle = None
 
     # Drain any pending commands/results so they don't leak into next session
     with STATE._lock:
@@ -5326,6 +5460,8 @@ async def _process_commands_loop():
                 result = await _probe_shared_segmentation(cmd.get("params", {}))
             elif action == "probe_pointcloud_semantic_fields":
                 result = await _probe_pointcloud_semantic_fields(cmd.get("params", {}))
+            elif action == "nvblox_world":
+                result = await _nvblox_world(cmd.get("params", {}))
             elif action == "nvblox_update":
                 result = await _nvblox_update(cmd.get("params", {}))
             elif action == "wrist_obstacles":

@@ -349,7 +349,7 @@ class RobotConfig:
         if nv is not None:
             for key in ("url", "voxel_size", "cameras", "workspace_min", "workspace_max",
                         "robot_mask_margin", "max_integration_distance",
-                        "esdf_max_site_distance_vox"):
+                        "esdf_max_site_distance_vox", "sdf_safety_margin"):
                 if nv.get(key) is None:
                     errors.append(f"nvblox.{key}: not set")
             lo, hi = nv.get("workspace_min") or [], nv.get("workspace_max") or []
